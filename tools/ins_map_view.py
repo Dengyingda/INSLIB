@@ -2,15 +2,15 @@
 """ins_map_view -- an OpenStreetMap background for a replayed lat/lon track.
 
 The tile fetch machinery (identifying User-Agent, cache-first, on-screen
-budget, no prefetch) is the same policy tools/inslib_gui.py's Track tab
+budget, no prefetch) is the same policy inslib_gui.py's Track tab
 follows, and TILE_CACHE points at the very same directory on disk, so a
 dataset looked at here in inspostgui.py and a device looked at live there
 do not each download the same square of the world twice.
 See https://operations.osmfoundation.org/policies/tiles/
 
-Kept as its own module rather than copied into different GUIs: tools/ and
-python/ do not import across each other (separate scripts, separate
-dependency sets), which is also why python/ins_map_frames.py keeps its
+Kept as its own module rather than copied into different GUIs: the board
+control GUI and this one do not import across each other (separate scripts,
+separate dependency sets), which is also why tools/ins_map_frames.py keeps its
 own plain-urllib copy of this same cache/policy rather than importing
 Qt/pyqtgraph for a batch PNG renderer that has no window.
 
@@ -38,7 +38,7 @@ EARTH_R = 6378137.0
 TILE_URL = "https://tile.openstreetmap.org/%d/%d/%d.png"
 TILE_AGENT = "inslib_gui/1.0 (INSLIB device console; local diagnostics)"
 TILE_BUDGET = 24
-# Same cache root as tools/inslib_gui.py and python/ins_map_frames.py --
+# Same cache root as inslib_gui.py and tools/ins_map_frames.py --
 # "inslib_gui" names the shared cache, not this particular script.
 TILE_CACHE = os.path.join(
     os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.cache"),
@@ -137,7 +137,7 @@ class MapView(QtWidgets.QWidget):
     """A track, a ground-truth track and the GNSS fixes over an optional
     OSM background.
 
-    Unlike the Track tab in tools/inslib_gui.py this is handed a whole
+    Unlike the Track tab in inslib_gui.py this is handed a whole
     replayed trajectory at once rather than growing one live, so there is
     no Ring buffer and no data-refresh timer -- set_tracks() replaces
     everything, and the only timer here re-tiles after a zoom or pan.

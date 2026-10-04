@@ -1,7 +1,7 @@
 """Shared writers for the dataset-neutral replay format (REQ-VER-003).
 
 Every converted dataset directory carries the same files, consumed by
-both tools/replay.c and python/replay.py:
+both tools/replay.c and tools/replay.py:
 
   config.yaml  lever arms, IMU noise model + optional IMU/magnetometer
                calibration (misalignment/fixed bias, REQ-NAV-037/039),
@@ -10,7 +10,7 @@ both tools/replay.c and python/replay.py:
                two-level YAML subset -- the C harness parses only sections
                + scalar/inline-list values). An optional `inputs:` section
                overrides the CSV filenames below per stream (imu/ref/gnss/
-               mag/baro/speed/heading), each relative to config.yaml's directory -- unset
+               mag/baro/speed/heading/ranges), each relative to config.yaml's directory -- unset
                keeps the conventional <stream>.csv name, so one stream can
                be swapped (e.g. gnss: gnss_f9p.csv) with the rest shared.
   imu.csv      t_us, gyr_frd_xyz [rad/s], acc_frd_xyz [m/s^2], and
@@ -36,6 +36,16 @@ both tools/replay.c and python/replay.py:
                t_us, which is what links the two files. Trailing columns
                (baseline length, receiver iTOW) are the producer's own
                record, both harnesses read the first four only.
+  ranges.csv   t_us, anchor_id, anchor ECEF x, y, z [m], range [m], its
+               1-sigma [m]                             (optional)
+               One row per calibrated range to an anchor at a known
+               position (REQ-NAV-082), t_us the time the range refers to.
+               Rows of one IMU interval are fused together, up to the
+               filter's per-epoch maximum, each history-anchored at its own
+               age. config.yaml's ranges: section scales and floors the
+               1-sigma and carries the antenna lever arm. Trailing columns
+               are the producer's own record, both harnesses read the first
+               seven only.
 
 Converters import these helpers so the format cannot drift apart.
 
@@ -73,6 +83,20 @@ SPEED_HEADER = "# t_us, speed_mps\n"
 # only scales and floors it.
 HEADING_HEADER = ("# t_us, heading_deg, stddev_deg, carr_soln,"
                   " length_m, itow_ms\n")
+# Like heading.csv the 1-sigma is a column: it is formed per range from the
+# spread of the measurement and the anchor's own position uncertainty, both
+# of which move from row to row.
+RANGES_HEADER = ("# t_us, anchor_id, anchor_x_m, anchor_y_m, anchor_z_m,"
+                 " range_m, stddev_m\n")
+
+
+def range_row(t_us, anchor_id, anchor_ecef, range_m, stddev_m, extra=()):
+    """Format one ranges.csv line. extra: the producer's own trailing
+    columns (read by neither harness)."""
+    tail = "".join(",%s" % e for e in extra)
+    return "%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f%s\n" % (
+        t_us, anchor_id, anchor_ecef[0], anchor_ecef[1], anchor_ecef[2],
+        range_m, stddev_m, tail)
 
 
 def gnss_row(t_us, lat_deg, lon_deg, h_m, cov_pos6, vel_ned, cov_vel6,

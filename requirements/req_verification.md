@@ -22,10 +22,10 @@ exit code and human-readable output.
 
 - **Status:** implemented
 - **Parent:** REQ-VER-002
-- **Verification:** Inspection: datasets/replay_format.py defines the shared config.yaml + imu/ref/gnss/mag/baro/speed/heading.csv contract (schema documented in doc/INSLIB_manual.tex section "config.yaml", dataset specifics confined to the convert_*.py converters)
+- **Verification:** Inspection: datasets/replay_format.py defines the shared config.yaml + imu/ref/gnss/mag/baro/speed/heading/ranges.csv contract (schema documented in doc/INSLIB_manual.tex section "config.yaml", dataset specifics confined to the convert_*.py converters)
 
 A single replay harness (one binary, `tools/replay.c`; mirrored by
-`python/replay.py`) shall consume a dataset-neutral input format: a
+`tools/replay.py`) shall consume a dataset-neutral input format: a
 generated per-dataset `config.yaml` (aiding/init mode, IMU noise
 model, lever arms, warmup, regression limits, GNSS covariance
 fallbacks) plus CSVs — imu.csv (FRD body-frame IMU, optionally
@@ -39,7 +39,9 @@ baro.csv (static pressure [Pa]) and speed.csv (scalar ground speed
 [m/s], REQ-NAV-068 -- its per-sample uncertainty and delay come from
 config.yaml as constants, not from further columns) and heading.csv
 (dual-antenna baseline azimuth [deg] with its per-row 1-sigma [deg] and
-carrier-phase solution, REQ-VER-035). Dataset specifics (axis conventions,
+carrier-phase solution, REQ-VER-035) and ranges.csv (ranges to anchors
+at known positions with a per-row 1-sigma, REQ-VER-038). Dataset
+specifics (axis conventions,
 units, lever arms, sensor calibration, noise, gates) shall be confined
 to the per-dataset converters, so new datasets only add a converter
 and a Makefile sub-target.
@@ -135,9 +137,9 @@ the value can also be found empirically from the data rather than guessed).
 
 - **Status:** deleted
 - **Parent:** REQ-VER-008
-- **Verification:** Inspection: obsolete -- python/replay.py analysis tooling (--estimate-gnss-delay) is not tracked as a requirement (the DB covers the src/ C library and the C regression harness only).
+- **Verification:** Inspection: obsolete -- tools/replay.py analysis tooling (--estimate-gnss-delay) is not tracked as a requirement (the DB covers the src/ C library and the C regression harness only).
 
-(Deleted, kept for ID stability.) Previously required python/replay.py to
+(Deleted, kept for ID stability.) Previously required tools/replay.py to
 cross-correlate the baro/accel vertical
 filter's down-velocity (assumed near-zero latency) against the held
 GNSS fix's down-velocity, over the --plot-hz recorder's uniformly
@@ -180,7 +182,7 @@ rpy_init_stddev_rad_deg, yaw_init_stddev_rad_deg (0 -> falls back to
 rpy_init_stddev_rad_deg, like ins's own rpy_init_stddev_rad[0..1]/[2]),
 acc_bias_init_stddev_mps2, gyr_bias_init_stddev_rps_deg -- each 0/omitted
 -> the harness's built-in default; the same YAML vocabulary is shared
-verbatim by python/replay.py, which reads the same config.yaml files.
+verbatim by tools/replay.py, which reads the same config.yaml files.
 Rationale: the built-in defaults
 assume a well-characterized initial state (e.g. a surveyed stationary
 start); a dataset whose "known" state is itself only a GNSS-derived
@@ -218,9 +220,9 @@ outlier-heavy replay is visible without instrumenting the source.
 
 - **Status:** deleted
 - **Parent:** REQ-VER-012
-- **Verification:** Inspection: obsolete -- python/replay.py `--plot` visualization is not tracked as a requirement (python-tool feature).
+- **Verification:** Inspection: obsolete -- tools/replay.py `--plot` visualization is not tracked as a requirement (python-tool feature).
 
-(Deleted, kept for ID stability.) Previously required python/replay.py's
+(Deleted, kept for ID stability.) Previously required tools/replay.py's
 `--plot` output to include a page plotting the
 cumulative chi2-downweight counters (REQ-VER-012: INSLIB/full3d, ars,
 ahrs, baro_alt, local_gnss offset) over time, one line per sub-filter,
@@ -234,9 +236,9 @@ multipath patch, a ZUPT-shaded stop).
 
 - **Status:** deleted
 - **Parent:** REQ-VER-002
-- **Verification:** Inspection: obsolete -- python/replay.py `--plot` visualization is not tracked as a requirement (python-tool feature).
+- **Verification:** Inspection: obsolete -- tools/replay.py `--plot` visualization is not tracked as a requirement (python-tool feature).
 
-(Deleted, kept for ID stability.) Previously required python/replay.py's
+(Deleted, kept for ID stability.) Previously required tools/replay.py's
 `--plot` output to include a page plotting each
 input stream's (IMU, and GNSS/mag/baro when present) sampling rate
 [Hz] over time, bucketed into fixed-width (`--plot-rate-bucket-sec`,
@@ -249,13 +251,13 @@ large to hold in memory as a raw timestamp list, shall be bucketed in
 the single existing streaming pass (`_imu_prepass`) rather than a
 separate one.
 
-## REQ-VER-015 — Magnetometer hard-iron bias (18-state) support in python/replay.py
+## REQ-VER-015 — Magnetometer hard-iron bias (18-state) support in tools/replay.py
 
 - **Status:** deleted
 - **Parent:** REQ-NAV-029
-- **Verification:** Inspection: obsolete -- python/replay.py config forwarding + `--plot` visualization is not tracked as a requirement (the underlying C-library 18-state mag hard-iron bias support is REQ-NAV-029).
+- **Verification:** Inspection: obsolete -- tools/replay.py config forwarding + `--plot` visualization is not tracked as a requirement (the underlying C-library 18-state mag hard-iron bias support is REQ-NAV-029).
 
-(Deleted, kept for ID stability.) Previously required python/replay.py to
+(Deleted, kept for ID stability.) Previously required tools/replay.py to
 accept a `mag: estimate_bias` (0/1, default 0)
 config key and forward it to `Config.estimate_mag_bias`, so a real
 dataset can be replayed in ins's 18-state magnetometer hard-iron
@@ -286,16 +288,25 @@ the ARS/AHRS sub-filters against the true reference; the Python harness
 binding AND additionally requires ins's position RMS to stay within a
 configured factor (`score: lim_groves_pos_rms_factor`) of the Groves
 textbook filter's own position RMS vs. truth. That harness drives the
-analysis tool `python/replay.py` (via its `--summary-json` output) and
+analysis tool `tools/replay.py` (via its `--summary-json` output) and
 owns the pass/fail gates itself, so `replay.py` stays gate-free. This
 exercises the whole navigation stack on a known-truth signal end to end
 and pins agreement with an independent textbook filter.
 
 `make simulated` shall additionally gate the C harness alone on
-`datasets/simulated/B_drone/config_coasting.yaml`, a second config over
-the committed B_drone flight that sets the coasting window shorter than
-that flight's GNSS outage. The dataset's own config.yaml keeps the whole
-outage inside the window on purpose, so only this one drives the filter
+`datasets/simulated/A_ideal`, a noise-free flight whose config opts out of
+the auto-ZUPT/ZARU (its slow phases have zero sample variance and would
+otherwise read as a standstill, pinning the velocity and absorbing the turn
+rate into the gyro bias) and carries tight `score:` limits on ins attitude
+and position, the height channels and the ARS, so such a fault fails the
+run instead of passing unnoticed, and on both configs of
+`datasets/simulated/B_drone`, a UAV flight with a GNSS outage. Its own
+config.yaml keeps the whole outage inside the coasting window on purpose,
+starts from the reference and carries `score:` limits on ins attitude,
+position, the height channels and the ARS/AHRS sub-filters.
+`datasets/simulated/B_drone/config_coasting.yaml` is a second config over
+the same flight that sets the coasting window shorter than the outage, so
+only this one drives the filter
 across the boundary: inert while the window is expired (REQ-NAV-064),
 re-anchored on the first fix afterwards with the carried states inflated
 (REQ-NAV-065) and the height taken from the barometer (REQ-NAV-066). The
@@ -332,7 +343,7 @@ phase, else ahrs.c's built-in default) and, when set, apply it to all
 3 axes of both `ars_cfg.gyr_bias_init_stddev_rps` and
 `ahrs_cfg.gyr_bias_init_stddev_rps` (nav_suite.h), independent of
 whether `gyro_bias_window_sec` found a parked phase to seed the mean
-from. python/replay.py shall accept the same `ahrs:
+from. tools/replay.py shall accept the same `ahrs:
 gyr_bias_init_stddev_rps_deg` key (schema shared with the C harness)
 and apply it via `Navigator.set_ahrs_gyr_bias_init_stddev()`
 (python/csrc's `ins_suite_set_ahrs_gyr_bias_init_stddev()`, which
@@ -356,7 +367,7 @@ instead of a permanent bias/yaw drift.
 - **Parent:** REQ-VER-002
 - **Verification:** Test: tools/replay.c:main; Test: tests/test_ahrs.c:scenario_suite_stillness_propagation
 
-Both replay harnesses (tools/replay.c and python/replay.py, schema
+Both replay harnesses (tools/replay.c and tools/replay.py, schema
 shared) shall accept the whole stillness parameter set under `imu:` as
 one block and forward it to ins_options_t / ins_init_t before
 nav_suite_init(), from where REQ-SUITE-020 distributes it to the
@@ -494,7 +505,7 @@ instead of leaving the destination at whatever it held.
 
 This is REQ-VER-025's rule applied to the value rather than the key. A
 dataset directory is read by both `tools/replay.c` (this reader) and
-`python/replay.py` (PyYAML), and PyYAML accepts both forms. A form only
+`tools/replay.py` (PyYAML), and PyYAML accepts both forms. A form only
 one of them understands therefore does not produce an error anywhere: it
 produces two harnesses that disagree about the same file, each convinced
 it applied the operator's configuration. `datasets/tunnel/config.yaml` was
@@ -810,10 +821,10 @@ tightly would only add noise from the initial leveling accuracy to a
 dataset about drift.
 
 The limits are set on a single deterministic run (`build/replay.exe`) at
-roughly 15 to 25% above the observed round-trip error: `lim_pos_rms_m: 0.09`
-(observed 0.072 m) and `lim_yaw_bias_deg: 0.25` (observed 0.205 deg), so a
-change that costs the free-inertial solution a few centimetres or a
-fraction of a degree fails this. Retighten after an intentional
+roughly 5% above the observed round-trip error: `lim_pos_rms_m: 0.076`
+(observed 0.072 m) and `lim_yaw_bias_deg: 0.216` (observed 0.205 deg), so a
+change that costs the free-inertial solution half a centimetre or a
+hundredth of a degree fails this. Retighten after an intentional
 improvement, the same rule as every other `lim_*` in this database.
 
 The committed rate (100 Hz) was picked by re-scoring the same capture
@@ -832,21 +843,16 @@ the rate goes up.
 
 - **Status:** verified
 - **Parent:** REQ-VER-003
-- **Verification:** Test: python/tests/test_heading_stream.py:test_heading_row_shares_t_us_with_its_gnss_fix; Test: python/tests/test_heading_stream.py:test_trailing_heading_is_placed_by_its_itow; Test: python/tests/test_heading_stream.py:test_unusable_relposned_epochs_are_dropped_and_counted; Test: python/tests/test_heading_stream.py:test_generated_config_section_is_accepted_by_the_replay; Test: python/tests/test_heading_stream.py:test_heading_measurement_gates_and_noise; Test: python/tests/test_heading_stream.py:test_heading_measurement_undoes_a_tilted_cross_baseline; Demonstration: tools/replay.c, python/replay.py and python/inspostgui.py --batch report identical heading counts and yaw error on profile_3_aircraft with heading.csv synthesized from ref.csv for a baseline along x and one across the vehicle
+- **Verification:** Test: python/tests/test_heading_stream.py:test_heading_config_section_and_csv_are_accepted_by_the_replay; Test: python/tests/test_heading_stream.py:test_heading_measurement_gates_and_noise; Test: python/tests/test_heading_stream.py:test_heading_measurement_undoes_a_tilted_cross_baseline; Demonstration: tools/replay.c, tools/replay.py and tools/inspostgui.py --batch report identical heading counts and yaw error on profile_3_aircraft with heading.csv synthesized from ref.csv for a baseline along x and one across the vehicle
 
-**Conversion.** tools/inslib_convert_ubx_to_csv.py shall write heading.csv
-from u-blox NAV-RELPOSNED, keeping only epochs with gnssFixOK, relPosValid,
-relPosHeadingValid, a positive accHeading and isMoving set (a heading
-against a static RTK base is the direction to that base, not an attitude),
-and count every dropped epoch by reason. A row shall carry the t_us of the
-NAV-PVT with the same iTOW, and the latest NAV-PVT's t_us plus the iTOW
-difference when the message belongs to a neighbouring epoch (at most one
-second apart, else dropped), so the heading row and the gnss.csv fix of one
-epoch carry the identical t_us regardless of which IMU sample either
-message arrived after. heading.csv, and `heading: enable: 1` in a generated
-config.yaml, shall only exist when at least one epoch was kept.
+**Input.** heading.csv holds one row per usable epoch (datasets/replay_format.py,
+HEADING_HEADER): t_us, the baseline azimuth, its 1-sigma, the carrier-phase
+solution and the producer's own record. A producer shall give a row the t_us
+of the GNSS fix of the same epoch, so that the heading and gnss.csv agree on
+the time of one epoch regardless of which IMU sample either message arrived
+after. `heading: enable: 1` in a config.yaml turns the stream on.
 
-**Replay.** tools/replay.c, python/replay.py and python/inspostgui.py shall
+**Replay.** tools/replay.c, tools/replay.py and tools/inspostgui.py shall
 accept a `heading:` config section (enable, baseline_frd, require_fixed,
 stddev_scale, stddev_min_deg, delay_ms) and an `inputs: heading` filename
 override, and turn the newest heading.csv row of each IMU interval into an
@@ -870,9 +876,9 @@ pair must not need a reconversion.
 
 - **Status:** verified
 - **Parent:** REQ-VER-003
-- **Verification:** Test: tests/test_yaml.c:scenario_imu_mount; Test: python/tests/test_mount_rotation.py:test_mount_composes_all_three_sensors; Test: python/tests/test_mount_rotation.py:test_zero_mount_is_a_noop; Test: python/tests/test_mount_rotation.py:test_mount_survives_a_config_roundtrip; Demonstration: with the imu.csv of datasets/kfgins rotated into a board mounted at roll 2, pitch -3, yaw -9 deg and imu: mount_rpy_deg: [2, -3, -9] in its config.yaml, tools/replay.c and python/replay.py reproduce the unrotated dataset's attitude and position scores exactly, while the same rotated data without the key misses the attitude gates by about the mounting angles
+- **Verification:** Test: tests/test_yaml.c:scenario_imu_mount; Test: python/tests/test_mount_rotation.py:test_mount_composes_all_three_sensors; Test: python/tests/test_mount_rotation.py:test_zero_mount_is_a_noop; Test: python/tests/test_mount_rotation.py:test_mount_survives_a_config_roundtrip; Demonstration: with the imu.csv of datasets/kfgins rotated into a board mounted at roll 2, pitch -3, yaw -9 deg and imu: mount_rpy_deg: [2, -3, -9] in its config.yaml, tools/replay.c and tools/replay.py reproduce the unrotated dataset's attitude and position scores exactly, while the same rotated data without the key misses the attitude gates by about the mounting angles
 
-tools/replay.c, tools/insrcv.c, python/replay.py and python/inspostgui.py
+tools/replay.c, tools/insrcv.c, tools/replay.py and tools/inspostgui.py
 shall accept `imu: mount_rpy_deg: [roll, pitch, yaw]` [deg], the attitude
 of the sensor board's axes in the vehicle body frame (ZYX, FRD), and
 compose it onto the accelerometer, gyroscope and magnetometer calibration
@@ -904,7 +910,7 @@ the board's own per-axis calibration.
 
 - **Status:** verified
 - **Parent:** REQ-VER-002
-- **Verification:** Test: python/tests/test_score_leverarm.py:test_height_projection_matches_rotated_lever_arm; Test: python/tests/test_score_leverarm.py:test_zero_lever_arm_is_a_noop; Demonstration: with ref.csv of datasets/kfgins moved to a point 2.0 m behind, 0.1 m right and 1.3 m above the IMU and score: leverarm_frd set to that point, tools/replay.c and python/replay.py report the unmoved dataset's position and ellipsoid height errors, and the state history, North-East and altitude pages of python/replay.py --plot overlay estimate and reference without the 1.3 m height offset
+- **Verification:** Test: python/tests/test_score_leverarm.py:test_height_projection_matches_rotated_lever_arm; Test: python/tests/test_score_leverarm.py:test_zero_lever_arm_is_a_noop; Demonstration: with ref.csv of datasets/kfgins moved to a point 2.0 m behind, 0.1 m right and 1.3 m above the IMU and score: leverarm_frd set to that point, tools/replay.c and tools/replay.py report the unmoved dataset's position and ellipsoid height errors, and the state history, North-East and altitude pages of tools/replay.py --plot overlay estimate and reference without the 1.3 m height offset
 
 `score: leverarm_frd` names the point on the vehicle the reference refers
 to (a GNSS antenna when ref.csv is the receiver's own solution). Every
@@ -914,12 +920,12 @@ suite's current attitude, not the IMU position:
 
 - the position error (as before),
 - the ellipsoid height error of nav_suite_get_height_ellipsoid() in
-  tools/replay.c and python/replay.py, using the down component of the
+  tools/replay.c and tools/replay.py, using the down component of the
   rotated lever arm with the suite's best available roll and pitch
   (nav_suite_get_rpy, level while the suite holds no attitude), because
   the accessor also answers while ins is coasting or not ready,
 - the estimate drawn on the --plot state history (position), North-East
-  and altitude pages of python/replay.py and python/inspostgui.py.
+  and altitude pages of tools/replay.py and tools/inspostgui.py.
 
 A zero lever arm shall change nothing.
 
@@ -929,3 +935,37 @@ score that was not an error of the filter, while the position error next
 to it already projected the lever arm and showed none. Two numbers for the
 same run that disagree by the lever arm make the plot unusable for
 judging the vertical channel.
+
+## REQ-VER-038 — Ranges to anchors in the replay tooling
+
+- **Status:** verified
+- **Parent:** REQ-VER-003
+- **Verification:** Test: python/tests/test_range_stream.py:test_range_row_and_loader_round_trip; Test: python/tests/test_range_stream.py:test_loader_drops_unusable_rows; Test: python/tests/test_range_stream.py:test_binding_takes_ranges_up_to_the_epoch_limit; Test: python/tests/test_range_stream.py:test_ranges_carry_the_replay_after_the_gnss_stops; Test: python/tests/test_replay_core.py:test_gui_worker_and_replay_py_agree
+
+**Format.** ranges.csv shall hold one calibrated range per row: t_us (the
+time the range refers to, the IMU's timebase), anchor id, anchor position
+in ECEF [m], range [m] and its 1-sigma [m], trailing columns being the
+producer's own record (datasets/replay_format.py range_row()). A row with a
+non-positive 1-sigma, a negative range or an id beyond 16 bit shall be
+dropped on loading.
+
+**Replay.** tools/replay.c, tools/replay.py and tools/inspostgui.py shall
+accept a `ranges:` config section (enable, leverarm_frd, stddev_scale,
+stddev_min_m, height_with_baro, aiding_max_hpos_stddev_m) and an
+`inputs: ranges` filename override, and hand every ranges.csv row up to each IMU epoch to
+the filter as a range measurement (REQ-NAV-082), with the row's age at that
+epoch as its delay, the 1-sigma multiplied by stddev_scale (0 -> 1) and
+floored at stddev_min_m (0 -> no floor), and the lever arm as the ranging
+antenna's. Rows beyond INS_RANGE_MAX in one epoch shall move on to the next
+epoch rather than be dropped. All three shall report the rows offered,
+fused, rejected, skipped and the epochs counted as position aiding
+(REQ-NAV-085), and agree on these counts for the same dataset.
+
+**Binding.** The Python binding shall expose the range measurement
+(Navigator.range(), refusing an entry beyond INS_RANGE_MAX in one epoch),
+the ranging lever arm and the range diagnostics, and the two ins_options_t
+range keys in its Config.
+
+Rationale: the rows keep their own time and age, since a range refers to
+the midpoint of its burst, not to the epoch that happens to fuse it.
+

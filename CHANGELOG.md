@@ -1,5 +1,38 @@
 # Changelog
 
+## [1.2.0] - 2026-10-04 - GUI Tool
+
+### Added
+
+- Windows executable for: `inspostgui.exe`. Easier processing of `.csv` files.
+- `inspostgui` can highlight ZUPT/ZARU epochs in trajectory view.
+- `inspostgui`: "Last run" panel (position and attitude error, change against
+  the previous run, insdoctor findings), a legend for the 3D view, keyboard
+  shortcuts (F5 run, Space pause, Esc stop, Ctrl+O/S, Ctrl+1..5 tabs).
+- `inspostgui`: adjustable speed for the red end of the 3D trail colours
+  ("Red at", auto or a fixed value in m/s).
+
+### Changed
+
+- All executables now live in `tools/`: `replay.py`, `inspostgui.py`,
+  and `allan_variance.py` moved over from `python/`,
+  which keeps only the `INSLIB` package.
+- Renamed `f9p_config.py` and `x20p_config.py` to `ublox_f9p_config.py` and
+  `ublox_x20p_config.py`.
+
+### Fixed
+
+- Potential height jump when the 3D solution restarts after a GNSS outage with
+  a barometer fixed.
+- Fixed a bunch of parameters in different `config.yaml` files in the `datasets`
+  directory.
+
+### Removed
+
+- The reference board's host tools (serial hub, control GUI, configuration,
+  calibration window, capture converter) are no longer part of this
+  repository. The protocol stays documented in `tools/inslib_protocol.md`.
+
 ## [1.1.1] - 2026-09-28 - Smaller fixes
 
 ### Added

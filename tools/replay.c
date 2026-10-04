@@ -22,6 +22,8 @@
  *   baro.csv     t_us, static pressure [Pa]      (optional)
  *   speed.csv    t_us, ground speed [m/s]        (optional)
  *   heading.csv  t_us, baseline azimuth [deg], 1-sigma [deg], carr_soln
+ *   ranges.csv   t_us, anchor_id, anchor ECEF x/y/z [m], range [m],
+ *                1-sigma [m]                             (optional)
  *                                                (optional)
  *
  * Usage: replay <config.yaml | datadir> [errdump.csv]
@@ -85,6 +87,7 @@ typedef struct
     char in_baro[256];
     char in_speed[256];
     char in_heading[256];
+    char in_ranges[256];
 
     int   automotive_mode;               /* 0/1: yaw from GNSS course over ground (REQ-NAV-034) */
     float automotive_min_speed_mps;      /* 0 -> default */
@@ -137,7 +140,7 @@ typedef struct
     /* Auto-ZUPT/ZARU pseudo-measurement stddev, 0 -> this harness's own
        default (0.05 m/s, 0.1 deg/s -- NOT ins.c's own built-in default of
        0.05 m/s, 0.5 deg/s for the rotation channel; shared with
-       python/replay.py's DEFAULTS for years, see build_config() there). */
+       tools/replay.py's DEFAULTS for years, see build_config() there). */
     float zero_vel_stddev_mps;
     float zero_rot_stddev_deg;
     /* Stillness detection, ONE set for the whole suite (REQ-SUITE-020,
@@ -304,6 +307,16 @@ typedef struct
     float heading_stddev_min_deg;  /* floor after scaling (0 -> none) */
     int   heading_delay_ms;        /* how old a row is at its timestamp */
 
+    /* ranges: ranges to anchors at known positions (REQ-NAV-082). The
+       1-sigma is a per-row column like heading's, scaled and floored here,
+       and each row is history-anchored at its own age (REQ-VER-038). */
+    int   ranges_enable;
+    float ranges_leverarm_frd[3];          /* ranging antenna, body FRD [m] */
+    float ranges_stddev_scale;             /* multiplies the row's 1-sigma (0 -> 1.0) */
+    float ranges_stddev_min_m;             /* floor after scaling (0 -> none) */
+    int   ranges_height_with_baro;         /* 0/1, ins_options_t */
+    float ranges_aiding_max_hpos_stddev_m; /* 0 -> ins default (REQ-NAV-085) */
+
     /* baro: */
     int   baro_enable;
     float baro_stddev_m;              /* 0 -> consumer default */
@@ -423,6 +436,7 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
     else if (!strcmp(full, "inputs.baro")) { snprintf(c->in_baro, sizeof(c->in_baro), "%s", val); }
     else if (!strcmp(full, "inputs.speed")) { snprintf(c->in_speed, sizeof(c->in_speed), "%s", val); }
     else if (!strcmp(full, "inputs.heading")) { snprintf(c->in_heading, sizeof(c->in_heading), "%s", val); }
+    else if (!strcmp(full, "inputs.ranges")) { snprintf(c->in_ranges, sizeof(c->in_ranges), "%s", val); }
     else if (!strcmp(full, "automotive_mode")) { c->automotive_mode = (int)d; }
     else if (!strcmp(full, "automotive_min_speed_mps")) { c->automotive_min_speed_mps = (float)d; }
     else if (!strcmp(full, "automotive_lateral_constraint"))
@@ -648,6 +662,12 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
     else if (!strcmp(full, "heading.stddev_scale")) { c->heading_stddev_scale = (float)d; }
     else if (!strcmp(full, "heading.stddev_min_deg")) { c->heading_stddev_min_deg = (float)d; }
     else if (!strcmp(full, "heading.delay_ms")) { c->heading_delay_ms = (int)d; }
+    else if (!strcmp(full, "ranges.enable")) { c->ranges_enable = (int)d; }
+    else if (!strcmp(full, "ranges.leverarm_frd")) { if (mini_yaml_list(val, c->ranges_leverarm_frd, 3) != 0) return -2; }
+    else if (!strcmp(full, "ranges.stddev_scale")) { c->ranges_stddev_scale = (float)d; }
+    else if (!strcmp(full, "ranges.stddev_min_m")) { c->ranges_stddev_min_m = (float)d; }
+    else if (!strcmp(full, "ranges.height_with_baro")) { c->ranges_height_with_baro = (int)d; }
+    else if (!strcmp(full, "ranges.aiding_max_hpos_stddev_m")) { c->ranges_aiding_max_hpos_stddev_m = (float)d; }
     else if (!strcmp(full, "baro.enable")) { c->baro_enable = (int)d; }
     else if (!strcmp(full, "baro.stddev_m")) { c->baro_stddev_m = (float)d; }
     else if (!strcmp(full, "baro.acc_bias_rw")) { c->baro_acc_bias_rw = (float)d; }
@@ -714,7 +734,7 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
        are accepted and ignored here rather than rejected. Rejecting them
        would force a dataset to pick one of its tools; deleting them from the
        file to satisfy this parser would silently disarm the other tool.
-       python/replay.py carries the identical list (FOREIGN_SECTIONS + the
+       tools/replay.py carries the identical list (FOREIGN_SECTIONS + the
        score key below).
 
          score.lim_groves_pos_rms_factor  datasets/check_simulated.py's gate
@@ -725,7 +745,7 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
          origin.*                         local-frame anchor for a platform
                                           with no absolute position source,
          crazyflie.*                      link settings for the same reader.
-                                          Both python/crazyflie_reader.py.
+                                          Both tools/crazyflie_reader.py.
 
        A section only earns a place here once a tool actually reads it:
        something no tool reads is not a foreign section, it is documentation,
@@ -780,6 +800,7 @@ static int load_config(const char* path, replay_cfg_t* c)
     snprintf(c->in_baro, sizeof(c->in_baro), "baro.csv");
     snprintf(c->in_speed, sizeof(c->in_speed), "speed.csv");
     snprintf(c->in_heading, sizeof(c->in_heading), "heading.csv");
+    snprintf(c->in_ranges, sizeof(c->in_ranges), "ranges.csv");
     /* The mounting where the baseline azimuth IS the yaw, and only fixed
        headings: a float one can be degrees off while claiming better. */
     c->heading_baseline_frd[0] = 1.0f;
@@ -883,6 +904,15 @@ typedef struct
     float   stddev_deg;
     int     carr_soln;   /* 0 none, 1 float, 2 fixed */
 } heading_epoch_t;
+
+typedef struct
+{
+    int64_t  t_us;           /* time the range refers to */
+    double   anchor_ecef[3]; /* [m] */
+    float    range_m;
+    float    stddev_m;
+    uint16_t anchor_id;
+} range_epoch_t;
 
 typedef struct
 {
@@ -1093,7 +1123,7 @@ static int load_baro(const char* path, baro_epoch_t** out)
 
 /* speed.csv: "t_us, speed_mps" plus any further columns the producer chose
    to keep. Only those two are read here -- uncertainty and delay come from
-   the config as constants, matching python/replay.py's load_speed(). */
+   the config as constants, matching tools/replay.py's load_speed(). */
 static int load_speed(const char* path, speed_epoch_t** out)
 {
     *out    = NULL;
@@ -1149,6 +1179,46 @@ static int load_heading(const char* path, heading_epoch_t** out)
     return n;
 }
 
+/* ranges.csv: "t_us, anchor_id, x, y, z, range_m, stddev_m" plus the
+   producer's own trailing columns, which are not read. A row with a
+   non-positive 1-sigma or a negative range is dropped here, the filter
+   would refuse it anyway. */
+static int load_ranges(const char* path, range_epoch_t** out)
+{
+    *out    = NULL;
+    FILE* f = fopen(path, "r");
+    if (!f) { return -1; }
+    char           line[512];
+    int            n   = 0;
+    int            cap = 0;
+    range_epoch_t* r   = NULL;
+    while (fgets(line, sizeof(line), f))
+    {
+        long long    t;
+        unsigned int id;
+        double       x, y, z;
+        float        rng, sd;
+        if (line[0] == '#') continue;
+        if (sscanf(line, "%lld,%u,%lf,%lf,%lf,%f,%f", &t, &id, &x, &y, &z, &rng, &sd) != 7)
+        {
+            continue;
+        }
+        if (!(sd > 0.0f) || !(rng >= 0.0f) || id > 0xFFFFu) continue;
+        r                 = grow_or_die(r, n, &cap, sizeof(*r), path);
+        r[n].t_us         = (int64_t)t;
+        r[n].anchor_id    = (uint16_t)id;
+        r[n].anchor_ecef[0] = x;
+        r[n].anchor_ecef[1] = y;
+        r[n].anchor_ecef[2] = z;
+        r[n].range_m      = rng;
+        r[n].stddev_m     = sd;
+        n++;
+    }
+    fclose(f);
+    *out = r;
+    return n;
+}
+
 /* Why a heading row did not become a yaw measurement. */
 typedef enum
 {
@@ -1160,7 +1230,7 @@ typedef enum
 } heading_reason_t;
 
 /* One heading.csv row -> the yaw measurement ins consumes. Mirrors
-   heading_measurement() in python/replay.py: gate on the carrier-phase
+   heading_measurement() in tools/replay.py: gate on the carrier-phase
    solution, scale and floor the receiver's 1-sigma, then undo the antenna
    mounting with the attitude the suite holds right now (level when it holds
    none yet, which is exact for a baseline along x). */
@@ -1266,6 +1336,7 @@ static mag_epoch_t*   g_mag;
 static baro_epoch_t*  g_baro;
 static speed_epoch_t* g_speed;
 static heading_epoch_t* g_heading;
+static range_epoch_t*   g_ranges;
 
 /* 3D position error of the ins solution against one reference epoch, with the
  * scoring lever arm mapping the filter position onto the truth point. Returns
@@ -1530,6 +1601,17 @@ int main(int argc, char** argv)
         }
     }
 
+    int n_ranges = 0;
+    if (cfg.ranges_enable)
+    {
+        snprintf(path, sizeof(path), "%s/%s", datadir, cfg.in_ranges);
+        n_ranges = load_ranges(path, &g_ranges);
+        if (n_ranges <= 0)
+        {
+            fprintf(stderr, "ranges: enable but no usable %s\n", path);
+            return 1;
+        }
+    }
     int n_heading = 0;
     if (cfg.heading_enable)
     {
@@ -1730,7 +1812,7 @@ int main(int argc, char** argv)
     init.gyr_bias_pred_stddev_rps_sqrts  = cfg.gyr_bias_rw;
     /* Auto-ZUPT/ZARU pseudo-measurement stddev: this harness's own default
        (0.05 m/s, 0.1 deg/s), NOT ins.c's own built-in default (0.05 m/s,
-       0.5 deg/s) -- shared with python/replay.py's build_config() for
+       0.5 deg/s) -- shared with tools/replay.py's build_config() for
        years, see the replay_cfg_t comment above. */
     init.zero_vel_stddev_mps = (cfg.zero_vel_stddev_mps > 0.0f) ? cfg.zero_vel_stddev_mps : 0.05f;
     init.zero_rot_stddev_rps =
@@ -1806,6 +1888,8 @@ int main(int argc, char** argv)
     opt.speed_scale                      = cfg.speed_scale;
     opt.speed_stddev_rel                 = cfg.speed_stddev_rel;
     opt.speed_min_mps                    = cfg.speed_min_mps;
+    opt.range_height_with_baro           = cfg.ranges_height_with_baro != 0;
+    opt.range_aiding_max_hpos_stddev_m   = cfg.ranges_aiding_max_hpos_stddev_m;
     opt.estimate_mag_bias                = cfg.mag_estimate_bias != 0;
     opt.magnetometer_min_delay_ms        = cfg.mag_min_delay_ms;
     /* Both are 0 unless the config names them, which is the library's own
@@ -1964,7 +2048,7 @@ int main(int argc, char** argv)
         fprintf(stderr,
                 "replay: WARNING mag.enable is set but mag.wmm_year is missing, no magnetic "
                 "reference field is built and the magnetometer will not be fused "
-                "(tools/inslib_convert_ubx_to_csv.py derives it from NAV-PVT)\n");
+                "(inslib_convert_ubx_to_csv.py derives it from NAV-PVT)\n");
     }
 
     char delay_suffix[32];
@@ -2052,6 +2136,8 @@ int main(int argc, char** argv)
 
     int64_t       t_prev       = 0;
     int           iref = 0, ignss = 0, imag = 0, ibaro = 0, ispeed = 0, iheading = 0;
+    int           iranges = 0;
+    unsigned long n_ranges_offered = 0, n_ranges_carried = 0;
     unsigned long n_heading_reason[HEADING_N_REASONS] = {0};
     int64_t       fi_next_t_us = 0; /* next free_inertial_start offer */
     unsigned long n_fi_offers  = 0;
@@ -2308,6 +2394,43 @@ int main(int argc, char** argv)
             }
         }
 
+        /* --- ranges (REQ-NAV-082, REQ-VER-038) --------------------------
+           Every row up to this epoch, each anchored at its own age. What
+           does not fit the filter's per-epoch maximum is carried to the
+           next epoch, where it is older by one IMU interval, rather than
+           dropped. */
+        if (cfg.ranges_enable)
+        {
+            int k = 0;
+            while (iranges < n_ranges && g_ranges[iranges].t_us <= t)
+            {
+                if (k == INS_RANGE_MAX)
+                {
+                    n_ranges_carried++;
+                    break;
+                }
+                const range_epoch_t* rr = &g_ranges[iranges];
+                float sd = rr->stddev_m * (cfg.ranges_stddev_scale > 0.0f ? cfg.ranges_stddev_scale : 1.0f);
+                if (cfg.ranges_stddev_min_m > 0.0f && sd < cfg.ranges_stddev_min_m)
+                {
+                    sd = cfg.ranges_stddev_min_m;
+                }
+                ins_meas_range_t* mr = &m.range[k++];
+                memcpy(mr->anchor_ecef, rr->anchor_ecef, sizeof(mr->anchor_ecef));
+                mr->range_m   = rr->range_m;
+                mr->stddev_m  = sd;
+                mr->delay_ms  = (int)((t - rr->t_us) / 1000);
+                mr->anchor_id = rr->anchor_id;
+                mr->is_valid  = true;
+                n_ranges_offered++;
+                iranges++;
+            }
+            if (k > 0)
+            {
+                for (i = 0; i < 3; ++i) { m.range_leverarm_b[i] = cfg.ranges_leverarm_frd[i]; }
+            }
+        }
+
         nav_suite_update(&g_suite, &m);
 
         /* --- scoring at reference epochs -------------------------------- */
@@ -2427,6 +2550,13 @@ int main(int argc, char** argv)
                n_fi_offers, cfg.fi_lat_deg, cfg.fi_lon_deg, cfg.fi_height_m,
                (double)cfg.fi_stddev_m);
     }
+    if (cfg.ranges_enable)
+    {
+        printf("range aiding: %d rows, %lu offered (%lu epochs full), %u fused, %u rejected,"
+               " %u skipped, %u epochs counted as position aiding\n",
+               n_ranges, n_ranges_offered, n_ranges_carried, diag->n_range_used,
+               diag->n_range_rejected, diag->n_range_skipped, diag->n_range_pos_aiding);
+    }
     if (cfg.heading_enable)
     {
         printf("heading aiding: %d rows, %lu offered as yaw, %lu not fixed, %lu bad 1-sigma,"
@@ -2532,7 +2662,7 @@ int main(int argc, char** argv)
        and the one datasets/check_simulated.py already implements. This one
        used to be checked unconditionally, so a 0 meant "must be below zero"
        and failed every run: the way to leave it ungated was an arbitrary
-       large number (datasets/fog/config_pyahrs.yaml still carries a 999). */
+       large number. */
     if (cfg.lim_pos_rms_m > 0.0)
     {
         CHECK_LIMIT(stat_rms(&nav_pos), cfg.lim_pos_rms_m, "ins pos rms [m]");

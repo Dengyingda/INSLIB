@@ -21,9 +21,9 @@
  * The magnetometer is fused only when mag: enable says so, unlike every
  * other sensor here: it is the one whose raw output is useless until it
  * has been calibrated against the platform it is mounted in
- * (tools/inslib_calib_gui.py writes the mag: keys this reads).
+ * (inslib_calib_gui.py writes the mag: keys this reads).
  *
- * --config reads the config.yaml subset shared with python/replay.py
+ * --config reads the config.yaml subset shared with tools/replay.py
  */
 
 #include <stdbool.h>
@@ -630,8 +630,8 @@ static bool gnss_llh_to_ins_ned(const ins_t* f, double lat_rad, double lon_rad, 
 /* ===========================================================================
  * Input source: a bound UDP socket
  *
- * The only input. tools/inslib_hub.py owns the serial device and sends
- * the stream here; tools/inslib_replay_udp.py sends a recorded .ubx file
+ * The only input. inslib_hub.py owns the serial device and sends
+ * the stream here; inslib_replay_udp.py sends a recorded .ubx file
  * to the same port at the original pace. A session is therefore
  * reproducible without hardware, and this program cannot tell the two
  * apart -- which is exactly what makes the replay worth anything.
@@ -1359,7 +1359,7 @@ typedef struct
        The risk this default accepts is an UNCALIBRATED magnetometer:
        hard iron is a bias, so no amount of measurement noise removes the
        heading error it causes, only a calibration does
-       (tools/inslib_calib_gui.py, mag.fixed_bias / mag.misalignment).
+       (inslib_calib_gui.py, mag.fixed_bias / mag.misalignment).
        What makes it acceptable is that ins does not fail silently there
        -- with a position known, the field-strength gate compares |B|
        against the WMM total field, downweights samples outside the
@@ -1378,7 +1378,7 @@ typedef struct
     /* Automotive mode (REQ-NAV-034): the GNSS course over ground doubles as
        a yaw measurement, which only holds on a platform that cannot move
        sideways. Same three top-level keys as tools/replay.c and
-       python/replay.py; each tuning value 0 -> ins's own default. */
+       tools/replay.py; each tuning value 0 -> ins's own default. */
     bool  automotive_mode;
     float automotive_min_speed_mps;
     float automotive_min_yaw_stddev_deg;
@@ -1493,8 +1493,8 @@ typedef struct
 } insrcv_t;
 
 /* ===========================================================================
- * --config: the config.yaml subset shared with python/replay.py
- * --config and python/replay.py
+ * --config: the config.yaml subset shared with tools/replay.py
+ * --config and tools/replay.py
  *
  * Same minimal YAML-subset reader as tools/replay.c (shared, mini_yaml.h):
  * two levels ("section:" + 2-space-indented "key: value"), scalars,
@@ -1645,7 +1645,7 @@ static int config_set(insrcv_t* r, const char* sec, const char* key, const char*
     }
     else if (!strcmp(full, "baro.enable")) { r->baro_enable = ((int)d != 0); }
     else if (!strcmp(full, "baro.stddev_m")) { if (d > 0.0) r->baro_stddev_m = (float)d; }
-    /* Spelled as in tools/replay.c, python/replay.py and every dataset
+    /* Spelled as in tools/replay.c, tools/replay.py and every dataset
        config under datasets. The value IS a stddev, but one config file
        has to mean the same thing in the live receiver and in a replay,
        and the shorter spelling is the one already written everywhere. */
@@ -1990,7 +1990,7 @@ static void sensor_apply_calib(const float M[9], const float bias[3], const floa
    the overlay carries the measured magnitude next to the magnitude the
    World Magnetic Model expects at this position, which turns "is the
    calibration any good" into a line on a plot. Exactly the |a| against
-   9.81 check the accelerometer gets in tools/inslib_calib_gui.py.
+   9.81 check the accelerometer gets in inslib_calib_gui.py.
 
    norm_ut is after the mag: calibration, since that is what the filter
    sees; norm_raw_ut is before it, so the two together also say how much
@@ -2836,7 +2836,7 @@ static void suite_bootstrap(insrcv_t* r, int64_t t_us)
     memcpy(opt.imu_gyr_fixed_bias, r->gyr_fixed_bias, sizeof(opt.imu_gyr_fixed_bias));
     /* Fixed magnetometer calibration (REQ-NAV-039): soft iron, hard iron
        and the alignment onto the IMU triad, all folded into the one
-       matrix by tools/inslib_calib_gui.py. Applied whether or not the
+       matrix by inslib_calib_gui.py. Applied whether or not the
        18-state hard-iron estimation runs: that one tracks what CHANGES
        after the calibration was taken, it does not replace it. */
     memcpy(opt.mag_misalignment, r->mag_misalignment, sizeof(opt.mag_misalignment));
@@ -3236,7 +3236,7 @@ static void on_imu(insrcv_t* r, const imu_sample_t* s)
        Consequence worth knowing: a sender that delivers in BURSTS caps
        this. Within one burst the host clock barely moves, so the whole
        burst yields a single publish and the effective rate is the burst
-       rate, not --pub-hz (a 0.2 s loop in tools/inslib_hub.py once made
+       rate, not --pub-hz (a 0.2 s loop in inslib_hub.py once made
        this 5 Hz). The fix belongs on the sending side. */
     const double now = host_now_sec();
     if (now >= r->next_pub_sec)
@@ -3803,8 +3803,8 @@ static void usage(const char* argv0)
             "\n"
             "  UBX stream (UDP) -> nav_suite -> PlotJuggler (UDP/JSON).\n"
             "\n"
-            "  The stream comes from tools/inslib_hub.py, which owns the serial\n"
-            "  device and redistributes it, or from tools/inslib_replay_udp.py,\n"
+            "  The stream comes from inslib_hub.py, which owns the serial\n"
+            "  device and redistributes it, or from inslib_replay_udp.py,\n"
             "  which sends a recorded .ubx at its original pace. This program\n"
             "  never opens a serial port: that would make recording the same\n"
             "  session impossible, since a port has exactly one owner.\n"
@@ -3825,7 +3825,7 @@ static void usage(const char* argv0)
             "                        HIGHRES_IMU, EKF_STATUS_REPORT, plus the\n"
             "                        sub-filter breakdown as NAMED_VALUE_FLOAT and\n"
             "                        the blocked reason as STATUSTEXT). Same rates\n"
-            "                        as python/replay.py --mavlink, which has no\n"
+            "                        as tools/replay.py --mavlink, which has no\n"
             "                        GPS_RAW_INT: that needs the raw receiver fix,\n"
             "                        which only the live path has\n"
             "  --mav-ip <addr>       MAVLink destination (default %s)\n"
@@ -3838,7 +3838,7 @@ static void usage(const char* argv0)
             "  --no-auto-zaru        don't arm the ARS/AHRS velocity-blind auto-ZARU\n"
             "filter:\n"
             "  --config <yaml>       read the config.yaml subset shared with\n"
-            "                        python/replay.py: imu noise + fixed IMU\n"
+            "                        tools/replay.py: imu noise + fixed IMU\n"
             "                        calibration, baro enable/stddev,\n"
             "                        gnss gates/lever arm/delay, auto-ZUPT/ZARU\n"
             "                        pseudo-measurement stddev + static gate,\n"

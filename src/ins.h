@@ -1392,6 +1392,13 @@ typedef struct
                                    unobserved, so the next bootstrap can
                                    price how far it could have got (see
                                    ins_autoinit_origin_carry_usable) */
+        bool baro_h0_valid;   /**< the exiting instance ran on the barometric
+                                   height source (REQ-NAV-053), so its datum
+                                   anchor below is carried with the origin
+                                   (REQ-NAV-088) */
+        float baro_h0_m;      /**< [m] that instance's barometric datum
+                                   anchor (baro_h0_m), only meaningful while
+                                   baro_h0_valid */
     } origin_carry;           /**< n-frame origin carried across a quality-loss re-arm
                                    (REQ-NAV-062) */
 

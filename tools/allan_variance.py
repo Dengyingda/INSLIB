@@ -32,7 +32,7 @@ Feed it a long static log (ideally a few hours): the sensor sitting still on a
 bench, the longer the better for a stable RRW.
 
 Usage:
-    python3 python/allan_variance.py <imu.csv | dataset-dir> [options]
+    python3 tools/allan_variance.py <imu.csv | dataset-dir> [options]
 
     --config PATH   config.yaml to compare against (shows current -> suggested)
     --plot PATH     write the Allan-deviation plot (PNG/PDF, needs matplotlib)

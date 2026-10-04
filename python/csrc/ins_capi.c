@@ -150,6 +150,8 @@ static void cfg_to_init_opt(const ins_cfg_t* cfg, ins_init_t* init, ins_options_
     opt->automotive_lateral_stddev_mps            = cfg->automotive_lateral_stddev_mps;
     opt->automotive_lateral_max_yaw_rate          = cfg->automotive_lateral_max_yaw_rate;
     opt->automotive_lateral_after_sec             = cfg->automotive_lateral_after_sec;
+    opt->range_height_with_baro                   = (cfg->range_height_with_baro != 0);
+    opt->range_aiding_max_hpos_stddev_m           = cfg->range_aiding_max_hpos_stddev_m;
 }
 
 static void meas_baro(ins_measurements_t* m, float pressure_pa, float stddev_m)
@@ -168,6 +170,29 @@ static void meas_speed(ins_measurements_t* m, float speed_mps, float stddev_mps,
     m->speed.speed_mps  = speed_mps;
     m->speed.stddev_mps = stddev_mps;
     m->speed_delay_ms   = delay_ms;
+}
+
+/* One range entry (REQ-NAV-082) into the first free slot of the epoch.
+   -1 when all INS_RANGE_MAX slots are taken. */
+static int meas_range(ins_measurements_t* m, const double anchor_ecef[3], float range_m,
+                      float stddev_m, int delay_ms, uint16_t anchor_id)
+{
+    int i;
+    for (i = 0; i < INS_RANGE_MAX; ++i)
+    {
+        ins_meas_range_t* r = &m->range[i];
+        if (r->is_valid) continue;
+        r->anchor_ecef[0] = anchor_ecef[0];
+        r->anchor_ecef[1] = anchor_ecef[1];
+        r->anchor_ecef[2] = anchor_ecef[2];
+        r->range_m        = range_m;
+        r->stddev_m       = stddev_m;
+        r->delay_ms       = delay_ms;
+        r->anchor_id      = anchor_id;
+        r->is_valid       = true;
+        return 0;
+    }
+    return -1;
 }
 
 static void meas_imu(ins_measurements_t* m, int64_t t_us, float dt, const float acc[3],
@@ -402,6 +427,17 @@ void ins_core_set_speed(void* h, float speed_mps, float stddev_mps, int delay_ms
 {
     ins_core_ctx_t* c = (ins_core_ctx_t*)h;
     if (c) meas_speed(&c->meas, speed_mps, stddev_mps, delay_ms);
+}
+int ins_core_add_range(void* h, const double anchor_ecef[3], float range_m, float stddev_m,
+                       int delay_ms, uint16_t anchor_id)
+{
+    ins_core_ctx_t* c = (ins_core_ctx_t*)h;
+    return c ? meas_range(&c->meas, anchor_ecef, range_m, stddev_m, delay_ms, anchor_id) : -1;
+}
+void ins_core_set_range_leverarm(void* h, const float lever_b[3])
+{
+    ins_core_ctx_t* c = (ins_core_ctx_t*)h;
+    if (c) memcpy(c->meas.range_leverarm_b, lever_b, sizeof(c->meas.range_leverarm_b));
 }
 void ins_core_set_gnss_delay_ms(void* h, int ms)
 {
@@ -704,6 +740,17 @@ void ins_suite_set_speed(void* h, float speed_mps, float stddev_mps, int delay_m
 {
     ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
     if (c) meas_speed(&c->meas, speed_mps, stddev_mps, delay_ms);
+}
+int ins_suite_add_range(void* h, const double anchor_ecef[3], float range_m, float stddev_m,
+                        int delay_ms, uint16_t anchor_id)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    return c ? meas_range(&c->meas, anchor_ecef, range_m, stddev_m, delay_ms, anchor_id) : -1;
+}
+void ins_suite_set_range_leverarm(void* h, const float lever_b[3])
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    if (c) memcpy(c->meas.range_leverarm_b, lever_b, sizeof(c->meas.range_leverarm_b));
 }
 /* baro_alt acc-bias drift density [m/s^2/sqrt(Hz)] (<=0 -> baro_alt default).
    Must be called before the first baro sample latches baro_cfg into the
@@ -1084,6 +1131,38 @@ static void copy_speed_diag(const ins_t* f, uint32_t out[3], float* resid)
     out[1]              = d->n_speed_used;
     out[2]              = d->n_speed_skipped;
     if (resid) *resid = d->last_speed_residual_mps;
+}
+static void copy_range_diag(const ins_t* f, uint32_t out[5], float* resid)
+{
+    const ins_diag_t* d = ins_get_diag(f);
+    out[0]              = d->n_range_seen;
+    out[1]              = d->n_range_used;
+    out[2]              = d->n_range_rejected;
+    out[3]              = d->n_range_skipped;
+    out[4]              = d->n_range_pos_aiding;
+    if (resid) *resid = d->last_range_residual_m;
+}
+void ins_core_get_range_diag(void* h, uint32_t out_counts[5], float* out_resid)
+{
+    ins_core_ctx_t* c = (ins_core_ctx_t*)h;
+    if (c)
+    {
+        copy_range_diag(&c->filter, out_counts, out_resid);
+        return;
+    }
+    memset(out_counts, 0, sizeof(uint32_t) * 5);
+    if (out_resid) *out_resid = 0.0f;
+}
+void ins_suite_get_range_diag(void* h, uint32_t out_counts[5], float* out_resid)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    if (c)
+    {
+        copy_range_diag(&c->suite.ins, out_counts, out_resid);
+        return;
+    }
+    memset(out_counts, 0, sizeof(uint32_t) * 5);
+    if (out_resid) *out_resid = 0.0f;
 }
 void ins_core_get_speed_diag(void* h, uint32_t out_counts[3], float* out_resid)
 {

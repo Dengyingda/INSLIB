@@ -244,7 +244,7 @@ cfg = Config(imu_acc_misalignment=(...), imu_acc_fixed_bias=(...),
              mag_misalignment=(...), mag_fixed_bias=(...))
 ```
 
-`python/replay.py` reads the `config.yaml` directly. In a `python -m INSLIB`
+`tools/replay.py` reads the `config.yaml` directly. In a `python -m INSLIB`
 run file the same values go under `filter:` with the `Config` names
 (`imu_acc_misalignment: [...]` and so on).
 

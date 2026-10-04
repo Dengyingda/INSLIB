@@ -1,6 +1,6 @@
 """Dark/light colour themes for inspostgui.py and ins_map_view.py.
 
-Same scheme as tools/inslib_gui.py: two palettes, every colour of the
+Same scheme as inslib_gui.py: two palettes, every colour of the
 window comes out of whichever one is current, and whatever fixes a colour
 at build time (an inline stylesheet, a pen, a GL item) registers a
 callable with themed() that set_theme() runs again after a switch.
@@ -24,6 +24,8 @@ DARK = {
     "map_est": "#ff6a6a", "map_here": "#ffb454", "fix": "#ffc83c",
     # The previous run, drawn behind the current one.
     "ghost": "#9aa4b2",
+    # Where a ZUPT/ZARU was applied, on the 3D trail.
+    "zupt": "#ff5ad2",
     "gl_bg": "#121418", "gl_grid": "#3c414b", "ref_trail": "#8cf08c",
     "position": "#ff5a5a", "ellipsoid": "#64c8ff",
     # Accelerometer bubble.
@@ -47,6 +49,7 @@ LIGHT = {
     "extra": "#7d3c98", "est": "#1f6fb2",
     "map_est": "#c0392b", "map_here": "#b86e00", "fix": "#c88a00",
     "ghost": "#8a93a0",
+    "zupt": "#c2188f",
     "gl_bg": "#fbfbfd", "gl_grid": "#b9c0ca", "ref_trail": "#1c8a4e",
     "position": "#c0392b", "ellipsoid": "#1f6fb2",
     "bubble_ring": "#9aa4b2", "bubble_edge": "#b86e00",

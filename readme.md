@@ -16,9 +16,9 @@ In action, fusing IMU measurements with Galileo HAS-corrected GPS/GNSS inputs:
 
 | Metric | Coverage |
 |---|---|
-| C0 (Line) | 99.7% (4120/4131) |
-| C1 (Branch) | 92.3% (2747/2977) |
-| MC/DC | 92.2% (2725/2956) |
+| C0 (Line) | 99.7% (4129/4140) |
+| C1 (Branch) | 92.2% (2757/2989) |
+| MC/DC | 92.1% (2735/2968) |
 <!-- COVERAGE:END -->
 
 <!-- STACK:START -->
@@ -26,8 +26,8 @@ In action, fusing IMU measurements with Galileo HAS-corrected GPS/GNSS inputs:
 
 | Entry point | x86_64-linux-gnu, GCC 14.2.0 |
 |---|---:|
-| `nav_suite_update()` | 13504 |
-| `ins_update()` | 12128 |
+| `nav_suite_update()` | 13488 |
+| `ins_update()` | 12112 |
 | `ahrs_update()` | 8240 |
 | `baro_alt_update()` | 7904 |
 | `nav_suite_init()` | 2704 |
@@ -70,7 +70,7 @@ helper programs and GUI apps are included in this repository.
 * UAVs that only need roll/pitch, no yaw/heading, can skip the magnetometer entirely: the standalone `AHRS_MODE_ARS` mode (5-state, freely-integrated yaw) runs from IMU data alone
 * Robust UDU/Bierman-Thornton Kalman Filter routines for numerically robust square-root filtering (effective precision for covariance is increased)
 * Worst-Case-Execution Time (WCET) friendly: no unbounded loops, recursion, suitable for real-time control loops
-* **Bounded, known stack usage**: static worst-case stack analysis of every public API function (`make stack`, built on GCC's `-fcallgraph-info`), gated against budgets and failing on recursion, variable length arrays or unresolved function pointer calls, so the stack of the task running the filter can be sized from a number instead of a guess
+* **Known stack usage**: static worst-case stack analysis of every public API function (`make stack`, using GCC's `-fcallgraph-info`), deliberately failing on recursion, variable length arrays or unresolved function pointer calls, so the stack of the task running the filter can be sized from a number instead of a guess
 * Strong static code analysis tests (undefined behaviour sanitizer **UBSan, ASan**)
 * Built-in light-weight World Magnetic Model (WMM) for magnetometer declination compensation
 * No heap, no OS dependencies, portable code: runs on bare-metal **embedded** targets as well as on a desktop computer
@@ -89,11 +89,19 @@ helper programs and GUI apps are included in this repository.
 `inspostgui.py` is a GUI to post-process measurements: open a dataset's config
 YAML (it sits next to the CSVs, a directory may hold several variants such as
 `config.yaml` and `config_experimental.yaml`), tweak its settings, and replay it.
+Keyboard: `F5` run, `Space` pause/resume, `Esc` stop, `Ctrl+O` open,
+`Ctrl+S` save the config, `Ctrl+1`..`Ctrl+5` switch tab.
+
+**Windows, no Python needed:** download `inspostgui-<version>-windows-x64.zip` from the
+[latest release](https://github.com/jnz/INSLIB/releases/latest), unzip it (keep the folder
+together) and start `inspostgui.exe`. Windows may show a SmartScreen warning, the
+executable is not code signed. Everywhere else, or to work on the code, run it
+from source:
 
 ```sh
 sh python/setup_venv.sh               # one-time (also runs `make pylib`)
 . env.sh                              # activate the venv (POSIX/git-bash, any OS)
-python3 python/inspostgui.py datasets/fog
+python3 tools/inspostgui.py datasets/fog
 ```
 
 ### `.csv` Data Format
@@ -135,7 +143,7 @@ configuration: config.yaml".
 ```sh
 sh python/setup_venv.sh               # one-time (also runs `make pylib`)
 . env.sh                              # activate the venv (POSIX/git-bash, any OS)
-python3 python/replay.py datasets/fog --plot --plot-out /tmp/plots.pdf
+python3 tools/replay.py datasets/fog --plot --plot-out /tmp/plots.pdf
 ```
 
 Example PDF plot output from `replay.py`:
@@ -161,7 +169,7 @@ with a sharp correlation peak (see the plot above).
 
 Example for a u-blox X20P receiver delay estimation:
 ```sh
-python3 python/replay.py datasets/pedestrian/07_outdoor_only/ --estimate-gnss-delay
+python3 tools/replay.py datasets/pedestrian/07_outdoor_only/ --estimate-gnss-delay
 ```
 
 ## Live Data Quickstart
@@ -256,8 +264,8 @@ for `make format-check` in particular; on a non-Ubuntu-22.04 machine, run
 ├── KFCore/               # Submodule: linear algebra, UDU/Bierman-Thornton filter
 ├── tests/                # Unit/integration tests
 ├── datasets/             # Real-world + simulated replay datasets
-├── tools/                # C/Python reference board tools: calibration, GUI
-├── python/               # Python bindings, plotting, replay harness
+├── tools/                # Command line programs: insrcv, replay (C and Python), post-processing GUI, calibration, receiver setup, protocol
+├── python/               # Python package INSLIB (ctypes binding) and its tests
 ├── magneticmodel/        # WMM lookup table
 ├── doc/                  # Documentation, Doxygen, images
 └── tutorial/             # Minimal C + Python usage examples
@@ -265,13 +273,14 @@ for `make format-check` in particular; on a non-Ubuntu-22.04 machine, run
 
 ## Reference Hardware
 
-All tools (`tools/`) speak an open (UBX-based) protocol,
+The live receiver `insrcv` (`tools/`) speaks an open (UBX-based) protocol,
 documented in [tools/inslib_protocol.md](tools/inslib_protocol.md).
 
 The *reference board* is a low-cost and ready-to-use development module (IMU,
 u-blox GNSS receiver, magnetometer, barometer) for running INSLIB on real
 hardware with pre-calibrated sensors.  It implements the protocol above and is
-ready to use out of the box. Its firmware itself is not public, get in touch if
+ready to use out of the box. Its firmware and the host tools that come with it
+(serial hub, control GUI, configuration, calibration window) are not public, get in touch if
 you're interested in a collaboration with my university institute or in getting a unit.
 
 ![Image of reference hardware](doc/figures/reference_board.jpg)
@@ -306,14 +315,13 @@ Live-Control center for reference INS board
 
 ![Screenshot 2](doc/figures/gui_2.png)
 
-### Reference Board Command Line Tools
+### Command Line Tools
 
-* `inslib_hub.py` Stream, forward and log input data from reference board
-* `inslib_convert_ubx_to_csv.py` Convert reference board to `.csv` files
-* `inslib_imu_calib.py` Command line IMU-calibration tool (live, or offline from any IMU's `.csv` log with `--csv`)
-* `inslib_cfg.py` Reference board config read/write
-* `inslib_clock_error.py` Estimate MCU-clock error from reference board `.csv` log
-* `inslib_obd_speed.py` Stream car velocity from OBD-II dongle
+* [`insrcv`](tools/insrcv.c) Live receiver: UDP stream in, navigation solution out (PlotJuggler, MAVLink)
+* [`tools/replay.py`](tools/replay.py) and [`tools/inspostgui.py`](tools/inspostgui.py) Replay a dataset through the filter, plots and GUI
+* [`tools/inslib_imu_calib.py`](tools/inslib_imu_calib.py) Command line IMU-calibration tool (offline from any IMU's `.csv` log with `--csv`)
+* [`tools/allan_variance.py`](tools/allan_variance.py) Allan variance: noise and bias random walk from a static recording
+* [`tools/ublox_f9p_config.py`](tools/ublox_f9p_config.py), [`tools/ublox_x20p_config.py`](tools/ublox_x20p_config.py) Persistent u-blox receiver configuration
 
 ## Common Pitfalls
 
@@ -342,7 +350,7 @@ filtering, etc.) has to line up properly. A list of common mistakes:
   high-quality GNSS receiver with a matching high-quality antenna is a must.
 * **GNSS receiver not configured** There are countless ways to misconfigure
   a GNSS receiver. A working configuration for u-blox F9P and X20 receivers
-  can be found [here (F9P)](python/f9p_config.py) and [here (X20)](python/x20p_config.py).
+  can be found [here (F9P)](tools/ublox_f9p_config.py) and [here (X20)](tools/ublox_x20p_config.py).
 * **Timestamps not synchronized or not monotonic** every sensor needs to be
   aligned to a single monotonic timebase (`t_us`). Clock issues break the
   library.

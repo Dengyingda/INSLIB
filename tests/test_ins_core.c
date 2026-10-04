@@ -3430,6 +3430,126 @@ static void scenario_gnss_quality_exit_origin_carry(void)
 #undef ORIGIN_STEP
 }
 
+/* The barometric datum travels with the carried origin (REQ-NAV-088): a
+   re-bootstrap on a fix that is several metres off vertically, while the
+   barometer knows the platform's true height, must restart the height channel
+   on the barometer. That is the drone holding its altitude through a GNSS
+   outage, which must neither climb nor sink when the 3D solution returns. The
+   second part covers the fallback: no barometer at the re-bootstrap, so the
+   GNSS source is selected and the fix decides the height after all. */
+static void scenario_gnss_quality_exit_baro_datum_carry(void)
+{
+    printf("\n=== Scenario: barometric datum carried with the n-frame origin "
+           "(REQ-NAV-088) ===\n");
+
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    double llh0[3];
+    ins_ecef_to_latlonh(init_ecef(&init), &llh0[0], &llh0[1], &llh0[2]);
+    float g_vec[3];
+    ins_gravity_ned((float)llh0[0], (float)llh0[2], g_vec);
+
+    const float acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+    const float gyr_body[3] = {0.0f, 0.0f, 0.0f};
+    const float dt          = 0.01f;
+
+    /* The platform reappears 50 m north / 20 m east and 2 m up, which the
+       barometer reports. The fix claims 10 m up, an 8 m vertical error its
+       own reported accuracy does not reveal. */
+    const float true_h_m    = 2.0f;
+    const float dned_fix[3] = {50.0f, 20.0f, -10.0f};
+    double      fix_reappear[3];
+    test_ecef_offset_ned(llh0, dned_fix, fix_reappear);
+
+    /* One IMU epoch, a 5 Hz fix at FIX_ECEF with velocity 1-sigma VEL_STD,
+       and a barometer sample for BARO_ALT unless that is NAN. */
+#define DATUM_STEP(F, T, FIX_ECEF, VEL_STD, BARO_ALT)                                     \
+    do {                                                                                  \
+        (T) += us_from_sec(dt);                                                           \
+        ins_measurements_t m;                                                             \
+        memset(&m, 0, sizeof(m));                                                         \
+        m.timestamp = (T);                                                                \
+        set_imu(&m, acc_body, gyr_body, dt);                                              \
+        if (isfinite(BARO_ALT)) { set_baro(&m, pressure_from_altitude(BARO_ALT), 1.0f); } \
+        if ((long)((T) % 200000) < (long)(dt * 1e6f))                                     \
+        {                                                                                 \
+            ins_ecef_to_latlonh((FIX_ECEF), &m.gnss_pos.llh[0], &m.gnss_pos.llh[1],       \
+                                &m.gnss_pos.llh[2]);                                      \
+            m.gnss_pos.Qll_ned[0] = 1.0f;                                                 \
+            m.gnss_pos.Qll_ned[4] = 1.0f;                                                 \
+            m.gnss_pos.Qll_ned[8] = 1.0f;                                                 \
+            m.gnss_pos.is_valid   = true;                                                 \
+            m.gnss_vel.Qll_ned[0] = (VEL_STD) * (VEL_STD);                                \
+            m.gnss_vel.Qll_ned[4] = (VEL_STD) * (VEL_STD);                                \
+            m.gnss_vel.Qll_ned[8] = (VEL_STD) * (VEL_STD);                                \
+            m.gnss_vel.is_valid   = true;                                                 \
+        }                                                                                 \
+        ins_update(&(F), &m);                                                             \
+    } while (0)
+
+    int part;
+    for (part = 0; part < 2; ++part)
+    {
+        const bool    baro_at_reentry = (part == 0);
+        ins_t         f;
+        ins_options_t opt;
+        ins_time_us_t t = 0;
+
+        memset(&f, 0, sizeof(f));
+        fill_default_opt(&opt);
+        opt.auto_init               = true;
+        opt.gnss_init_dwell_disable = true;
+        opt.gnss_stop_dwell_sec     = 5.0f;
+        CHECK_TRUE(ins_init(&f, &init, &opt) == 0, "init ok");
+
+        while (t < (ins_time_us_t)(10e6)) { DATUM_STEP(f, t, init_ecef(&init), 0.1f, 0.0f); }
+        CHECK_TRUE(ins_is_ready(&f) && f.height_from_baro, "3D ready on barometric height");
+        const float h0_before = f.baro_h0_m;
+
+        while (f.is_initialized && t < (ins_time_us_t)(20e6))
+        {
+            DATUM_STEP(f, t, init_ecef(&init), 0.6f, 0.0f);
+        }
+        CHECK_TRUE(f.origin_carry.valid && f.origin_carry.baro_h0_valid,
+                   "the origin carry holds the barometric datum");
+        CHECK_NEAR(f.origin_carry.baro_h0_m, h0_before, 1e-6,
+                   "the carried anchor is the exiting instance's");
+
+        while (!f.is_initialized && t < (ins_time_us_t)(35e6))
+        {
+            DATUM_STEP(f, t, fix_reappear, 0.1f, baro_at_reentry ? true_h_m : NAN);
+        }
+        CHECK_TRUE(f.is_initialized, "re-bootstrapped on good fixes");
+        CHECK_NEAR(f.origin_llh[2], llh0[2], 1e-6, "origin kept across the re-arm");
+
+        float pos[3];
+        CHECK_TRUE(ins_get_position_local(&f, pos), "position available");
+        CHECK_NEAR(pos[0], dned_fix[0], 0.5, "north still taken from the fix");
+
+        if (baro_at_reentry)
+        {
+            CHECK_TRUE(f.height_from_baro, "barometric source selected again");
+            CHECK_NEAR(pos[2], -true_h_m, 0.3,
+                       "bootstrap height from the barometer, not the fix's +10 m");
+            CHECK_NEAR(f.baro_h0_m, h0_before, 1e-3, "the new instance runs on the carried anchor");
+            CHECK_NEAR(f.latlonh[2], llh0[2] + true_h_m, 0.3,
+                       "absolute height follows the barometric height");
+
+            /* Ten more seconds of the same wrong fixes: the height stays where
+               the barometer has it, nothing pulls it towards the fix. */
+            while (t < (ins_time_us_t)(45e6)) { DATUM_STEP(f, t, fix_reappear, 0.1f, true_h_m); }
+            CHECK_TRUE(ins_get_position_local(&f, pos), "position still available");
+            CHECK_NEAR(pos[2], -true_h_m, 0.3, "height held on the barometer");
+        }
+        else
+        {
+            CHECK_TRUE(!f.height_from_baro, "no barometer at the re-entry, GNSS source");
+            CHECK_NEAR(pos[2], dned_fix[2], 0.5, "without a barometer the fix sets the height");
+        }
+    }
+#undef DATUM_STEP
+}
+
 /* Shared bootstrap helper for the barometric-height scenarios below: a few
  * IMU(+optional barometer) epochs to fill the leveling window (needs >= 3
  * samples, REQ-NAV-047/ins_autoinit_try), then one final epoch that adds the
@@ -13915,6 +14035,7 @@ int main(void)
     scenario_gnss_mode_hysteresis();
     scenario_gnss_quality_exit_bias_carry();
     scenario_gnss_quality_exit_origin_carry();
+    scenario_gnss_quality_exit_baro_datum_carry();
     scenario_baro_height_source_selection();
     scenario_baro_height_fusion();
     scenario_baro_height_survives_reacquire();

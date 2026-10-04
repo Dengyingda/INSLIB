@@ -54,11 +54,11 @@ score:
   # This dataset is the GNSS delay-compensation test: gnss.csv timestamps are
   # shifted +200 ms and `gnss: delay_ms: 200` must undo it. Observed here are
   # WITH compensation; uncompensated (delay_ms 0) pos rms blows up to ~0.47 m.
-  lim_att_bias_deg: 0.50    # observed 0.334
-  lim_att_std_deg: 1.80    # observed 1.299
-  lim_yaw_bias_deg: 0.30    # observed 0.168
-  lim_yaw_std_deg: 2.50    # observed 1.810
-  lim_pos_rms_m: 0.08    # observed 0.049
+  lim_att_bias_deg: 0.219  # observed 0.208 (roll)
+  lim_att_std_deg: 1.38    # observed 1.311 (roll)
+  lim_yaw_bias_deg: 0.177  # observed 0.169
+  lim_yaw_std_deg: 1.86    # observed 1.769
+  lim_pos_rms_m: 0.06      # observed 0.056
   leverarm_frd: [0, 0, 0]
 
 origin:

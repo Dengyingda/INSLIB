@@ -90,6 +90,7 @@
     yaw_init_stddev_rad_deg,acc_bias_init_stddev_mps2,gyr_bias_init_stddev_rps_deg,
     roll_deg,pitch_deg,rpy_stddev_deg,yaw_deg,yaw_stddev_deg,
     heading,baseline_frd,require_fixed,stddev_scale,stddev_min_deg,
+    ranges,stddev_min_m,height_with_baro,aiding_max_hpos_stddev_m,
     enable,stddev_ut,min_delay_ms,wmm_year,estimate_bias,bias_init_ut,bias_rw_ut_sqrts,
     fixed_bias,misalignment,stddev_m,acc_bias_rw,
     h_process_noise,acc_bias_init_mps2,acc_noise_mps2_sqrthz,gyr_noise_psd,acc_noise_mps2,
@@ -126,7 +127,7 @@
        \large Software Documentation and Mathematical Models\\[1cm]
        \includegraphics[width=0.33\textwidth]{figures/inslib_logo.pdf}
 }
-\newcommand{\inslibversion}{1.1.1}
+\newcommand{\inslibversion}{1.2.0}
 \author{Jan Zwiener \\ \texttt{jan@zwiener.org}}
 \date{Version \inslibversion\\[2mm] \today}
 
@@ -142,12 +143,12 @@ barometer, magnetometer, local position references, absolute yaw
 references, scalar ground speed, ranges to known anchors and
 zero-velocity / zero-rotation information. Around it the library provides two standalone attitude filters
 (ARS/AHRS), a baro/accelerometer vertical channel filter
-(\code{baro\_\allowbreak{}alt}), a local-height-to-ellipsoid offset filter, a World
-Magnetic Model (WMM) lookup and a wrapper (\code{nav\_\allowbreak{}suite}) that runs all
+(\code{baro\_\allowbreak{}alt}), a World Magnetic Model (WMM) lookup
+and a wrapper (\code{nav\_\allowbreak{}suite}) that runs all
 filters in parallel with graceful degradation. All covariances are
 maintained in UDU (``square-root'') factorisation (Bierman/Thornton).  The
 code uses no heap and no OS services, and its per-epoch execution time is
-bounded by design. This document describes the software architecture, the
+bounded. This document describes the software architecture, the
 design decisions and the mathematical models implemented.
 \end{abstract}
 
@@ -166,24 +167,21 @@ robots, indoor platforms) with aerospace-style engineering constraints:
 \begin{itemize}
   \item \textbf{Portable C11.} No OS dependencies, no compiler
         extensions.
-  \item \textbf{No heap/dynamic memory.} All state lives in caller-provided structs,
+  \item \textbf{No heap/dynamic memory.} All state exists in caller-provided structs,
         the library never calls \code{malloc}/\code{free}.
   \item \textbf{Bounded execution time (WCET).} No unbounded
         loops, recursion, or input-dependent iteration counts in the
         per-epoch path.
   \item \textbf{Single-precision hot path.} Strapdown, prediction and
-        fusion run in 32-bit IEEE 754 \code{float}. 64-bit \code{double} is confined to the
-        absolute-position anchor (the geodetic origin, the
-        latitude/longitude/height bookkeeping and the geodetic differences
-        formed against them), touched only at initialisation, in the GNSS
-        residual and in accessors.
+        fusion run in 32-bit IEEE 754 \code{float}. 64-bit \code{double} is limited to
+        coordinate calculations that require a higher precision.
   \item \textbf{Fail-operational robustness.} Non-finite inputs (NaN, Inf) are
         dropped at the API boundary, implausible measurements are
-        statistically screened, and rejections are counted
+        statistically tracked, and rejections are counted
         in diagnostics.
 \end{itemize}
 
-Development follows a requirements-first workflow: behaviour is captured in a
+Development follows a requirements-first process: behaviour is captured in a
 machine-checked requirements database (\code{requirements/}, checked by
 \code{make reqs}) and verified by unit/integration tests (\code{make test}) and
 replays of real datasets (\code{make datasets}). This document does not restate
@@ -295,7 +293,7 @@ IMU noise fallback constants (sensor\_defaults.h). The
 \end{tikzpicture}
     \caption{Module dependencies. Grey modules are (reusable) helper modules:
     \code{geodetic\_\allowbreak{}toolbox}, \code{KFCore}, and \code{magnetic\_\allowbreak{}model} are
-    deliberately reusable outside this repository.}
+    reusable outside this repository.}
 \label{fig:arch}
 \end{figure}
 
@@ -334,8 +332,7 @@ offset filter.
 \subsection{Parallel redundant filters and mode arbitration}
 \label{sec:suite}
 
-The suite runs deliberately redundant estimators of different
-complexity:
+The suite runs redundant estimators of different complexity:
 
 \begin{itemize}
   \item \textbf{INS} needs position aiding to stay observable. It
@@ -652,7 +649,7 @@ filter instead of an overconfident one, but is not optimally tuned. The \emph{gy
 density, bias random walk) are shared between ins and ahrs via
 \code{sensor\_\allowbreak{}defaults.h}: in the suite both filters observe the same
 physical gyro, so their fallback must agree. The \emph{accelerometer}
-defaults are deliberately \emph{not} shared -- each filter fuses a
+defaults are \emph{not} shared -- each filter fuses a
 different physical quantity:
 ins integrates the raw specific force (pure VRW density,
 $\approx\!350\,\mu g/\sqrt{\text{Hz}}$), ars/ahrs fuses a discrete leveling
@@ -769,7 +766,7 @@ z_{\text{measured}}$, which makes $z = \mat{H}\,\delta\vect{x} + v$
 directly.
 
 % ==============================================================================
-\section{ins: the navigation ESKF}
+\section{INS: the navigation ESKF}
 % ==============================================================================
 
 \subsection{State definition}
@@ -789,9 +786,9 @@ $\vect{b}_m$ & \code{mag\_\allowbreak{}bias} & body (for 18-state mode) & \si{\m
 \bottomrule
 \end{tabular}
 \end{center}
-The absolute position is anchored in double precision, geodetically in
+The absolute position is captured in double precision, geodetically in
 both places: the n-frame origin as $(\varphi,\lambda,h)_{\text{origin}}$,
-and the current latitude/longitude/height $(\varphi,\lambda,h)$ bookkept
+and the current latitude/longitude/height $(\varphi,\lambda,h)$ tracked
 incrementally from it (\S\ref{sec:llh}).
 
 \paragraph{Error state.} 15 elements, extended to 18 when magnetometer
@@ -907,12 +904,9 @@ $(\varphi, \lambda, h)$ is maintained in double precision from the
 The curvature terms (and gravity) change only by
 $\sim d / R_{\text{earth}}$ per metre of travel and are cached,
 refreshed after every \SI{100}{\metre} of accumulated travel. $\Rne$ is
-deliberately not among them: no epoch-path computation uses it, so it is
+not among them: no epoch-path computation uses it, so it is
 built on demand in \code{ins\_\allowbreak{}get\_\allowbreak{}velocity\_\allowbreak{}ecef()}
-rather than refreshed inside the worst-case epoch. This keeps
-the double-precision cost at two multiply-adds per step while avoiding
-the classic float breakdown of absolute coordinates ($\sim$\SI{0.5}{\metre}
-resolution at Earth radius in single precision).
+rather than refreshed inside the worst-case epoch.
 
 \subsection{Covariance prediction}
 \label{sec:predict}
@@ -1034,7 +1028,7 @@ afterwards.
 \subsubsection{Barometric height (ins-internal)}
 \label{sec:baro-height-meas}
 
-If barometer data was present when \code{ins} bootstrapped
+If barometer data was present when \code{INS} started
 (\S\ref{sec:auto-init}), the barometric altitude is fused directly as a
 scalar measurement of the vertical position state, on the same datum
 anchor $h_0$ established at bootstrap (\S\ref{sec:origin-shift},
@@ -1049,7 +1043,7 @@ anchor $h_0$ established at bootstrap (\S\ref{sec:origin-shift},
   \label{eq:Hbaroheight}
 \end{equation}
 with $\vect{e}_3 = (0,0,1)\T$ picking the down component of $\vect{p}$
-(recall $h = -p_z$, \S\ref{sec:heightsystems}). Fused through the same
+($h = -p_z$, \S\ref{sec:heightsystems}). Fused through the same
 robust UDU update as every other measurement (\S\ref{sec:udu}), outliers
 downweighted like the barometer's own fusion in \code{baro\_\allowbreak{}alt}
 (\S\ref{sec:baroalt}) -- a persistent absolute reference, not a
@@ -1071,7 +1065,7 @@ across a passage the frozen state knew nothing about.
 \subsubsection{GNSS velocity}
 \label{sec:gnss-vel}
 
-NED velocity with full covariance; the lever-arm velocity is
+NED velocity with full covariance, the lever-arm velocity is
 compensated and its attitude coupling included
 \cite[eq.~8.74]{wendel2011}:
 \begin{equation}
@@ -2011,7 +2005,7 @@ never feed yaw. The measurement noise is inflated during dynamics:
 \end{equation}
 with the \emph{gravity-diff penalty} $k$ (default 8 per
 \si{\metre\per\second\squared}); the default $\sigma_{\text{acc}} =
-\SI{0.25}{\metre\per\second\squared}$ deliberately includes a margin so a
+\SI{0.25}{\metre\per\second\squared}$ includes a margin so a
 moderate disturbance still passes the robust chi-square gate with
 downweighting, instead of being rejected outright.
 
@@ -2208,6 +2202,14 @@ drifted against the fix (weather, ISA model error, a tunnel's own pressure).
 Shifting a carried origin onto that reading would push the accumulated
 disagreement into the origin, moving the datum and every local coordinate the
 consumer already holds -- which is what carrying the origin exists to prevent.
+The carried origin brings the exiting instance's barometric anchor along with
+it, so the re-bootstrap takes its initial height from the barometer on that
+anchor rather than from the bootstrap fix. A drone that loses GNSS, holds its
+altitude on the barometer and then re-enters the 3D solution therefore does
+not see a step in its height: the vertical error the fix happens to carry at
+that moment (several metres right after an indoor or urban outage) never
+reaches the height channel, which the fix's vertical row does not aid under
+the barometric source anyway.
 \paragraph{Bridging local to absolute.} The bridge is the offset $o$
 of \S\ref{sec:offsetfilter}, i.e. \emph{the ellipsoid height of the
 datum origin}:
@@ -2337,7 +2339,7 @@ $\mat{\Phi}$'s $v\!\to\!h$ coupling. The exact continuous-discrete model for
 this double integrator additionally places small
 $Q_{hh}\!\sim\!\sigma_a^2\dt^3/3$ and $Q_{hv}\!\sim\!\sigma_a^2\dt^2/2$ terms
 at every step, which the unit-weight-on-$v$-only $\mat{G}$ leaves at zero;
-$\sigma_h$ (\code{h\_\allowbreak{}process\_\allowbreak{}noise\_\allowbreak{}m\_\allowbreak{}sqrthz}) is a deliberately small,
+$\sigma_h$ (\code{h\_\allowbreak{}process\_\allowbreak{}noise\_\allowbreak{}m\_\allowbreak{}sqrthz}) is a small,
 independently tunable stand-in for that omitted term -- a margin against
 discretization/model mismatch, not a primary noise source.
 
@@ -2374,7 +2376,7 @@ observes $v$ directly:
   z = 0, \qquad \mat{H} = \begin{bmatrix} 0 & 1 & 0 \end{bmatrix},
 \end{equation}
 fused through the same robust UDU update as the barometer (outliers
-downweighted, not dropped). It is deliberately \emph{not} gated on the
+downweighted, not dropped). It is \emph{not} gated on the
 filter's own $v$ estimate -- that estimate is exactly what is being
 corrected, so gating on it would suppress the update precisely when the
 accelerometer-only dead reckoning has drifted furthest and needs it
@@ -2409,7 +2411,7 @@ $h_{\text{GNSS,ellipsoid}} = h_{\text{antenna}} + (\mathbf{R}_{b\to n}\,\mathbf{
 Without that, $o$ would absorb the lever arm and the absolute height would
 jump by it whenever \code{nav\_\allowbreak{}suite\_\allowbreak{}get\_\allowbreak{}height\_\allowbreak{}ellipsoid}
 switches between ins and $h_{\text{local}} + o$.
-The filter is deliberately \emph{agnostic} to where the local height
+The filter is \emph{agnostic} to where the local height
 comes from: with the barometric source $o$ lumps the weather-dependent
 pressure offset, the geoid undulation and the ISA model error, with an
 external local height (e.g.\ a lighthouse system) it lumps the geoid
@@ -2519,7 +2521,7 @@ $(\varphi,\lambda,h)_{\text{origin}}$:
   \vect{p}_{\text{local}}^{\,n} = \mathcal{M}\!\left(
     (\varphi,\lambda,h) - (\varphi,\lambda,h)_{\text{origin}} \right).
 \end{equation}
-There is deliberately no detour through ECEF here: routing it that way
+There is no detour through ECEF here: routing it that way
 would answer the same question with a different approximation than the
 filter's own position bookkeeping uses, so the local frame and the
 absolute solution would disagree at the metre level far from the origin.
@@ -2778,7 +2780,7 @@ one place, the detailed context is in the sections above.
 
 A dataset directory carries the neutral CSV streams
 (\code{imu.csv}, \code{ref.csv}, and optionally \code{gnss.csv}, \code{mag.csv},
-\code{baro.csv}, \code{speed.csv}, \code{heading.csv}, the column contract lives in
+\code{baro.csv}, \code{speed.csv}, \code{heading.csv}, \code{ranges.csv}, the column contract lives in
 \code{datasets/replay\_\allowbreak{}format.py})
 plus one \code{config.yaml} that tells the harness \emph{how} to run the filter:
 aiding source, initialisation mode, the sensor noise model, sensor calibration
@@ -3122,6 +3124,15 @@ heading:
   stddev_scale: 0.0         # multiplies the row's 1-sigma, 0 -> 1.0
   stddev_min_deg: 0.0       # floor after scaling, 0 -> none
   delay_ms: 0               # how old a row is at its timestamp
+# Ranges to anchors at known positions from ranges.csv (REQ-NAV-082).
+# The 1-sigma is a per-row column, each row is anchored at its own age.
+ranges:
+  enable: 0                 # Process ranges.csv
+  leverarm_frd: [0, 0, 0]   # IMU -> ranging antenna, body FRD [m]
+  stddev_scale: 0.0         # multiplies the row's 1-sigma, 0 -> 1.0
+  stddev_min_m: 0.0         # floor after scaling, 0 -> none
+  height_with_baro: 0       # 1 -> ranges also correct the height
+  aiding_max_hpos_stddev_m: 0.0  # 0 -> default (REQ-NAV-085)
 
 ahrs:                       # SHARED ARS/AHRS noise override (0 -> derived
                              # from imu: above), both sub-filters consume
@@ -3150,6 +3161,7 @@ inputs:                     # optional per-stream CSV filename overrides
   baro: baro.csv
   speed: speed.csv
   heading: heading.csv
+  ranges: ranges.csv
 \end{lstlisting}
 
 \paragraph{Top level.}
@@ -3211,7 +3223,7 @@ inputs:                     # optional per-stream CSV filename overrides
     from a trial). \textbf{Required.}
   \item[\code{gyr\_\allowbreak{}bias\_\allowbreak{}rw}, \code{acc\_\allowbreak{}bias\_\allowbreak{}rw}] \emph{rad/s/$\sqrt{\mathrm s}$,
     m/s\textsuperscript{2}/$\sqrt{\mathrm s}$.} Bias random walk. Estimate from a
-    long static log with \code{python/allan\_\allowbreak{}variance.py}. \textbf{Required.}
+    long static log with \code{tools/allan\_\allowbreak{}variance.py}. \textbf{Required.}
   \item[\code{gyr\_\allowbreak{}fixed\_\allowbreak{}bias}, \code{acc\_\allowbreak{}fixed\_\allowbreak{}bias}] \emph{3-list, rad/s and
     m/s\textsuperscript{2}, default 0.} Removed permanently ($\code{raw}-\code{bias}$),
     never estimated.
@@ -3220,8 +3232,8 @@ inputs:                     # optional per-stream CSV filename overrides
     matrix $M$, $\code{corrected}=M(\code{raw}-\code{bias})$. Also feeds the
     parallel ARS/AHRS.
 
-    Measured by \code{tools/inslib\_\allowbreak{}ubx\_\allowbreak{}imu\_\allowbreak{}calib.py} (or its window,
-    \code{tools/inslib\_\allowbreak{}calib\_\allowbreak{}gui.py}) from a session of arbitrary static
+    Measured by \code{tools/inslib\_\allowbreak{}imu\_\allowbreak{}calib.py} (or the reference
+    board's calibration window) from a session of arbitrary static
     poses, no fixture involved. The same matrix carries the \emph{housing}
     alignment when one was captured: the unit is rested on a level surface,
     any tilt it reports is the IMU sitting crooked in the box, and the
@@ -3234,7 +3246,7 @@ inputs:                     # optional per-stream CSV filename overrides
     yaw, FRD), e.g. \code{[0, 0, -9]} for a board whose x axis points
     9\,deg left of the vehicle's forward axis. The harnesses
     (\code{tools/\allowbreak{}replay.c}, \code{tools/\allowbreak{}insrcv.c},
-    \code{python/\allowbreak{}replay.py}, \code{inspostgui.py}) premultiply the
+    \code{tools/\allowbreak{}replay.py}, \code{inspostgui.py}) premultiply the
     rotation $R(\text{roll},\text{pitch},\text{yaw})$, which takes a board-frame
     vector into the vehicle frame, onto the accelerometer, gyroscope and
     magnetometer matrices, $M \leftarrow R\,M$, after the per-axis
@@ -3280,7 +3292,7 @@ harder to find than it sounds.
 \begin{figure}[htbp]
 \centering
 \includegraphics[width=0.92\textwidth]{figures/calib.png}
-\caption{\code{tools/inslib\_\allowbreak{}calib\_\allowbreak{}gui.py}: the coverage sphere fills in as
+\caption{The reference board's calibration window: the coverage sphere fills in as
 static poses are accepted, the stillness meter says whether the unit
 currently held down is calm enough to count, and the live traces show the
 raw and calibrated readings side by side.}
@@ -3423,7 +3435,7 @@ consume the same physical gyro/accelerometer.
       gates the fusion alone (off, they stay decoded, counted and
       published), so a receiver with no magnetometer simply never fuses one
       and the default costs nothing --- as with the barometer. Offline
-      (\code{tools/replay.c}, \code{python/replay.py}) the same key gates
+      (\code{tools/replay.c}, \code{tools/replay.py}) the same key gates
       \emph{opening} \code{mag.csv} and a missing file is a hard error, so
       a dataset without a magnetometer stream must not have it on by
       default. The risk the live default accepts is an \emph{uncalibrated}
@@ -3455,7 +3467,7 @@ consume the same physical gyro/accelerometer.
     source of their own, so there it is required whenever \code{mag: enable}
     is set: without it no reference field is built, the magnetometer is
     not fused, and the harness warns once at start-up.
-    \code{tools/inslib\_\allowbreak{}convert\_\allowbreak{}ubx\_\allowbreak{}to\_\allowbreak{}csv.py} fills it in
+    The reference board's capture converter fills it in
     from the capture's NAV-PVT date.
   \item[\code{mag: estimate\_\allowbreak{}bias}] \emph{0/1, default 0.} Run \code{ins} in its
     18-state mode estimating a hard-iron bias online.
@@ -3537,6 +3549,38 @@ consume the same physical gyro/accelerometer.
 \end{description}
 Each harness prints how many rows were offered as yaw and how many were
 skipped as not fixed, for a bad 1-sigma, or by the baseline geometry.
+
+\paragraph{\code{ranges:} --- ranges to anchors (optional, REQ-VER-038).}
+\code{ranges.csv} holds one calibrated range per row: \code{t\_us} (the time
+the range refers to), the anchor id, the anchor position in ECEF, the range
+and its 1-sigma. Each producer does its own calibration, the harnesses only
+weight the rows.
+\begin{description}\setlength\itemsep{0pt}
+  \item[\code{ranges: enable}] \emph{0/1, default 0.} Open
+    \code{ranges.csv} and fuse every row up to each IMU epoch as a range
+    measurement (REQ-NAV-082), anchored in the state history at its own
+    age. Rows beyond the filter's per-epoch maximum move on to the next
+    epoch. A missing file is a hard error.
+  \item[\code{ranges: leverarm\_\allowbreak{}frd}] \emph{3-list, default
+    $[0,0,0]$.} From the IMU to the ranging antenna, body frame.
+  \item[\code{ranges: stddev\_\allowbreak{}scale},
+    \code{ranges: stddev\_\allowbreak{}min\_\allowbreak{}m}]
+    \emph{default 0 $\to$ 1.0 / no floor.} The row's 1-sigma is multiplied
+    by the scale and then floored.
+  \item[\code{ranges: height\_\allowbreak{}with\_\allowbreak{}baro},
+    \code{ranges: aiding\_\allowbreak{}max\_\allowbreak{}hpos\_\allowbreak{}stddev\_\allowbreak{}m}]
+    \emph{default 0.} The \code{ins\_options\_t} keys of the same names:
+    ranges also correct the height under the barometric height source, and
+    the horizontal 1-sigma below which fused ranges count as position
+    aiding for the coasting window (REQ-NAV-085).
+\end{description}
+Each harness, \code{inspostgui.py} included, prints how many rows were
+offered, fused, rejected by the chi2 gate or skipped, and in how many epochs
+the ranges counted as position aiding. To score a ranges-only stretch of a
+recording, cut the GNSS fixes of that stretch with \code{replay.py
+-{}-gnss-outage} (\S\ref{sec:replaycli}) or the GUI's \emph{GNSS outage}
+field, or cut the rows from a copy of \code{gnss.csv} and hand it over with
+\code{inputs: gnss}. The reference stays the full track either way.
 
 \paragraph{Non-holonomic lateral constraint (top level, optional).}
 \code{automotive\_\allowbreak{}lateral\_\allowbreak{}constraint} [0/1, default 0] fuses a synthetic
@@ -3626,7 +3670,7 @@ A/B comparison of two receivers or IMUs needs no directory duplication.
 Table~\ref{tab:configyaml-xref} lists every \code{config.yaml} key next to the
 C struct field or function call that ultimately consumes it, derived from
 \code{tools/replay.c}'s \code{cfg\_\allowbreak{}set()} (the canonical, exhaustive mapping,
-REQ-VER-025) -- \code{python/replay.py}'s \code{build\_\allowbreak{}config()} wires the
+REQ-VER-025) -- \code{tools/replay.py}'s \code{build\_\allowbreak{}config()} wires the
 identical schema onto the same field names via ctypes. A key with no C
 equivalent is consumed by the harness itself (dataset selection, CSV file
 names, scoring) and never reaches the library. Fields written per epoch (into
@@ -3903,7 +3947,7 @@ traceable rather than merely suspected.
 \medskip
 \noindent\textbf{The same run offline.} All three consumers implement the
 section: the live receiver \code{tools/insrcv.c} and both replay harnesses
-(\code{tools/replay.c}, \code{python/replay.py}). The same \code{config.yaml}
+(\code{tools/replay.c}, \code{tools/replay.py}). The same \code{config.yaml}
 therefore produces the same start whether the data arrives over UDP or out of
 \code{imu.csv}. The offer mechanism is identical in all three -- the declared
 position at 2\,Hz until \code{ins} has bootstrapped from it, never in an epoch
@@ -4012,12 +4056,23 @@ first line of each file is a \code{\#} header, every column layout:
 % ------------------------------------------------------------------------------
 
 The \emph{filter} behaviour is fixed by \code{config.yaml}
-(\S\ref{sec:configyaml}), the Python harness \code{python/replay.py} adds a few
+(\S\ref{sec:configyaml}), the Python harness \code{tools/replay.py} adds a few
 command-line flags that only affect \emph{analysis and output}, never the
-estimate itself. \code{python/replay.py -{}-help} is authoritative, the flags
+estimate itself, plus \code{-{}-gnss-outage}, which takes data away from
+the filter. \code{tools/replay.py -{}-help} is authoritative, the flags
 that change what is evaluated or reported are:
 
 \begin{description}
+  \item[\code{-{}-gnss-outage START:DURATION}] Simulate a GNSS outage:
+    every fix from \code{START} to \code{START+DURATION} seconds after the
+    first IMU sample (the origin of \code{-{}-eval-start}) is cut from the
+    input before the run, so the filter never learns that a fix existed.
+    Repeatable, \code{aiding: gnss} only. Combine it with
+    \code{-{}-eval-start}/\code{-{}-eval-end} to score the drift inside the
+    gap rather than diluting it over the whole run. \code{inspostgui.py}
+    offers the same cut as its \emph{GNSS outage} toolbar field
+    (comma-separated windows) and as \code{-{}-gnss-outage} with
+    \code{-{}-batch}.
   \item[\code{-{}-eval-start SEC}, \code{-{}-eval-end SEC}] Restrict the
     ground-truth error evaluation to a trial-time window (seconds from the first
     IMU sample, the same origin as the printed \code{t=\ldots} times). The
@@ -4062,6 +4117,13 @@ that change what is evaluated or reported are:
     the map reuse the \code{-{}-plot-hz} samples.
 \end{description}
 
+\code{replay.py} and \code{inspostgui.py} run the same replay core
+(\code{tools/\allowbreak{}replay\_\allowbreak{}core.py}): input loading, feed
+order, scoring, recorders and the printed summary are one implementation,
+so the GUI and the command line give the same result for the same
+\code{config.yaml}. \code{python/tests/test\_\allowbreak{}replay\_\allowbreak{}core.py}
+checks that on a dataset with ranges and a GNSS outage.
+
 
 % ==============================================================================
 \section{Verification environment (overview)}
@@ -4080,7 +4142,7 @@ For completeness -- the process itself is documented in
     tests for all filters, no framework, non-zero exit on failure.
   \item \textbf{Real-data replays} (\code{make datasets}): 
     dataset processing harness (\code{tools/replay.c}, mirrored by
-    \code{python/replay.py}) replays datasets for verification.
+    \code{tools/replay.py}) replays datasets for verification.
   \item \textbf{Static analysis} (\code{make cppcheck}, \code{make
     clang-tidy}): complements the compiler warnings (\code{-Wall -Wextra} plus
     a wider set) with two independent tools over the production sources.

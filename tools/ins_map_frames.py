@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PNG frame sequence for python/replay.py --map-frames: a portrait
+"""PNG frame sequence for tools/replay.py --map-frames: a portrait
 (1080x1920) top-down OpenStreetMap view with the raw GNSS fix track (red)
 and the INSLIB estimate (cyan) progressively revealed over time, plus a
 gray band marking the real tunnel/underpass geometry pulled from OSM. Meant
@@ -10,7 +10,7 @@ one just enters solid terrain).
 
 Two data sources beyond the recorded track:
   - OpenStreetMap raster tiles for the background (tile.openstreetmap.org,
-    same disk cache and usage-policy-respecting fetch as tools/inslib_gui.py
+    same disk cache and usage-policy-respecting fetch as inslib_gui.py
     -- identifying User-Agent, on-screen budget in spirit even though this
     is a batch tool, cache-first).
   - The tunnel/underpass geometry itself via the Overpass API: every OSM
@@ -51,7 +51,7 @@ def _haversine_m(lat1, lon1, lat2, lon2):
         + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2.0) ** 2)
     return 2.0 * EARTH_R * math.asin(min(1.0, math.sqrt(a)))
 
-# Same cache root and tile-policy-respecting fetch as tools/inslib_gui.py's
+# Same cache root and tile-policy-respecting fetch as inslib_gui.py's
 # TileFetcher: fetched tiles are shared between the interactive GUI and
 # this batch tool instead of being downloaded twice.
 _CACHE_ROOT = os.path.join(

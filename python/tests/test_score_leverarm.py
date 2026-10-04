@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """score: leverarm_frd applied wherever the estimate meets the reference
 (REQ-VER-037): replay.ref_point_offset_ned(), which the ellipsoid height
-score and the --plot recorders of python/replay.py and python/inspostgui.py
+score and the --plot recorders of tools/replay.py and tools/inspostgui.py
 add to the IMU-point quantities, and ins_plots._ref_pt_up(), which shifts
 the board curves of the altitude pages.
 
@@ -16,6 +16,7 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, "python"))
+sys.path.insert(0, os.path.join(REPO, "tools"))
 
 import replay     # noqa: E402
 import ins_plots  # noqa: E402

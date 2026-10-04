@@ -183,7 +183,7 @@
  *  Here for the same reason as INS_DEFAULT_BARO_STDDEV_M above: "how much do I
  *  trust one magnetometer sample" is a property of the sensor and its magnetic
  *  environment. Keeping it here also stops every caller (tools/insrcv.c,
- *  tools/replay.c, python/replay.py) from carrying its own copy.
+ *  tools/replay.c, tools/replay.py) from carrying its own copy.
  *
  *  Deliberately of the same order as the horizontal field itself (~20 uT at
  *  mid-latitudes). ins.c fuses the magnetometer for yaw only, so a per-axis

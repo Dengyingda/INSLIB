@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Google Earth (KML) output for python/replay.py --kml: the ins
+"""Google Earth (KML) output for tools/replay.py --kml: the ins
 estimate as a time-animated gx:Track (drag Google Earth's time slider to
 fly the replay) plus static ground-track LineStrings for the estimate, the
 ground truth and the raw GNSS fix.
@@ -45,7 +45,7 @@ Output is always a KMZ (a zip bundling the .kml plus the embedded
 model), since a bare .kml cannot carry the model file with it; --kml's
 path gets its extension corrected to .kmz if needed.
 
-Built with simplekml (python/requirements-replay.txt) rather than
+Built with simplekml (python/requirements.txt) rather than
 hand-rolled XML templates, so the KML stays well-formed as fields are
 added.
 

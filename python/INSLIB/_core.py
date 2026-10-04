@@ -171,6 +171,10 @@ class _CfgStruct(ctypes.Structure):
         ("automotive_lateral_stddev_mps", ctypes.c_float),
         ("automotive_lateral_max_yaw_rate", ctypes.c_float),
         ("automotive_lateral_after_sec", ctypes.c_float),
+        # Range aiding (REQ-NAV-082, REQ-NAV-085), appended at the end to
+        # keep every offset above it stable.
+        ("range_height_with_baro", ctypes.c_int32),
+        ("range_aiding_max_hpos_stddev_m", ctypes.c_float),
     ]
 
 
@@ -217,6 +221,12 @@ def _bind_family(p):
     g("get_speed_diag").argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32),
                                     ctypes.POINTER(ctypes.c_float)]
     g("get_time_diag").argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    g("add_range").argtypes = [ctypes.c_void_p, _d3, ctypes.c_float, ctypes.c_float,
+                               ctypes.c_int, ctypes.c_uint16]
+    g("add_range").restype = ctypes.c_int
+    g("set_range_leverarm").argtypes = [ctypes.c_void_p, _f3]
+    g("get_range_diag").argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32),
+                                    ctypes.POINTER(ctypes.c_float)]
     for n in ("set_gnss_delay_ms", "set_yaw_delay_ms",
               "set_local_pos_delay_ms"):
         g(n).argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -390,6 +400,12 @@ class Config:
     automotive_lateral_max_yaw_rate: float = 0.0  # [rad/s], 0 -> C default
     automotive_lateral_after_sec: float = 0.0  # [s], 0 -> C default,
                                         # negative -> no delay
+    range_height_with_baro: bool = False  # ranges also correct the height
+                                        # under the barometric height source
+    range_aiding_max_hpos_stddev_m: float = 0.0  # [m], 0 -> C default: the
+                                        # horizontal 1-sigma in its worst
+                                        # direction below which fused ranges
+                                        # count as position aiding
                                         # yaw stddev. Raise it where the
                                         # course-equals-heading assumption is
                                         # itself looser than a car's (e.g.
@@ -534,7 +550,7 @@ class Config:
 
     def _to_struct(self) -> _CfgStruct:
         s = _CfgStruct()
-        _bools = ("auto_init", "allow_unlimited_deadreckoning",
+        _bools = ("auto_init", "allow_unlimited_deadreckoning", "range_height_with_baro",
                   "auto_zupt_disable", "mag_field_check_disable",
                   "estimate_mag_bias", "automotive_mode", "chi2_disable",
                   "automotive_lateral_constraint",
@@ -710,6 +726,20 @@ class _Base:
         self._c("set_speed")(self._h, float(speed_mps), float(stddev_mps),
                              int(delay_ms))
 
+    def range(self, anchor_ecef, range_m, stddev_m, delay_ms=0, anchor_id=0):
+        """Range to an anchor at a known position (REQ-NAV-082): anchor in
+        ECEF [m], the calibrated range [m] and its 1-sigma [m]. delay_ms is
+        how old the range is, history-anchored like a delayed GNSS fix.
+        Each call adds one entry to the pending epoch; returns False when
+        the epoch already holds INS_RANGE_MAX of them."""
+        return self._c("add_range")(self._h, _d3(*anchor_ecef), float(range_m),
+                                    float(stddev_m), int(delay_ms),
+                                    int(anchor_id) & 0xFFFF) == 0
+
+    def range_leverarm(self, lever_b):
+        """Ranging antenna lever arm, body FRD [m], for the pending epoch."""
+        self._c("set_range_leverarm")(self._h, _f3(*lever_b))
+
     def zupt(self, on=True):
         self._c("set_zupt")(self._h, 1 if on else 0)
 
@@ -871,6 +901,13 @@ class _Base:
         self._c("get_speed_diag")(self._h, counts, ctypes.byref(resid))
         d["n_speed_seen"], d["n_speed_used"], d["n_speed_skipped"] = list(counts)
         d["last_speed_residual_mps"] = resid.value
+        # Range aiding, likewise outside the array (REQ-NAV-082/085).
+        rcounts = (ctypes.c_uint32 * 5)()
+        rresid = ctypes.c_float(0.0)
+        self._c("get_range_diag")(self._h, rcounts, ctypes.byref(rresid))
+        (d["n_range_seen"], d["n_range_used"], d["n_range_rejected"],
+         d["n_range_skipped"], d["n_range_pos_aiding"]) = list(rcounts)
+        d["last_range_residual_m"] = rresid.value
         # Timestamp health, same reason it lives outside the array
         # (REQ-NAV-016, REQ-NAV-070).
         tcounts = (ctypes.c_uint32 * 3)()

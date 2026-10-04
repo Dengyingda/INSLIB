@@ -5,12 +5,12 @@ Subscribes to a Crazyflie's onboard telemetry over the Crazyradio, feeds
 it through the INSLIB navigation suite in real time, forwards the estimate
 to PlotJuggler + MAVLink (znav3d), and logs every input stream to a
 timestamped dataset directory in the standard datasets replay format --
-so the same run can be reprocessed offline with python/replay.py
+so the same run can be reprocessed offline with tools/replay.py
 ("falls was nicht stimmt").
 
-    python3 python/crazyflie_reader.py --uri radio://0/80/2M/DABADA5503
+    python3 tools/crazyflie_reader.py --uri radio://0/80/2M/DABADA5503
     ...
-    python3 python/replay.py datasets/crazyflie/2026_07_13_142530   # post-process
+    python3 tools/replay.py datasets/crazyflie/2026_07_13_142530   # post-process
 
 Two Crazyflie log configs are subscribed (each within the 26-byte CRTP
 payload limit, all FP16):
@@ -39,7 +39,7 @@ INSLIB uses init: auto and does not consume the reference attitude; the
 yaw fed as a heading aid comes from the transformed NED quaternion.
 
 Dataset directory (datasets/crazyflie/YYYY_MM_DD_HHMMSS/), all in the
-datasets replay_format contract so python/replay.py reads it directly:
+datasets replay_format contract so tools/replay.py reads it directly:
   config.yaml   aiding: gnss, init: auto, IMU noise model
   imu.csv       t_us, gyr_frd_xyz [rad/s], acc_frd_xyz [m/s^2]
   gnss.csv      t_us, lat/lon/h, NED position covariance (position-only fix)
@@ -67,7 +67,8 @@ import sys
 import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)                                   # python/
+sys.path.insert(0, _HERE)
+sys.path.insert(0, os.path.join(_HERE, "..", "python"))   # INSLIB package
 sys.path.insert(0, os.path.join(_HERE, "..", "datasets"))  # replay_format
 
 from INSLIB import Navigator, Config, Telemetry, ecef_to_llh   # noqa: E402
@@ -110,7 +111,7 @@ _ISA_EXP = 5.255
 
 # Default Crazyflie / BMI088 in-flight noise model. These are rough starting
 # points dominated by motor vibration -- refine them per airframe from a real
-# static/hover log with python/allan_variance.py or replay.py's noise check.
+# static/hover log with tools/allan_variance.py or replay.py's noise check.
 _IMU_NOISE = {
     "gyr_psd": (2.0e-5, "(rad/s)^2/Hz  approx, refine via allan_variance.py"),
     "acc_psd": (2.0e-3, "(m/s^2)^2/Hz  approx, refine via allan_variance.py"),
@@ -224,7 +225,7 @@ DEFAULTS = {
 
 def write_session_config(path, spec):
     """Write config.yaml for a live session, in the datasets replay_format
-    schema so python/replay.py reprocesses the dataset directly."""
+    schema so tools/replay.py reprocesses the dataset directly."""
     origin = spec["origin"]
     aid = spec["aiding"]
     write_config(path, [

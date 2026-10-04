@@ -2156,7 +2156,10 @@ static void scenario_datum_offset_survives_origin_shift(void)
  * datum, so the only thing an alignment could do is push the accumulated
  * baro-vs-fix disagreement into the origin -- relocating every local
  * coordinate the consumer holds, which is exactly what the origin carry
- * exists to prevent. A re-arm that does anchor a NEW origin (here: the
+ * exists to prevent. Nor may ins restart its height on the fix: the
+ * barometric anchor is carried too (REQ-NAV-088), so the height the
+ * consumer read from baro_alt during the outage does not step when ins
+ * takes over again. A re-arm that does anchor a NEW origin (here: the
  * health-check path, which inherits nothing) must still re-join the datum,
  * so the second half of the scenario covers that direction too.
  * ---------------------------------------------------------------------------
@@ -2249,13 +2252,41 @@ static void scenario_datum_survives_quality_exit(void)
         const float drift = baro_drift_m * (float)(drift_end - i) / 600.0f;
         QEXIT_STEP(s, t, i, 0.0f, baro_drift_m - drift, false, 0.1f);
     }
+    /* Still no fixes, the drift holds. A real barometer drifts over minutes,
+       the 10 m in 6 s above is only there to keep the scenario short, and
+       baro_alt (whose accelerometer saw no motion) needs a while to settle on
+       it. Phase D compares heights across the re-entry, so it has to start
+       from a vertical channel that is no longer catching up. */
+    const int hold_end = i + 2000;
+    for (; i < hold_end; ++i) { QEXIT_STEP(s, t, i, 0.0f, baro_drift_m, false, 0.1f); }
     CHECK_TRUE(!s.ins.is_initialized, "ins is still collecting without fixes");
 
     /* Phase D: the fixes come back. ins re-bootstraps on the carried origin,
-       and the wrapper must leave that origin alone. */
-    const int reboot_end = i + 1500;
-    for (; i < reboot_end; ++i) { QEXIT_STEP(s, t, i, 0.0f, baro_drift_m, true, 0.1f); }
+       and the wrapper must leave that origin alone. Tracked across the
+       re-entry: the height a consumer reads (nav_suite_get_height) is baro_alt
+       while ins is down and ins once it is back, and the switch must not step
+       it (REQ-NAV-088). */
+    const int reboot_end   = i + 1500;
+    float     h_rep_pre    = 0.0f;
+    float     h_rep_post   = 0.0f;
+    bool      reentry_seen = false;
+    for (; i < reboot_end; ++i)
+    {
+        const bool full_before = nav_suite_get_mode(&s) == NAV_SUITE_MODE_FULL;
+        float      h_rep       = 0.0f;
+        const bool have_rep    = nav_suite_get_height(&s, &h_rep);
+        QEXIT_STEP(s, t, i, 0.0f, baro_drift_m, true, 0.1f);
+        if (!reentry_seen && !full_before && have_rep &&
+            nav_suite_get_mode(&s) == NAV_SUITE_MODE_FULL && nav_suite_get_height(&s, &h_rep_post))
+        {
+            h_rep_pre    = h_rep;
+            reentry_seen = true;
+        }
+    }
     CHECK_TRUE(s.ins.is_initialized, "ins re-bootstrapped on the recovered fixes");
+    CHECK_TRUE(reentry_seen, "the 3D solution was re-entered");
+    CHECK_NEAR(h_rep_post, h_rep_pre, 0.5,
+               "the reported height does not step when the 3D solution returns");
 
     CHECK_TRUE(nav_suite_get_baro_alt(&s, &h_baro, (float*)0), "baro running");
     CHECK_TRUE(ins_get_position_local(&s.ins, pos_ned), "ins local position");
@@ -2272,9 +2303,15 @@ static void scenario_datum_survives_quality_exit(void)
                "datum origin longitude kept across the re-arm");
     CHECK_NEAR(s.ins.origin_llh[2], datum_origin[2], 1e-3,
                "datum origin height kept across the re-arm");
-    /* The platform never moved, so the local height a consumer reads has to
-       be the one it read before the outage. */
-    CHECK_NEAR(-pos_ned[2], h_local_before, 1.0, "local height is continuous across the re-arm");
+    /* The barometric datum came along with the origin, so ins restarts on
+       the barometer, drift included, exactly where it would stand had it
+       never left the 3D solution: under the barometric source the datum's
+       drift belongs to the local height (REQ-SUITE-008, corrected in the
+       absolute height only). Not on the fix, which would pull it back to
+       h_local_before and step it by the whole drift. */
+    CHECK_NEAR(-pos_ned[2], h_baro, 1.0, "ins restarts on the carried barometric datum");
+    CHECK_TRUE(fabsf(-pos_ned[2] - h_local_before) > 2.0f,
+               "and not on the fix, which would undo the drift in one step");
 
     /* Phase E: the other direction. A health-check re-arm inherits no origin
        (REQ-NAV-062), so its bootstrap anchors a fresh one -- here 30 m above

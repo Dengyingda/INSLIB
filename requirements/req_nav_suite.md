@@ -136,7 +136,10 @@ not hold mid-mission: the barometer has drifted against the fix by then
 carried origin onto that reading would push the accumulated disagreement
 into the origin -- relocating every local coordinate the consumer holds,
 which is precisely what carrying the origin exists to prevent. A carried
-origin already is the datum and needs no reading to find it.
+origin already is the datum and needs no reading to find it. ins carries
+its barometric anchor along with that origin (REQ-NAV-088), so it restarts
+on the same drifted barometric height baro_alt reported during the outage,
+and the reported height does not step when the 3D solution returns.
 
 ## REQ-SUITE-008 — Offset filter integration and height accessors
 

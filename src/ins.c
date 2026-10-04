@@ -3308,7 +3308,7 @@ static void ins_fail_health(ins_t* f)
  * a corruption: the state was fine, the aiding stopped being good enough for a
  * 3D solution. IMU biases (REQ-NAV-061) and the n-frame origin (REQ-NAV-062)
  * are kept, position/velocity/attitude are re-derived by the next bootstrap.
- * @satisfies REQ-NAV-052 REQ-NAV-061 REQ-NAV-062 */
+ * @satisfies REQ-NAV-052 REQ-NAV-061 REQ-NAV-062 REQ-NAV-088 */
 static void ins_fail_gnss_quality(ins_t* f, ins_time_us_t t)
 {
     if (f->opt.auto_reacquire_disable || !f->opt.auto_init)
@@ -3342,6 +3342,10 @@ static void ins_fail_gnss_quality(ins_t* f, ins_time_us_t t)
     const double ox = f->origin_llh[0], oy = f->origin_llh[1], oz = f->origin_llh[2];
     const bool   origin_ok =
         vec3d_finite(f->origin_llh) && (fabs(ox) <= (0.5 * M_PI)) && (fabs(oy) <= (2.0 * M_PI));
+    /* REQ-NAV-088: the barometric datum belongs to the origin, the re-arm
+       below clears it from the instance. */
+    const bool  baro_h0_ok = f->height_from_baro && isfinite(f->baro_h0_m);
+    const float baro_h0    = f->baro_h0_m;
 
     f->is_initialized = false;
     ins_rearm_collecting(f);
@@ -3355,11 +3359,13 @@ static void ins_fail_gnss_quality(ins_t* f, ins_time_us_t t)
            frames: the pair is what lets the bootstrap work in short
            baselines instead of against the possibly far-away origin. */
         vec3_copy(pos_at_exit, f->origin_carry.pos_local);
-        f->origin_carry.latlonh[0] = llh_at_exit[0];
-        f->origin_carry.latlonh[1] = llh_at_exit[1];
-        f->origin_carry.latlonh[2] = llh_at_exit[2];
-        f->origin_carry.t          = (f->t_last_pos_aiding != 0) ? f->t_last_pos_aiding : t;
-        f->origin_carry.valid      = true;
+        f->origin_carry.latlonh[0]    = llh_at_exit[0];
+        f->origin_carry.latlonh[1]    = llh_at_exit[1];
+        f->origin_carry.latlonh[2]    = llh_at_exit[2];
+        f->origin_carry.t             = (f->t_last_pos_aiding != 0) ? f->t_last_pos_aiding : t;
+        f->origin_carry.baro_h0_valid = baro_h0_ok;
+        f->origin_carry.baro_h0_m     = baro_h0;
+        f->origin_carry.valid         = true;
     }
 
     vec3_copy(acc_b, f->bias_carry.acc_bias);
@@ -4534,7 +4540,7 @@ static bool ins_autoinit_origin_carry_usable(const ins_t* f, const double fix_ll
  * quasi-static IMU window for accelerometer leveling. Returns true once the
  * filter has been initialized. */
 /* @satisfies REQ-NAV-015 REQ-NAV-045 REQ-NAV-047 REQ-NAV-048 REQ-NAV-051 REQ-NAV-053
-   REQ-NAV-062 */
+   REQ-NAV-062 REQ-NAV-088 */
 static bool ins_autoinit_try(ins_t* f, const ins_measurements_t* m)
 {
     /* Entry-quality gate (REQ-NAV-051): the bootstrap fix itself must be
@@ -4653,6 +4659,12 @@ static bool ins_autoinit_try(ins_t* f, const ins_measurements_t* m)
     const float rpy[3]     = {roll, pitch, yaw};
     const float rpy_var[3] = {roll_var, pitch_var, yaw_var};
 
+    /* Is the cached barometer sample recent enough to anchor the height
+       channel (REQ-NAV-053), and to place a carried datum (REQ-NAV-088)? */
+    const bool baro_fresh =
+        f->autoinit_baro.valid &&
+        time_diff_sec(m->timestamp, f->autoinit_baro.t) <= INS_BARO_ANCHOR_MAX_AGE_SEC;
+
     /* Origin + velocity from the fix. */
     double origin_llh[3];
     double fix_llh[3];
@@ -4718,6 +4730,20 @@ static bool ins_autoinit_try(ins_t* f, const ins_measurements_t* m)
         }
         int k;
         for (k = 0; k < 3; ++k) { pos_local[k] -= la_n[k]; }
+        /* REQ-NAV-088: an inherited barometric datum places the bootstrap
+           height on the barometer, not on the fix's vertical row, which the
+           barometric source never fuses (REQ-NAV-055). The anchor latched
+           below then comes out as the carried one, so the height channel
+           continues where the previous instance left it. */
+        if (carry && f->origin_carry.baro_h0_valid && baro_fresh && !f->opt.baro_height_disable)
+        {
+            const float h_baro = ins_isa_altitude_from_pressure(f->autoinit_baro.pressure_pa) -
+                                 f->origin_carry.baro_h0_m;
+            LOG_INFO("ins: bootstrap height %.2f m from the carried barometric datum "
+                     "(the fix alone would have put it at %.2f m)",
+                     (double)h_baro, (double)(-pos_local[2]));
+            pos_local[2] = -h_baro;
+        }
         if (ins_gnss_vel_usable(f, &m->gnss_vel))
         {
             /* The antenna also moves at R * (omega x lever arm) that the IMU
@@ -4766,9 +4792,6 @@ static bool ins_autoinit_try(ins_t* f, const ins_measurements_t* m)
        vertical-datum alignment right after this call (REQ-SUITE-007).
        Everything else selects GNSS/local_pos height. */
 
-    const bool baro_fresh =
-        f->autoinit_baro.valid &&
-        time_diff_sec(m->timestamp, f->autoinit_baro.t) <= INS_BARO_ANCHOR_MAX_AGE_SEC;
     f->height_from_baro = have_gnss && baro_fresh && !f->opt.baro_height_disable;
     if (f->height_from_baro)
     {

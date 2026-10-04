@@ -1746,6 +1746,12 @@ bootstraps at a nonzero pos_local[2] whenever the platform reappears at a
 different altitude. Left anchored at zero it would offset the entire height
 channel by that altitude difference.
 
+The one exception to the identity is the height under the barometric
+source: when the exiting instance carried a barometric datum, the bootstrap
+height comes from the barometer on that datum rather than from the fix
+(REQ-NAV-088), and the absolute height follows it. Latitude and longitude
+stay anchored to the fix.
+
 The carry shall be refused, and the bootstrap fix shall define a fresh
 origin as before, when
 
@@ -2897,3 +2903,50 @@ biases the filter with every turn. One shared function keeps the firmware
 glue and both replay harnesses on the same geometry. The horizontal
 projection floor bounds the error amplification: below it the azimuth of
 the baseline is dominated by antenna phase noise, not by the yaw.
+
+## REQ-NAV-088 — Barometric datum carried with the n-frame origin
+
+- **Status:** verified
+- **Parent:** REQ-NAV-062
+- **Verification:** Test: tests/test_ins_core.c:scenario_gnss_quality_exit_baro_datum_carry; Test: tests/test_baro.c:scenario_datum_survives_quality_exit; Test: tools/replay.c:main
+
+When the instance that leaves the 3D solution through the quality-loss
+re-arm of REQ-NAV-052 runs on the barometric height source
+(REQ-NAV-053), the re-arm shall carry its barometric datum anchor
+(the h0 of REQ-NAV-054) together with the n-frame origin of
+REQ-NAV-062. A bootstrap that keeps that origin and selects the
+barometric height source again shall set its initial vertical position
+from the barometer sample it anchors on, through the carried anchor and
+the same ISA conversion the fusion uses, instead of from the bootstrap
+fix's height. The new instance's anchor is then the carried one.
+
+The fix's height shall be used as before when
+
+- the carry is refused and a fresh origin is anchored (REQ-NAV-062),
+- the exiting instance did not run on the barometric source, or
+- the bootstrap does not select the barometric source (no sufficiently
+  fresh barometer sample, or barometric height disabled).
+
+Latitude and longitude stay anchored to the bootstrap fix. The absolute
+height follows the vertical position (origin height plus the local
+height), the same relation a running instance on the barometric source
+keeps.
+
+Rationale: under the barometric source the GNSS vertical row is never
+fused (REQ-NAV-055), so the only role the fix's height plays at a
+re-bootstrap is to decide where the height channel restarts, and the
+anchor of REQ-NAV-062 then bakes that decision in for the whole rest of
+the instance's life. Right after an outage this is exactly the fix to
+trust least: the quality loss that caused the re-arm typically comes
+from shading (indoors, urban canyon, under a bridge), and a fix that
+already passes the entry gate of REQ-NAV-051 can still be several metres
+off vertically. A drone that held its altitude on the barometer through
+the outage would see its reported height step by that error at the
+moment the 3D solution returns and its altitude controller would climb
+or sink to correct a height change that never happened. The barometer,
+on the datum the previous instance had and nav_suite's vertical channel
+still shares (REQ-SUITE-007), knows the height continuously across the
+outage, which is the same argument REQ-NAV-066 makes for the
+re-acquisition path. Drift of the barometric datum against the
+ellipsoid is not ins's to correct: nav_suite's offset filter observes
+and reports it (REQ-SUITE-008).

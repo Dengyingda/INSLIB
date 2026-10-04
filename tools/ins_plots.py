@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""matplotlib output for python/replay.py --plot: state history with a
+"""matplotlib output for tools/replay.py --plot: state history with a
 1-σ band (from the filter's own error-state covariance, see
 ins.Navigator.stddev()) and, when a ground-truth reference is available,
 error-over-time plots with the reference overlaid on the estimate.

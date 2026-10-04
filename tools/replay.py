@@ -12,17 +12,17 @@ filter via the ctypes wrapper.
 
 Usage:
     make pylib
-    python3 python/replay.py datasets/some/dataset  # dir
-    python3 python/replay.py datasets/some/dataset/config.yaml
-    python3 python/replay.py datasets/some/dataset --realtime
-    python3 python/replay.py datasets/some/dataset --plotjuggler
-    python3 python/replay.py datasets/some/dataset --mavlink
-    python3 python/replay.py datasets/some/dataset --plot
-    python3 python/replay.py datasets/some/dataset \\
+    python3 tools/replay.py datasets/some/dataset  # dir
+    python3 tools/replay.py datasets/some/dataset/config.yaml
+    python3 tools/replay.py datasets/some/dataset --realtime
+    python3 tools/replay.py datasets/some/dataset --plotjuggler
+    python3 tools/replay.py datasets/some/dataset --mavlink
+    python3 tools/replay.py datasets/some/dataset --plot
+    python3 tools/replay.py datasets/some/dataset \\
         --plot --plot-out /tmp/plots.pdf  # save a multi-page PDF instead
-    python3 python/replay.py datasets/some/dataset \\
+    python3 tools/replay.py datasets/some/dataset \\
         --kml /tmp/flight.kml           # Google Earth output
-    python3 python/replay.py datasets/some/dataset \\
+    python3 tools/replay.py datasets/some/dataset \\
         --map-frames /tmp/frames        # OpenStreetMap PNG frame sequence
 
 --plot draws the filter's state history (position/velocity/attitude) with
@@ -81,14 +81,20 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from INSLIB import Navigator, Config, Telemetry, ecef_to_llh   # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "python"))
+from INSLIB import Config, Telemetry, ecef_to_llh   # noqa: E402
 from INSLIB import yaw_from_baseline_heading   # noqa: E402
 # The sub-filter breakdown, the status bits and the ISA conversion live in
 # the shared telemetry module, so a live receiver and this replay put the
 # identical tree on the wire (see INSLIB/telemetry.py).
 from INSLIB.telemetry import (isa_pressure_to_altitude,        # noqa: E402
                               subfilter_overlay_tree, suite_status)
-from geodetic_toolbox import mag_heading   # noqa: E402
+# The shared replay loop (replay_core.py) imports this module as "replay".
+# Run as a script it is "__main__", so it is registered under its own name
+# first, otherwise the core would load a second copy of it.
+sys.modules.setdefault("replay", sys.modules[__name__])
+import replay_core   # noqa: E402
 
 US_PER_SEC = 1_000_000
 
@@ -416,9 +422,18 @@ DEFAULTS = {
                 "stddev_scale": 0.0,    # 0 -> 1.0
                 "stddev_min_deg": 0.0,  # 0 -> no floor
                 "delay_ms": 0.0},       # how old a row is at its timestamp
+    # Ranges to anchors at known positions (REQ-NAV-082, REQ-VER-038).
+    # ranges.csv carries a 1-sigma per row like heading.csv, this section
+    # scales and floors it and holds the ranging antenna's lever arm.
+    "ranges": {"enable": 0,
+               "leverarm_frd": [0.0, 0.0, 0.0],  # ranging antenna, body FRD
+               "stddev_scale": 0.0,              # 0 -> 1.0
+               "stddev_min_m": 0.0,              # 0 -> no floor
+               "height_with_baro": 0,            # 1 -> ranges also correct the height
+               "aiding_max_hpos_stddev_m": 0.0},  # 0 -> default (REQ-NAV-085)
     "inputs": {"imu": "imu.csv", "ref": "ref.csv", "gnss": "gnss.csv",
                "mag": "mag.csv", "baro": "baro.csv", "speed": "speed.csv",
-               "heading": "heading.csv"},
+               "heading": "heading.csv", "ranges": "ranges.csv"},
 }
 
 # Sections of the config.yaml schema that belong to a DIFFERENT consumer of
@@ -437,7 +452,7 @@ DEFAULTS = {
 # the simulated datasets' injected-bias numbers now live).
 #
 #   origin      local-frame anchor (lat/lon/h) for a platform that has no
-#               absolute position source, consumed by python/crazyflie_reader.py.
+#               absolute position source, consumed by tools/crazyflie_reader.py.
 #   crazyflie   radio URI and other link settings for that same reader.
 FOREIGN_SECTIONS = ("origin", "crazyflie")
 
@@ -1286,6 +1301,33 @@ def load_heading(path):
     return rows
 
 
+def load_ranges(path):
+    """ranges.csv -> [(t_us, anchor_id, (x, y, z), range_m, stddev_m)].
+
+    Trailing columns are the producer's record and not read, and a row with
+    a non-positive 1-sigma or a negative range is dropped, matching
+    load_ranges() in tools/replay.c."""
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            p = line.strip().split(",")
+            if len(p) < 7:
+                continue
+            try:
+                t_us, aid = int(p[0]), int(p[1])
+                ecef = (float(p[2]), float(p[3]), float(p[4]))
+                rng, sd = float(p[5]), float(p[6])
+            except ValueError:
+                continue
+            if not sd > 0.0 or not rng >= 0.0 or not 0 <= aid <= 0xFFFF:
+                continue
+            rows.append((t_us, aid, ecef, rng, sd))
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
 HEADING_OK = "ok"
 HEADING_NOT_FIXED = "not fixed"
 HEADING_BAD_STDDEV = "bad 1-sigma"
@@ -1450,6 +1492,8 @@ def build_config(spec, ref0, t0_us, lat0, lon0, h0, gyr_bias):
         speed_scale=float(spec["speed"]["scale"]),
         speed_stddev_rel=float(spec["speed"]["stddev_rel"]),
         speed_min_mps=float(spec["speed"]["min_speed_mps"]),
+        range_height_with_baro=bool(int(spec["ranges"]["height_with_baro"])),
+        range_aiding_max_hpos_stddev_m=float(spec["ranges"]["aiding_max_hpos_stddev_m"]),
         estimate_mag_bias=bool(spec["mag"]["estimate_bias"]),
         # IMU calibration (REQ-NAV-037) + GNSS covariance conditioning
         # (REQ-NAV-038); .get() keeps older configs (no such keys) working.
@@ -1760,16 +1804,16 @@ def gnss_standstill_accuracy(phases, min_seg_fixes=4):
     return out
 
 
-def print_gnss_standstill_accuracy(phases):
+def print_gnss_standstill_accuracy(phases, out=print):
     """Print the gnss_standstill_accuracy() result as a data-quality line,
     or note that there weren't enough standstill fixes."""
     acc = gnss_standstill_accuracy(phases)
     if acc is None:
         n_fix = sum(len(ph) for ph in phases)
-        print(f"  gnss accuracy check: not enough standstill fixes "
+        out(f"  gnss accuracy check: not enough standstill fixes "
               f"({n_fix} seen) - skipped (needs the platform to stand still)")
         return
-    print(f"  gnss accuracy check (measured spread during {acc['n_phases']} "
+    out(f"  gnss accuracy check (measured spread during {acc['n_phases']} "
           f"standstill phase(s), {acc['n_fix']} fixes, vs receiver-reported "
           f"1-σ):")
     for label, key, unit in (("horizontal pos", "pos_hor", "m"),
@@ -1778,14 +1822,14 @@ def print_gnss_standstill_accuracy(phases):
                              ("vertical vel  ", "vel_ver", "m/s")):
         d = acc[key]
         if d["meas"] is None or d["rep"] is None:
-            print(f"    {label}: n/a (no usable samples)")
+            out(f"    {label}: n/a (no usable samples)")
             continue
         r = d["ratio"]
         verdict = ("optimistic" if r > 1.3 else
                    "pessimistic" if r < 0.77 else "consistent")
-        print(f"    {label}: measured {d['meas']:8.3f} {unit:3s} vs reported "
+        out(f"    {label}: measured {d['meas']:8.3f} {unit:3s} vs reported "
               f"{d['rep']:8.3f} {unit:3s} -> {verdict} (x{r:.2f})")
-    print("    (measured > reported => GNSS covariance too optimistic, "
+    out("    (measured > reported => GNSS covariance too optimistic, "
           "< => too pessimistic)")
 
 
@@ -1848,29 +1892,29 @@ def channel_standstill_accuracy(phases, reported_stddev, min_seg_samples=4):
             "ratio": (meas / rep if meas is not None and rep else None)}
 
 
-def print_channel_standstill_accuracy(label, unit, phases, reported_stddev):
+def print_channel_standstill_accuracy(label, unit, phases, reported_stddev, out=print):
     """Print channel_standstill_accuracy() as a data-quality line (baro/mag),
     or note that there weren't enough standstill samples."""
     acc = channel_standstill_accuracy(phases, reported_stddev)
     if acc is None:
         n = sum(len(ph) for ph in phases)
-        print(f"  {label} accuracy check: not enough standstill samples "
+        out(f"  {label} accuracy check: not enough standstill samples "
               f"({n} seen) - skipped (needs the platform to stand still)")
         return
     d = acc
     if d["meas"] is None or d["rep"] is None:
-        print(f"  {label} accuracy check: n/a "
+        out(f"  {label} accuracy check: n/a "
               f"({'no configured stddev' if d['rep'] is None else 'no usable samples'})")
         return
     r = d["ratio"]
     verdict = ("optimistic" if r > 1.3 else
                "pessimistic" if r < 0.77 else "consistent")
-    print(f"  {label} accuracy check (measured spread during {d['n_phases']} "
+    out(f"  {label} accuracy check (measured spread during {d['n_phases']} "
           f"standstill phase(s), {d['n_samples']} samples, vs configured "
           f"1-σ):")
-    print(f"    measured {d['meas']:8.3f} {unit:3s} vs configured "
+    out(f"    measured {d['meas']:8.3f} {unit:3s} vs configured "
           f"{d['rep']:8.3f} {unit:3s} -> {verdict} (x{r:.2f})")
-    print(f"    (measured > configured => {label} stddev too optimistic, "
+    out(f"    (measured > configured => {label} stddev too optimistic, "
           "< => too pessimistic)")
 
 
@@ -2312,7 +2356,7 @@ def _vec_nonzero(v):
     return any(abs(float(x)) > 0.0 for x in v)
 
 
-def print_chi2_gate(spec):
+def print_chi2_gate(spec, out=print):
     """Print the active chi2 outlier gate as a confidence level (1-alpha) at
     startup, so it's obvious at a glance whether outliers are gated at ~95%
     or ~99%. Each ins reference is fused scalar-row-wise, so the gate is
@@ -2321,12 +2365,12 @@ def print_chi2_gate(spec):
     INS_CHI2_MAG/YAW (9); a positive chi2_reject_alpha overrides them with
     one shared chi2inv(1-alpha, 1) gate."""
     if spec["chi2_disable"]:
-        print("chi2 outlier gate: DISABLED (chi2_disable=1)")
+        out("chi2 outlier gate: DISABLED (chi2_disable=1)")
         return
     alpha = float(spec["chi2_reject_alpha"])
     if alpha > 0.0:
         conf = 1.0 - alpha
-        print(f"chi2 outlier gate: shared chi2inv(1-alpha, 1), "
+        out(f"chi2 outlier gate: shared chi2inv(1-alpha, 1), "
               f"1-alpha = {100.0 * conf:.2f}% (alpha {100.0 * alpha:.2f}%)")
         return
     parts = []
@@ -2334,7 +2378,7 @@ def print_chi2_gate(spec):
         conf = math.erf(math.sqrt(thr / 2.0))
         parts.append(f"{label} thr {thr:.1f} -> {100.0 * conf:.2f}% "
                      f"(alpha {100.0 * (1.0 - conf):.2f}%)")
-    print("chi2 outlier gate (per-channel defaults, 1 DOF): " + "; ".join(parts))
+    out("chi2 outlier gate (per-channel defaults, 1 DOF): " + "; ".join(parts))
 
 
 def notable_settings(spec):
@@ -2590,1292 +2634,70 @@ def main():
     print(f"ins replay.py - loading {args.dataset} ...")
 
     spec, data_dir = load_config(args.dataset)
-    imu_path = input_path(data_dir, spec, "imu")
-    ref_path = input_path(data_dir, spec, "ref")
-    if not (os.path.exists(imu_path) and os.path.exists(ref_path)):
-        sys.exit(f"dataset missing under {data_dir}")
-
-    ref = load_ref(ref_path)
-    if not ref:
-        sys.exit(f"no reference epochs in {ref_path}")
-
-    # Move every reference row onto its own time of validity (REQ-VER-030),
-    # the same shift tools/replay.c applies at load, so one config.yaml scores
-    # the same in both harnesses.
-    ref_delay_ms = float(spec["score"].get("ref_delay_ms", 0.0))
-    if ref_delay_ms:
-        if spec["aiding"] == "ref":
-            sys.exit(f"{data_dir}: score: ref_delay_ms cannot be used with "
-                     "aiding: ref")
-        shift_us = int(ref_delay_ms * 1000.0)
-        for r in ref:
-            r["t_us"] -= shift_us
-        print(f"reference time of validity: {ref_delay_ms:.0f} ms earlier "
-              "than its timestamps (score: ref_delay_ms)")
-
-    gnss_cfg = spec["gnss"]
-    gnss_delay_ms = int(gnss_cfg.get("delay_ms", 0.0))
-    aiding_mode = spec["aiding"]
-    var_hor = gnss_cfg["pos_stddev_fallback_m"][0] ** 2
-    var_ver = gnss_cfg["pos_stddev_fallback_m"][1] ** 2
-    var_vel = gnss_cfg["vel_stddev_fallback_mps"] ** 2
-    if aiding_mode == "gnss":
-        gnss_path = input_path(data_dir, spec, "gnss")
-        fixes = load_gnss(gnss_path) if os.path.exists(gnss_path) else None
-        if not fixes:
-            sys.exit(f"aiding: gnss but no usable {gnss_path}")
-        if args.gnss_outage:
-            # Cut the fixes out rather than telling the filter to ignore
-            # them: an outage is the ABSENCE of data, and anything the
-            # filter would otherwise still learn from a "rejected" fix
-            # (that one arrived at all, its covariance, its time) would
-            # make the test easier than reality.
-            windows = []
-            for w in args.gnss_outage:
-                try:
-                    a_s, d_s = w.split(":")
-                    start, dur = float(a_s), float(d_s)
-                except ValueError:
-                    sys.exit(f"--gnss-outage: expected START:DURATION, got {w!r}")
-                if dur <= 0:
-                    sys.exit(f"--gnss-outage: duration must be > 0, got {w!r}")
-                windows.append((start, start + dur))
-            # Same origin as --eval-start/--eval-end, which count from the
-            # first IMU sample: anchoring the cut on the first FIX instead
-            # would silently offset the two by however long the receiver
-            # took to produce one (55.6 s on the first real drive), and the
-            # evaluation window would then not be inside the outage it
-            # claims to measure.
-            base_us = None
-            for _t, _g, _a in iter_imu(imu_path):
-                base_us = _t
-                break
-            if base_us is None:
-                sys.exit("--gnss-outage: no IMU samples to anchor the window on")
-            kept = [fx for fx in fixes
-                    if not any(lo <= (fx["t_us"] - base_us) / US_PER_SEC < hi
-                               for lo, hi in windows)]
-            n_cut = len(fixes) - len(kept)
-            fixes = kept
-            if not fixes:
-                sys.exit("--gnss-outage removed every fix")
-            print("simulated GNSS outage: %s -> %d of %d fixes dropped"
-                  % (", ".join("%.0f..%.0f s" % w for w in windows),
-                     n_cut, n_cut + len(kept)))
-        for fx in fixes:
-            fx["cov_pos"] = apply_fallback(cov6_to_rows(fx["cov_pos"]),
-                                           var_hor, var_ver)
-            fx["cov_vel"] = (apply_fallback(cov6_to_rows(fx["cov_vel"]),
-                                            var_vel, var_vel)
-                             if fx["vel_ok"] else None)
-    elif aiding_mode == "ref":
-        # Synthesize the fix from the reference. Noise is
-        # pos_stddev_fallback_m/vel_stddev_fallback_mps, same fields a real
-        # fix's zero/unknown covariance diagonals fall back to: this
-        # synthesized fix never has a reported covariance either.
-        pos_cov = [[var_hor, 0, 0], [0, var_hor, 0], [0, 0, var_ver]]
-        vel_cov = [[var_vel if i == j else 0
-                    for j in range(3)] for i in range(3)]
-        fixes = [{
-            "t_us": r["t_us"], "lat_rad": r["lat_rad"],
-            "lon_rad": r["lon_rad"], "h_m": r["h_m"],
-            "cov_pos": pos_cov, "vel_ned": r["vel_ned"],
-            "cov_vel": vel_cov, "vel_ok": True,
-        } for r in ref]
-    elif aiding_mode == "none":
-        # No absolute position aiding at all: ins never gets a fix, so
-        # it stays uninitialized (nav_suite mode NONE/ATTITUDE_ONLY)
-        # forever - but the ARS and baro_alt filters don't need one,
-        # they bootstrap from the accelerometer/first barometer sample
-        # and keep running regardless (see nav_suite.h). Use this to
-        # exercise just those two, e.g. when there is no position source
-        # at all.
-        fixes = []
-    else:
-        sys.exit(f"{args.dataset}: unknown aiding mode {aiding_mode!r} "
-                 f"(expected gnss/ref/none)")
-
-    mag_cfg = spec["mag"]
-    mags = []
-    if int(mag_cfg["enable"]):
-        mags = load_txyz(input_path(data_dir, spec, "mag"))
-        if not mags:
-            sys.exit(f"mag: enable but no usable mag.csv in {data_dir}")
-    # 0 is handed straight to the library, which reads an unset variance as
-    # "use my magnetometer default" (src/sensor_defaults.h). The standstill
-    # accuracy check below is fed the same 0 on purpose: with nothing
-    # configured there is no configured stddev to call optimistic.
-    mag_sd = float(mag_cfg["stddev_ut"])
-    mag_var = (mag_sd ** 2,) * 3
-    # The fixed calibration as the library gets it (mags itself stays raw:
-    # nav.mag() is handed the raw sample and ins.c calibrates it, applying it
-    # here as well would correct twice). Anything replay derives from the mag
-    # stream on its own goes through mag_calibrate() with these.
-    mag_misalign = mounted_calibration(spec)[2]
-    mag_bias_cfg = tuple(float(v) for v in mag_cfg["fixed_bias"])
-    mag_cal_active = any(mag_misalign) or any(mag_bias_cfg)
-
-    baro_cfg = spec["baro"]
-    ahrs_cfg = spec["ahrs"]
-    baros = []
-    if int(baro_cfg["enable"]):
-        baros = load_baro(input_path(data_dir, spec, "baro"))
-        if not baros:
-            sys.exit(f"baro: enable but no usable baro.csv in {data_dir}")
-
-    speed_cfg = spec["speed"]
-    speeds = []
-    if int(speed_cfg["enable"]):
-        speeds = load_speed(input_path(data_dir, spec, "speed"))
-        if not speeds:
-            sys.exit(f"speed: enable but no usable speed.csv in {data_dir}")
-
-    heading_cfg = spec["heading"]
-    headings = []
-    if int(heading_cfg["enable"]):
-        headings = load_heading(input_path(data_dir, spec, "heading"))
-        if not headings:
-            sys.exit(f"heading: enable but no usable heading.csv in {data_dir}")
-
-    leverarm = tuple(gnss_cfg["leverarm_frd"])
-    score_la = tuple(spec["score"].get("leverarm_frd") or (0.0, 0.0, 0.0))
-
-    # init: ref uses the reference epoch aligned with the FIRST IMU
-    # sample, not ref[0]: ins defers a prescribed init to its actual
-    # start epoch and stamps the provided state THERE without propagating
-    # it (REQ-NAV-033). Handing it an older truth epoch bakes a permanent
-    # -v*dt position offset into a moving start (2 m East on the Groves
-    # aircraft profile: one 10-ms IMU period at 200 m/s East), which then
-    # reads as filter inaccuracy.
-    first_imu_us = next(iter_imu(imu_path))[0]
-    ref0 = next((r for r in ref if r["t_us"] >= first_imu_us), ref[0])
-
-    gyr_bias = estimate_gyro_bias(imu_path, spec["gyro_bias_window_sec"])
-    bias_note = "from initial window" if gyr_bias else "n/a"
-    if gyr_bias is not None and spec["init"] == "ref":
-        # With init: ref the reference provides position, velocity AND
-        # attitude, so the non-bias content of the window average can be
-        # removed (see correct_initial_gyr_bias).
-        gyr_bias = correct_initial_gyr_bias(
-            gyr_bias, ref, first_imu_us, spec["gyro_bias_window_sec"])
-        bias_note += ", ref motion + earth/transport rate removed"
-    if not spec["gnss"]["enable"]:
-        print("gnss: enable 0 - the fixes are read and counted, but none of "
-              "them aids the filter")
-    print(f"dataset {spec['name']}: aiding={spec['aiding']}, "
-          f"init={spec['init']}, warmup {spec['score']['warmup_sec']:g} s, "
-          f"leverarm FRD {list(leverarm)}"
-          f"{', automotive' if spec['automotive_mode'] else ''}"
-          f"{', mag' if mags else ''}{', baro' if baros else ''}"
-          f"{f', gnss delay {gnss_delay_ms} ms' if gnss_delay_ms else ''}")
-    print(f"initial gyro bias: "
-          f"{[round(math.degrees(b), 4) for b in (gyr_bias or (0, 0, 0))]} deg/s "
-          f"({bias_note})")
-    print_chi2_gate(spec)
-    notes = notable_settings(spec)
-    if notes:
-        print("notable settings (non-default):")
-        for n in notes:
-            print(f"  - {n}")
-    else:
-        print("notable settings: none (all defaults)")
-
-    # fixes[0] is just a provisional seed for auto_init (overridden by the
-    # first real fix); with aiding: none there is none, so fall back to
-    # the reference epoch - harmless since ins then never leaves
-    # is_collecting anyway.
-    t0 = ref0 if (spec["init"] == "ref" or not fixes) else fixes[0]
-    nav = Navigator(build_config(spec, ref0, t0["t_us"], t0["lat_rad"],
-                                 t0["lon_rad"], t0["h_m"], gyr_bias))
-    # baro_alt / ARS/AHRS noise model (0 -> each filter's own default); must
-    # be set before the first baro sample / ins_suite_update() latches the
-    # respective template (nav_suite contract).
-    nav.set_baro_acc_bias_drift(float(baro_cfg.get("acc_bias_rw", 0.0)))
-    nav.set_baro_acc_noise(float(baro_cfg.get("acc_noise_mps2_sqrthz", 0.0)))
-    nav.set_baro_acc_bias_init_stddev(float(baro_cfg.get("acc_bias_init_mps2", 0.0)))
-    nav.set_baro_h_process_noise(float(baro_cfg.get("h_process_noise", 0.0)))
-    nav.set_local_gnss_rw_stddev(float(baro_cfg.get("local_gnss_rw_stddev_mps", 0.0)))
-    nav.set_local_gnss_chi2_threshold(float(baro_cfg.get("local_gnss_chi2_threshold", 0.0)))
-    nav.set_local_gnss_min_update_interval(
-        float(baro_cfg.get("local_gnss_min_update_interval_sec", 0.0)))
-    nav.set_local_gnss_stddev_inflation(
-        float(baro_cfg.get("local_gnss_stddev_inflation_factor", 0.0)))
-    nav.set_ahrs_gyr_noise(float(ahrs_cfg.get("gyr_noise_psd", 0.0)))
-    nav.set_ahrs_acc_noise(float(ahrs_cfg.get("acc_noise_mps2", 0.0)))
-    nav.set_ahrs_gyr_bias_rw(float(ahrs_cfg.get("gyr_bias_rw", 0.0)))
-    nav.set_ahrs_gyr_bias_init_stddev(
-        math.radians(float(ahrs_cfg.get("gyr_bias_init_stddev_rps_deg", 0.0))))
-    init_hint = spec["init_hint"]
-    nav.set_init_att_hint(
-        math.radians(init_hint["roll_deg"]), math.radians(init_hint["pitch_deg"]),
-        math.radians(init_hint["rpy_stddev_deg"]), math.radians(init_hint["yaw_deg"]),
-        math.radians(init_hint["yaw_stddev_deg"]))
-    # No set_auto_zaru() here: the ARS/AHRS stillness fallback (REQ-AHRS-017)
-    # is armed by default and configured through the same imu.auto_zupt_* set
-    # as ins (REQ-SUITE-020, already in the Config above). Calling the runtime
-    # override here would silently re-arm a dataset that opted out with
-    # imu.auto_zupt_velocity_blind_disable.
-    #
-    # Armed by default is what a real capture needs: the ARS/AHRS ZARU and,
-    # through it, baro_alt's vertical ZUPT are decided on the IMU alone
-    # (short-window sample stddev), which is available from the first samples,
-    # whereas the trigger propagated from ins (REQ-SUITE-009) cannot answer
-    # until ins has initialized.
-    if mags and float(mag_cfg["wmm_year"]) > 0:
-        # Both attitude sources agree on true north (WMM declination).
-        nav.set_magnetic_model(ref[0]["lat_rad"], ref[0]["lon_rad"],
-                               float(mag_cfg["wmm_year"]))
-    elif mags:
-        # Same up-front warning as tools/replay.c: without an epoch there is
-        # no reference field and every magnetometer sample is rejected.
-        print("  WARNING: mag.enable is set but mag.wmm_year is missing, no"
-              " magnetic reference field is built and the magnetometer will"
-              " not be fused (tools/inslib_convert_ubx_to_csv.py derives it"
-              " from NAV-PVT)")
+    try:
+        outages = replay_core.parse_gnss_outages(args.gnss_outage)
+        inp = replay_core.load_inputs(spec, data_dir, outages)
+    except replay_core.ReplayError as e:
+        sys.exit(str(e))
+    replay_core.log_startup(spec, inp)
+    nav = replay_core.make_navigator(spec, inp)
     tele = Telemetry(plotjuggler=args.plotjuggler, mavlink=args.mavlink,
                      pj_port=args.pj_port, mav_port=args.mav_port,
                      pj_log=args.flight_log)
 
-    noise = spec["imu"]
-    acc_var = (noise["acc_psd"],) * 3
-    gyr_var = (noise["gyr_psd"],) * 3
+    run = replay_core.Replay(spec, inp, nav, eval_start=args.eval_start,
+                             eval_end=args.eval_end,
+                             rate_bucket_sec=args.plot_rate_bucket_sec)
+    progress, progress_done = _progress_reporter(run.n_imu_total, "imu")
 
-    (n_imu_total, imu_duration, imu_hz, imu_max_gap, imu_max_gap_at,
-     gyr_d2_stat, acc_d2_stat, rate_t0, imu_rate_t,
-     imu_rate_hz) = _imu_prepass(imu_path, args.plot_rate_bucket_sec)
-    progress, progress_done = _progress_reporter(n_imu_total, "imu")
+    # The GNSS-delay estimate runs on its own whenever it is meaningful
+    # (Replay.gnss_delay_auto()), --estimate-gnss-delay forces it on
+    # regardless (e.g. to sanity-check aiding: ref).
+    do_gnss_delay_estimate = args.estimate_gnss_delay or run.gnss_delay_auto()
 
-    # per-stream sampling rate over time for the --plot
-    # sensor-rate page, all sharing rate_t0 (the first IMU sample) as
-    # their time origin, same as rec["t"].
-    sensor_rate = {"imu": (imu_rate_t, imu_rate_hz)}
-    if aiding_mode == "gnss" and fixes:
-        sensor_rate["gnss"] = _bucketed_rate(
-            [fx["t_us"] for fx in fixes], rate_t0, args.plot_rate_bucket_sec)
-    if mags:
-        sensor_rate["mag"] = _bucketed_rate(
-            [m[0] for m in mags], rate_t0, args.plot_rate_bucket_sec)
-    if baros:
-        sensor_rate["baro"] = _bucketed_rate(
-            [b[0] for b in baros], rate_t0, args.plot_rate_bucket_sec)
-
-    iref = 0
-    ifix = 0
-    imag = 0
-    ibaro = 0
-    ispeed = 0
-    n_speed_fused = 0
-    speed_sd_cfg = float(speed_cfg["stddev_mps"])
-    speed_delay_cfg = int(round(float(speed_cfg["delay_ms"])))
-    iheading = 0
-    heading_reasons = {}
-    heading_delay_cfg = int(round(float(heading_cfg["delay_ms"])))
-    t_prev = None
-    n_imu = 0
-    last_ref = None
-    last_fix = None
-    last_mag = None
-    last_baro = None
-    origin_ecef = None
-    origin_lat = origin_lon = origin_h = 0.0
-    last_pub_us = None
-    pub_period_us = US_PER_SEC / max(args.telemetry_hz, 1e-3)
-    wall0 = time.perf_counter()
-    err_dump = None
-    if args.dump_errors:
-        err_dump = open(args.dump_errors, "w", encoding="utf-8")
-        err_dump.write("# t_s, horizontal_m, down_m, north_m, east_m\n")
-    sol_dump = None
-    last_sol_us = None
-    sol_period_us = (US_PER_SEC / args.dump_solution_hz
-                     if args.dump_solution_hz > 0 else 0.0)
-    if args.dump_solution:
-        # newline="" so the dataset CSVs stay LF on every platform, matching
-        # datasets/replay_format.py's writers
-        sol_dump = open(args.dump_solution, "w", encoding="utf-8", newline="\n")
-        sol_dump.write("# t_us, lat_deg, lon_deg, h_m, roll_deg, pitch_deg,"
-                       " yaw_deg, vn_mps, ve_mps, vd_mps\n")
-        sol_dump.write("# INSLIB nav_suite solution, python/replay.py"
-                       " --dump-solution\n")
-    t0_us = None
-    t_warmup_end = ((fixes[0] if fixes else ref[0])["t_us"]
-                    + int(spec["score"]["warmup_sec"] * US_PER_SEC))
-    e_roll, e_pitch, e_yaw, e_pos = Stat(), Stat(), Stat(), Stat()
-    e_height_ell = Stat()  # nav_suite_get_height_ellipsoid() vs ref_now["h_m"]
-
-    # Optional ground-truth evaluation window (--eval-start/--eval-end),
-    # in microseconds from the first IMU sample (t0_us, the printed-time
-    # origin). Only the scoring below is gated - the filter still runs the
-    # whole trial. Resolved to absolute timestamps once t0_us is known.
-    eval_lo_us = (int(args.eval_start * US_PER_SEC)
-                  if args.eval_start is not None else None)
-    eval_hi_us = (int(args.eval_end * US_PER_SEC)
-                  if args.eval_end is not None else None)
-
-    # Auto-detect whether a GNSS-delay estimate is meaningful:
-    # real GNSS aiding (not a ref-synthesized fix, which is perfectly
-    # time-aligned with the reference by construction and would just
-    # trivially self-correlate at ~0 ms) with usable velocity, plus a
-    # barometer as the near-zero-latency vertical reference. --estimate-
-    # gnss-delay forces it on regardless (e.g. to sanity-check aiding: ref).
-    auto_gnss_delay = (aiding_mode == "gnss" and bool(baros)
-                      and any(fx.get("vel_ok") and fx.get("cov_vel") is not None
-                              for fx in fixes))
-    do_gnss_delay_estimate = args.estimate_gnss_delay or auto_gnss_delay
-
-    rec = None
-    last_rec_us = None
-    rec_period_us = US_PER_SEC / max(args.plot_hz, 1e-3)
+    run.observers.append(_TelemetryPublisher(tele, args.telemetry_hz))
+    # --plot recorder: state history + error samples at a fixed rate,
+    # independent of the telemetry throttle (see ins_plots.py).
+    rec_obs = None
     if args.plot or do_gnss_delay_estimate:
-        rec = {k: [] for k in (
-            "t", "pos", "pos_sigma", "vel", "vel_sigma",
-            "rpy_deg", "rpy_sigma_deg", "ref_pos",
-            "ref_vel", "ref_rpy_deg", "pos_err_ned",
-            "rpy_err_deg", "baro_vel_d", "gnss_vel_d",
-            # most recent fused GNSS fix's OWN reported 1-σ (receiver
-            # covariance, after apply_fallback) - for the PDF summary's
-            # "last GNSS fix accuracy" line, side-by-side with the filter's
-            # final 1-σ above.
-            "gnss_pos_sigma", "gnss_vel_sigma",
-            # ins bias + 1-σ (all NED/body, SI units)
-            "acc_bias", "acc_bias_sigma", "gyr_bias", "gyr_bias_sigma",
-            # ins magnetometer hard-iron bias + 1-σ
-            # (18-state mode only, mag: estimate_bias) [uT]
-            "mag_bias", "mag_bias_sigma",
-            # ARS/AHRS roll/pitch + own gyro bias/sigma
-            "ars_rpy_deg", "ars_rpy_sigma_deg", "ars_gyr_bias", "ars_gyr_bias_sigma",
-            "ahrs_rpy_deg", "ahrs_rpy_sigma_deg", "ahrs_gyr_bias", "ahrs_gyr_bias_sigma",
-            # heading page: independent absolute-heading sources sampled
-            # every tick, NaN when unavailable. mag_heading_deg is the
-            # tilt-compensated raw-magnetometer compass (magnetic north),
-            # gnss_course_deg the GNSS course-over-ground (atan2(vE,vN),
-            # the automotive_mode yaw source) once moving fast enough.
-            "mag_heading_deg", "gnss_course_deg",
-            # baro_alt page: height/vel in the same NED-down convention as
-            # pos/vel/ref_pos/ref_vel above (baro_alt itself is positive
-            # up, negated to match), plus its own z-accel bias/sigma, plus
-            # the GNSS fix in the same local frame as ref_pos/ref_vel.
-            "baro_h_d", "baro_raw_d", "baro_h_sigma", "baro_acc_bias", "baro_acc_bias_sigma",
-            "fix_pos_d",
-            # baro-to-ellipsoid offset filter (nav_suite_get_height_ellipsoid)
-            "local_gnss_offset", "local_gnss_offset_sigma",
-            # nav_suite_get_height_ellipsoid() itself, i.e. h_local + the
-            # ESTIMATED offset above (not the true origin_h ref_pos is
-            # anchored to) -- reveals the offset filter's own reconstruction
-            # error, invisible when everything is compared against the true
-            # origin_h instead. Same NED-down convention as the other *_d
-            # fields, so it overlays directly on the altitude-profile page.
-            "nav_height_ellipsoid_d",
-            # REQ-VER-037: pos moved onto the score.leverarm_frd point, and
-            # the up shift from the board to that point (0 without a lever
-            # arm) for the board-point curves of the altitude pages.
-            "pos_ref_pt", "ref_pt_up",
-            # ins's own velocity-aware auto-ZUPT/ZARU detector (shaded on
-            # the plot pages so stops can be correlated with bias jumps).
-            "zupt_active",
-            # The individual detectors zupt_active is OR'd together from,
-            # each sampled separately for the dedicated ZUPT/ZARU timeline
-            # page (_zupt_page) -- a mismatch between them (e.g. the ARS
-            # thinks it's still but ins doesn't) is invisible on the
-            # combined signal above. *_zaru_applied, not *_auto_zaru_active
-            # (a much looser "stillness run started" gate that stays true
-            # through genuine constant-velocity cruise) -- see
-            # ars_zaru_applied()'s docstring.
-            "auto_zupt_active", "vertical_zupt_active",
-            "ars_zaru_applied", "ahrs_zaru_applied",
-            # cumulative chi2-downweight counters, same
-            # source as downweight_counts()/diag()['n_downweighted']
-            # printed at the end - here sampled every recorder tick so
-            # the outlier page can show WHEN, not just how many.
-            "dw_full3d", "dw_ars", "dw_ahrs", "dw_baro_alt", "dw_local_gnss",
-        )}
-        # A single ref.csv row (e.g. the MVP-placeholder ref.csv
-        # inslib_convert_ubx_to_csv.py writes when a capture has no real
-        # fix) gets forward-filled onto every later epoch by last_ref
-        # below, which would otherwise masquerade as a full, flat "ground
-        # truth" trajectory (zero speed/distance) to ins_plots.py. Record
-        # the real epoch count so it can tell the two apart.
-        rec["ref_epoch_count"] = len(ref)
-
-    # --plot North-East map recorder: the ground track alone (two floats
-    # per sample), sampled independently of - and by default faster than -
-    # the full state history above, which carries ~60 fields per tick and
-    # would blow up the PDF and the memory footprint at this rate. See
-    # --plot-track-hz and _ne_page/_thin_track in ins_plots.py.
-    do_track = args.plot and args.plot_track_hz > 0.0
-    track_est = [] if do_track else None
-    track_ref = [] if do_track else None
-    last_track_us = None
-    track_period_us = US_PER_SEC / max(args.plot_track_hz, 1e-3)
-
+        rec_obs = replay_core.PlotRecorder(args.plot_hz)
+        run.observers.append(rec_obs)
+    # --plot North-East map recorder: the ground track alone, sampled
+    # independently of, and by default faster than, the full state history
+    # above (see --plot-track-hz and _ne_page/_thin_track in ins_plots.py).
+    track_obs = None
+    if args.plot and args.plot_track_hz > 0.0:
+        track_obs = replay_core.TrackRecorder(args.plot_track_hz)
+        run.observers.append(track_obs)
     # Shared by --kml and --map-frames: both consume the same recorded
     # geodetic track, just render it differently.
-    do_kml_track = bool(args.kml) or bool(args.map_frames)
-    kml_est_track = [] if do_kml_track else None
-    kml_ref_track = [] if do_kml_track else None
-    kml_fix_track = [] if do_kml_track else None
-    last_kml_us = None
-    kml_period_us = US_PER_SEC / max(args.kml_hz, 1e-3)
+    kml_obs = None
+    if args.kml or args.map_frames:
+        kml_obs = replay_core.KmlRecorder(args.kml_hz)
+        run.observers.append(kml_obs)
+    sol_obs = None
+    if args.dump_solution:
+        sol_obs = _SolutionDump(args.dump_solution, args.dump_solution_hz)
+        run.observers.append(sol_obs)
+    err_obs = None
+    if args.dump_errors:
+        err_obs = _ErrorDump(args.dump_errors)
+        run.observers.append(err_obs)
 
-    # Stationary-epoch count (for the "stationary epochs" line below), from
-    # ins's own (velocity-aware) auto-ZUPT/ZARU detector.
-    n_static = 0
-
-    # GNSS accuracy self-check: collect the GNSS fixes that land during
-    # an ins-detected standstill, grouped into contiguous
-    # standstill phases, to later compare their empirical spread against
-    # the receiver's own reported covariance (see gnss_standstill_accuracy).
-    # Only meaningful for real GNSS aiding - a ref-synthesized fix equals
-    # the truth and would trivially show ~zero spread.
-    gnss_static_phases = []
-    gnss_cur_phase = []
-
-    # Same standstill-spread self-check for the raw baro/mag channels (see
-    # channel_standstill_accuracy). Unlike GNSS these are never
-    # reference-synthesized, so the check is meaningful without GNSS aiding
-    # too - baro truly in ANY aiding mode (nav.vertical_zupt_active()
-    # below folds in the ARS/AHRS fallback), mag still needs ins's own
-    # auto-ZUPT/ZARU. Each phase is a list of per-sample tuples: baro (ISA
-    # altitude,), mag (x, y, z).
-    baro_static_phases, baro_cur_phase = [], []
-    mag_static_phases, mag_cur_phase = [], []
-
-    # Filter self-consistency watchdog: sample the filter's OWN reported
-    # 1-σ (attitude + position) right after a fused GNSS fix, but only
-    # past the warmup and while GNSS is streaming (the previous used fix is
-    # still recent), so the uncertainty growth during initial convergence,
-    # a GNSS outage, or the re-acquisition transient after one is excluded
-    # - only steady, healthy operation is judged against STDDEV_LIMITS.
-    health_stats = {k: {"worst": 0.0, "t": 0.0, "n_exceed": 0}
-                    for k in STDDEV_LIMITS}
-    health_n = 0
-    last_fix_used_us = None
-    # Streaming grace: the previous fix counts as "recent" within a few
-    # nominal GNSS periods (>=2 s), so a slow receiver isn't permanently
-    # treated as gapped, and a real gap (>= this) suppresses the sample.
-    gnss_grace_us = 2 * US_PER_SEC
-    if fixes and len(fixes) > 1:
-        nominal_sec = ((fixes[-1]["t_us"] - fixes[0]["t_us"]) / US_PER_SEC
-                       / (len(fixes) - 1))
-        gnss_grace_us = int(max(2.0, 3.0 * nominal_sec) * US_PER_SEC)
-
-    # free_inertial_start (see the offer inside the loop). Prepared once:
-    # the ECEF of the declared point and the covariance of that statement.
-    # gnss: enable 0 - the fixes stay loaded and counted, they just never
-    # reach the filter (same key and same meaning as tools/insrcv.c).
-    gnss_enable = bool(spec["gnss"]["enable"])
-    fi_spec = spec["free_inertial_start"]
-    fi_llh = fi_cov = None
-    fi_next_t_us = 0
-    n_fi_offers = 0
-    if fi_spec["enable"]:
-        fi_llh = (math.radians(fi_spec["lat_deg"]),
-                  math.radians(fi_spec["lon_deg"]),
-                  float(fi_spec["height_m"]))
-        fi_var = float(fi_spec["stddev_m"]) ** 2
-        fi_cov = [fi_var, 0.0, 0.0, 0.0, fi_var, 0.0, 0.0, 0.0, fi_var]
-
-    for t, g, a in iter_imu(imu_path):
-        if t0_us is None:
-            t0_us = t
-        dt = (t - t_prev) / US_PER_SEC if t_prev is not None else 0.0
-        t_prev = t
-        n_imu += 1
-        progress(n_imu)
-
-        nav.imu(t, dt, a, g, acc_var, gyr_var)
-
-        # Attach the most recent fix (real GNSS or reference-derived).
-        fix_now = None
-        while ifix < len(fixes) and fixes[ifix]["t_us"] <= t:
-            fix_now = fixes[ifix]
-            ifix += 1
-        # free_inertial_start: the declared origin, offered as a position
-        # measurement until ins has bootstrapped from it and not one epoch
-        # longer - a source that kept repeating the same point would pin the
-        # solution to it instead of dead reckoning. Never in an epoch that
-        # already carries a real fix: a measured position beats a declared
-        # one. Mirrors fi_offer_start_position() in tools/insrcv.c.
-        if (fi_llh is not None and fix_now is None
-                and nav.deadreckoning_ms() < 0 and t >= fi_next_t_us):
-            fi_next_t_us = t + US_PER_SEC // 2   # 2 Hz: entry dwell wants >= 1
-            nav.gnss_pos_llh(fi_llh, fi_cov)
-            n_fi_offers += 1
-
-        if (gnss_enable and fix_now is not None
-                and fix_now["cov_pos"] is not None):
-            # REQ-VER-008: assumed fixed processing/telemetry latency,
-            # applied uniformly regardless of aiding source; history-
-            # anchors the fusion via ins's existing gnss_delay_ms.
-            nav.gnss_pos_llh((fix_now["lat_rad"], fix_now["lon_rad"],
-                              fix_now["h_m"]),
-                             fix_now["cov_pos"], delay_ms=gnss_delay_ms)
-            if fix_now["vel_ok"] and fix_now["cov_vel"] is not None:
-                nav.gnss_vel(fix_now["vel_ned"], fix_now["cov_vel"])
-            nav.gnss_leverarm(leverarm)
-        if fix_now is not None:
-            last_fix = fix_now
-
-        # Attach the most recent magnetometer / barometer sample.
-        mag_now = None
-        while imag < len(mags) and mags[imag][0] <= t:
-            mag_now = mags[imag]
-            imag += 1
-        if mag_now is not None:
-            nav.mag(mag_now[1], mag_var)
-            last_mag = mag_now
-        baro_now = None
-        while ibaro < len(baros) and baros[ibaro][0] <= t:
-            baro_now = baros[ibaro]
-            ibaro += 1
-        if baro_now is not None:
-            nav.baro(baro_now[1], float(baro_cfg["stddev_m"]))
-            last_baro = baro_now
-
-        # Absolute speed (REQ-NAV-068). Only the newest sample of the
-        # interval is fused: re-fusing a value the filter has already seen
-        # would count one measurement twice and make it overconfident about
-        # the velocity, the same contract the barometer above follows.
-        speed_now = None
-        while ispeed < len(speeds) and speeds[ispeed][0] <= t:
-            speed_now = speeds[ispeed]
-            ispeed += 1
-        if speed_now is not None:
-            nav.speed(speed_now[1], speed_sd_cfg, speed_delay_cfg)
-            n_speed_fused += 1
-
-        # Dual-antenna heading (REQ-NAV-010/087). Newest row only, same
-        # contract as the speed above.
-        heading_now = None
-        while iheading < len(headings) and headings[iheading][0] <= t:
-            heading_now = headings[iheading]
-            iheading += 1
-        if heading_now is not None:
-            why, yaw_meas, sd_meas = heading_measurement(heading_cfg, heading_now,
-                                                         nav.rpy())
-            heading_reasons[why] = heading_reasons.get(why, 0) + 1
-            if why == HEADING_OK:
-                nav.yaw(yaw_meas, sd_meas, heading_delay_cfg)
-
-        nav.update()
-
-        if nav.auto_zupt_active():
-            n_static += 1
-
-        ref_now = None
-        while iref < len(ref) and ref[iref]["t_us"] <= t:
-            ref_now = ref[iref]
-            iref += 1
-        if ref_now is not None:
-            last_ref = ref_now
-
-        # Cache the local-frame origin once the filter is up, so the ground
-        # truth can be expressed in the same NED frame as the estimate. A
-        # GNSS quality-loss re-bootstrap no longer moves the origin, it is
-        # carried across (REQ-NAV-062); a time-jump reset (REQ-NAV-016) or a
-        # bootstrap beyond the carry distance still establish a new one, and
-        # rec['pos'] comes straight from ins's pos_local, so it would
-        # restart at zero in a frame that no longer matches the cached one.
-        # Refreshing the cache instead would move the truth frame mid-plot,
-        # which is worse. Scoring is unaffected either way, it runs on
-        # absolute ECEF (pos_error_ecef); only plot overlays drawn in this
-        # cached frame would show the offset.
-        if origin_ecef is None:
-            origin_ecef = nav.origin_ecef()
-            if origin_ecef is not None:
-                origin_lat, origin_lon, origin_h = ecef_to_llh(*origin_ecef)
-
-        # File a fused GNSS fix that arrived this epoch under the current
-        # standstill phase (ins-ZUPT-detected), or end the
-        # phase when a fix arrives while moving. fix_now is the fix just
-        # fused (cov_pos None means it was rejected -> not counted); the
-        # standstill flag is read AFTER nav.update() so it reflects this
-        # epoch, and needs the local origin to place the fix in NED.
-        if (aiding_mode == "gnss" and fix_now is not None
-                and fix_now["cov_pos"] is not None):
-            if nav.auto_zupt_active():
-                if origin_ecef is not None:
-                    cov_p = fix_now["cov_pos"]
-                    cov_v = fix_now["cov_vel"]
-                    has_vel = fix_now["vel_ok"] and cov_v is not None
-                    gnss_cur_phase.append({
-                        "pos_ned": ref_to_local_ned(fix_now, origin_ecef,
-                                                    origin_lat, origin_lon),
-                        "vel_ned": (list(fix_now["vel_ned"]) if has_vel
-                                    else None),
-                        "rep_pos_hor": math.sqrt((cov_p[0][0] + cov_p[1][1]) / 2.0),
-                        "rep_pos_ver": math.sqrt(cov_p[2][2]),
-                        "rep_vel_hor": (math.sqrt((cov_v[0][0] + cov_v[1][1]) / 2.0)
-                                        if has_vel else None),
-                        "rep_vel_ver": (math.sqrt(cov_v[2][2]) if has_vel
-                                        else None),
-                    })
-            elif gnss_cur_phase:  # moving fix -> close the standstill phase
-                gnss_static_phases.append(gnss_cur_phase)
-                gnss_cur_phase = []
-
-        # File the baro/mag samples that arrived this epoch under the current
-        # ins-detected standstill, or close the phase once the platform moves
-        # (same machinery as the GNSS check, but driven by the ZUPT flag
-        # directly so it works without GNSS aiding). baro_now/mag_now are the
-        # samples read this epoch (None if none arrived); the standstill flag
-        # is read AFTER nav.update() so it reflects this epoch. The mag field
-        # in body frame is only constant if the platform isn't ROTATING, so
-        # gate it on the zero-angular-rate detector too - an in-place turn
-        # during a stop would otherwise inflate the measured spread.
-        #
-        # baro uses the WIDER vertical_zupt_active() rather than
-        # auto_zupt_active(): without absolute position aiding (aiding:
-        # none) ins never initializes, so auto_zupt_active() stays false
-        # for the whole replay and the baro accuracy check below would
-        # silently never fire even on a dataset that never moves -
-        # vertical_zupt_active() folds in the ARS/AHRS velocity-blind
-        # fallback, the only stillness detector available in that mode
-        # (see nav_suite.c, REQ-SUITE-015).
-        baro_standstill = nav.vertical_zupt_active()
-        if baros:
-            if baro_standstill and baro_now is not None:
-                baro_cur_phase.append((isa_pressure_to_altitude(baro_now[1]),))
-            elif not baro_standstill and baro_cur_phase:
-                baro_static_phases.append(baro_cur_phase)
-                baro_cur_phase = []
-        standstill = nav.auto_zupt_active()
-        if mags:
-            mag_still = standstill and nav.zaru_active()
-            if mag_still and mag_now is not None:
-                mag_cur_phase.append(tuple(mag_now[1]))
-            elif not mag_still and mag_cur_phase:
-                mag_static_phases.append(mag_cur_phase)
-                mag_cur_phase = []
-
-        # Filter self-consistency watchdog: on a fused fix, judge the
-        # filter's freshly-corrected 1-σ against STDDEV_LIMITS - but
-        # only past the warmup, while streaming (prev fix recent) and while
-        # actually moving. Excludes: initial convergence (warmup), GNSS
-        # gaps + the post-gap transient (streaming), and standstill (where
-        # yaw is unobservable without a magnetometer, so a growing yaw
-        # σ is expected, not a fault). Only steady, observable
-        # navigation is judged.
-        if fix_now is not None and fix_now["cov_pos"] is not None:
-            streaming = (last_fix_used_us is not None
-                         and (t - last_fix_used_us) <= gnss_grace_us)
-            last_fix_used_us = t
-            sd = nav.stddev() if nav.is_ready() else None
-            if (streaming and t >= t_warmup_end and sd is not None
-                    and not nav.auto_zupt_active()):
-                health_n += 1
-                t_sec = (t - t0_us) / US_PER_SEC
-                vals = {"roll": math.degrees(sd["rpy"][0]),
-                        "pitch": math.degrees(sd["rpy"][1]),
-                        "yaw": math.degrees(sd["rpy"][2]),
-                        "pos": math.sqrt(sum(x * x for x in sd["pos_ned"]))}
-                for k, v in vals.items():
-                    h = health_stats[k]
-                    if v > h["worst"]:
-                        h["worst"], h["t"] = v, t_sec
-                    if v > STDDEV_LIMITS[k]:
-                        h["n_exceed"] += 1
-
-        # Telemetry, throttled in sim time so fast replays don't flood.
-        # Publishes the estimate (INSLIB/...), the individual sub-filter
-        # outputs (INSLIB/ars|ahrs|full3d|baroalt/...), the ground truth
-        # (ref/...) and the raw input measurements (meas/...), so
-        # everything available can be overlaid in one PlotJuggler session
-        # (overlay the error yourself if you want it - e.g. ref/pos_ned
-        # vs. INSLIB/pos_ned).
-        if last_pub_us is None or (t - last_pub_us) >= pub_period_us:
-            last_pub_us = t
-            tele.publish_suite(nav)
-            if last_ref is not None:
-                ref_local = (ref_to_local_ned(last_ref, origin_ecef,
-                                              origin_lat, origin_lon)
-                             if origin_ecef is not None else None)
-                tele.publish_extra(ref_overlay_tree(last_ref, ref_local))
-            tele.publish_extra(
-                meas_overlay_tree(a, g, last_fix, last_mag, last_baro,
-                                  origin_ecef, origin_lat, origin_lon))
-
-        # --plot recorder: state history + error samples at a fixed rate,
-        # independent of the telemetry throttle above (see ins_plots.py).
-        # "t" (and everything below) is recorded every period regardless of
-        # ins's own readiness - ARS/AHRS/baro_alt run independently of
-        # it (e.g. "aiding: none", where ins never initializes at all)
-        # and each group is NaN-padded on its OWN availability, not
-        # ins's, so every rec[...] list stays the same length as "t".
-        if rec is not None and (last_rec_us is None
-                                or (t - last_rec_us) >= rec_period_us):
-            last_rec_us = t
-            rec["t"].append((t - t0_us) / US_PER_SEC)
-            # OR'd with vertical_zupt_active() (see the baro_standstill
-            # comment above) so the --plot-out shading still shows
-            # standstill phases - e.g. on the altitude page - for a
-            # dataset with no absolute position aiding, where
-            # auto_zupt_active() alone stays false for the whole replay.
-            rec["zupt_active"].append(
-                1.0 if (nav.auto_zupt_active() or nav.vertical_zupt_active()) else 0.0)
-            rec["auto_zupt_active"].append(1.0 if nav.auto_zupt_active() else 0.0)
-            rec["vertical_zupt_active"].append(1.0 if nav.vertical_zupt_active() else 0.0)
-            rec["ars_zaru_applied"].append(1.0 if nav.ars_zaru_applied() else 0.0)
-            rec["ahrs_zaru_applied"].append(1.0 if nav.ahrs_zaru_applied() else 0.0)
-
-            # cumulative downweight counters, sampled every
-            # tick so the outlier page can plot WHEN outliers occurred.
-            dw_now = nav.downweight_counts()
-            rec["dw_full3d"].append(float(nav.diag()["n_downweighted"]))
-            rec["dw_ars"].append(float(dw_now["ars"]))
-            rec["dw_ahrs"].append(float(dw_now["ahrs"]))
-            rec["dw_baro_alt"].append(float(dw_now["baro_alt"]))
-            rec["dw_local_gnss"].append(float(dw_now["local_gnss"]))
-
-            pos = nav.position_local()
-            vel = nav.velocity_ned()
-            rpy = nav.rpy_ins()
-            sd = nav.stddev()
-            if pos is not None and vel is not None and rpy is not None and sd:
-                rec["pos"].append(pos)
-                rec["pos_sigma"].append(sd["pos_ned"])
-                rec["vel"].append(vel)
-                rec["vel_sigma"].append(sd["vel_ned"])
-                rec["rpy_deg"].append([math.degrees(x) for x in rpy])
-                rec["rpy_sigma_deg"].append(
-                    [math.degrees(x) for x in sd["rpy"]])
-                acc_bias = nav.bias_acc()
-                rec["acc_bias"].append(list(acc_bias) if acc_bias else [math.nan] * 3)
-                rec["acc_bias_sigma"].append(list(sd["acc_bias"]))
-                gyr_bias = nav.bias_gyr()
-                rec["gyr_bias"].append(list(gyr_bias) if gyr_bias else [math.nan] * 3)
-                rec["gyr_bias_sigma"].append(list(sd["gyr_bias"]))
-                # only present in 18-state mode (mag:
-                # estimate_bias) - NaN otherwise, same convention as the
-                # sub-filter fields below.
-                mag_bias = nav.bias_mag()
-                rec["mag_bias"].append(list(mag_bias) if mag_bias else [math.nan] * 3)
-                rec["mag_bias_sigma"].append(
-                    list(sd["mag_bias"]) if "mag_bias" in sd else [math.nan] * 3)
-            else:
-                for k in ("pos", "vel", "pos_sigma", "vel_sigma", "rpy_deg",
-                         "rpy_sigma_deg", "acc_bias", "acc_bias_sigma",
-                         "gyr_bias", "gyr_bias_sigma", "mag_bias", "mag_bias_sigma"):
-                    rec[k].append([math.nan] * 3)
-            # REQ-VER-037: the same position at the reference point, and the
-            # height shift every board-point curve needs on the altitude
-            # pages (baro_alt too, whose sensor sits on the board).
-            la_n = ref_point_offset_ned(nav, score_la)
-            rec["pos_ref_pt"].append([p + d for p, d in zip(rec["pos"][-1], la_n)])
-            rec["ref_pt_up"].append(-la_n[2])
-
-            # ARS/AHRS: their own roll/pitch (yaw omitted for the ARS -
-            # free-running, not meaningful without a reference) and their
-            # own independent gyro bias + 1-σ.
-            for pfx, rpy_fn, rpy_sd_fn, bias_fn, sd_fn in (
-                ("ars", nav.rpy_ars, nav.rpy_stddev_ars,
-                 nav.bias_gyr_ars, nav.gyr_bias_stddev_ars),
-                ("ahrs", nav.rpy_ahrs, nav.rpy_stddev_ahrs,
-                 nav.bias_gyr_ahrs, nav.gyr_bias_stddev_ahrs),
-            ):
-                sub_rpy = rpy_fn()
-                rec[f"{pfx}_rpy_deg"].append(
-                    [math.degrees(x) for x in sub_rpy] if sub_rpy else [math.nan] * 3)
-                sub_rpy_sd = rpy_sd_fn()
-                rec[f"{pfx}_rpy_sigma_deg"].append(
-                    [math.degrees(x) for x in sub_rpy_sd] if sub_rpy_sd else [math.nan] * 3)
-                sub_bias = bias_fn()
-                rec[f"{pfx}_gyr_bias"].append(list(sub_bias) if sub_bias else [math.nan] * 3)
-                sub_sd = sd_fn()
-                rec[f"{pfx}_gyr_bias_sigma"].append(list(sub_sd) if sub_sd else [math.nan] * 3)
-
-            # Independent absolute-heading sources for the heading page.
-            # Magnetometer: tilt-compensate the last sample with the best
-            # available roll/pitch (full3d if ready, else AHRS/ARS, both of
-            # which run without GNSS) - yaw is what we derive, so only
-            # leveling matters. The sample is put through the configured
-            # fixed calibration first, so the trace is the compass the filter
-            # sees, not one still carrying the hard/soft-iron error.
-            # NaN until a mag sample exists.
-            level_rpy = rpy or nav.rpy_ahrs() or nav.rpy_ars()
-            if last_mag is not None and level_rpy is not None:
-                m_cal = mag_calibrate(last_mag[1], mag_misalign, mag_bias_cfg)
-                rec["mag_heading_deg"].append(math.degrees(
-                    mag_heading(m_cal, level_rpy[0], level_rpy[1])))
-            else:
-                rec["mag_heading_deg"].append(math.nan)
-            # GNSS course over ground (the automotive_mode yaw source),
-            # gated on horizontal speed so a standstill's noisy course
-            # doesn't pollute the trace. Shown whenever GNSS velocity is
-            # present, independent of whether automotive_mode is armed.
-            if last_fix is not None and last_fix.get("vel_ok"):
-                v_n, v_e = last_fix["vel_ned"][0], last_fix["vel_ned"][1]
-                if math.hypot(v_n, v_e) >= max(
-                        spec["automotive_min_speed_mps"], 2.0):
-                    rec["gnss_course_deg"].append(math.degrees(math.atan2(v_e, v_n)))
-                else:
-                    rec["gnss_course_deg"].append(math.nan)
-            else:
-                rec["gnss_course_deg"].append(math.nan)
-
-            # baro_alt: own height/velocity (negated to the same NED-down
-            # convention as pos/vel above) and its own z-accel bias/σ.
-            baro = nav.baro_alt()
-            rec["baro_h_d"].append(-baro[0] if baro is not None else math.nan)
-            rec["baro_raw_d"].append(
-                -isa_pressure_to_altitude(last_baro[1])
-                if last_baro is not None else math.nan)
-            rec["baro_vel_d"].append(-baro[1] if baro is not None else math.nan)
-            baro_bias = nav.baro_acc_bias()
-            rec["baro_acc_bias"].append(baro_bias if baro_bias is not None else math.nan)
-            baro_sd = nav.baro_stddev()
-            rec["baro_h_sigma"].append(baro_sd[0] if baro_sd is not None else math.nan)
-            rec["baro_acc_bias_sigma"].append(baro_sd[2] if baro_sd is not None else math.nan)
-            gnss_offset = nav.local_gnss_offset()
-            rec["local_gnss_offset"].append(gnss_offset[0] if gnss_offset is not None else math.nan)
-            rec["local_gnss_offset_sigma"].append(
-                gnss_offset[1] if gnss_offset is not None else math.nan)
-            nav_h_ell = nav.height_ellipsoid()
-            rec["nav_height_ellipsoid_d"].append(
-                -(nav_h_ell - origin_h) if nav_h_ell is not None and origin_ecef is not None
-                else math.nan)
-
-            # GNSS fix, in the same local NED frame as ref_pos/ref_vel.
-            rec["gnss_vel_d"].append(
-                last_fix["vel_ned"][2] if last_fix is not None else math.nan)
-            if last_fix is not None and origin_ecef is not None:
-                rec["fix_pos_d"].append(ref_to_local_ned(
-                    last_fix, origin_ecef, origin_lat, origin_lon)[2])
-            else:
-                rec["fix_pos_d"].append(math.nan)
-            if last_fix is not None and last_fix.get("cov_pos") is not None:
-                cov_p = last_fix["cov_pos"]
-                rec["gnss_pos_sigma"].append(
-                    [math.sqrt(cov_p[0][0]), math.sqrt(cov_p[1][1]),
-                     math.sqrt(cov_p[2][2])])
-                cov_v = last_fix.get("cov_vel")
-                rec["gnss_vel_sigma"].append(
-                    [math.sqrt(cov_v[0][0]), math.sqrt(cov_v[1][1]),
-                     math.sqrt(cov_v[2][2])]
-                    if last_fix.get("vel_ok") and cov_v is not None
-                    else [math.nan] * 3)
-            else:
-                rec["gnss_pos_sigma"].append([math.nan] * 3)
-                rec["gnss_vel_sigma"].append([math.nan] * 3)
-
-            if last_ref is not None and origin_ecef is not None:
-                err_ecef = (pos_error_ecef(nav, last_ref, score_la)
-                           if nav.is_ready() else None)
-                rec["ref_pos"].append(ref_to_local_ned(
-                    last_ref, origin_ecef, origin_lat, origin_lon))
-                rec["ref_vel"].append(list(last_ref["vel_ned"]))
-                rec["ref_rpy_deg"].append(
-                    [math.degrees(last_ref["roll_rad"]),
-                     math.degrees(last_ref["pitch_rad"]),
-                     math.degrees(last_ref["yaw_rad"])])
-                rec["pos_err_ned"].append(
-                    _matvec_rm_T(ned_to_ecef_rot(origin_lat, origin_lon),
-                                 err_ecef) if err_ecef is not None
-                    else [math.nan] * 3)
-                rec["rpy_err_deg"].append(
-                    [math.nan] * 3 if rpy is None else [
-                        math.degrees(wrap_pi(rpy[0] - last_ref["roll_rad"])),
-                        math.degrees(wrap_pi(rpy[1] - last_ref["pitch_rad"])),
-                        math.degrees(wrap_pi(rpy[2] - last_ref["yaw_rad"])),
-                    ])
-            else:
-                for k in ("ref_pos", "ref_vel", "ref_rpy_deg",
-                         "pos_err_ned", "rpy_err_deg"):
-                    rec[k].append([math.nan] * 3)
-
-        # --plot map recorder: North/East only, at its own rate.
-        if track_est is not None and (last_track_us is None
-                                      or (t - last_track_us) >= track_period_us):
-            last_track_us = t
-            track_pos = nav.position_local()
-            # A NaN pair rather than a skipped sample, so the drawn line
-            # BREAKS while ins has nothing instead of bridging the gap
-            # with a straight chord.
-            track_la = ref_point_offset_ned(nav, score_la)  # REQ-VER-037
-            track_est.append((track_pos[0] + track_la[0], track_pos[1] + track_la[1])
-                             if track_pos is not None
-                             else (math.nan, math.nan))
-            if last_ref is not None and origin_ecef is not None:
-                r = ref_to_local_ned(last_ref, origin_ecef,
-                                     origin_lat, origin_lon)
-                # The reference arrives at its own (usually slower) rate,
-                # so most ticks repeat the previous point - dropping the
-                # repeats keeps the identical polyline at a fraction of
-                # the memory.
-                if not track_ref or (r[0], r[1]) != track_ref[-1]:
-                    track_ref.append((r[0], r[1]))
-
-        # --kml recorder: geodetic track for Google Earth (see ins_kml.py).
-        if kml_est_track is not None and (last_kml_us is None
-                                          or (t - last_kml_us) >= kml_period_us):
-            last_kml_us = t
-            ecef = nav.position_ecef()
-            rpy = nav.rpy_ins()
-            if ecef is not None and rpy is not None:
-                lat, lon, alt = ecef_to_llh(*ecef)
-                kml_est_track.append(((t - t0_us) / US_PER_SEC,
-                                      math.degrees(lat), math.degrees(lon), alt,
-                                      math.degrees(rpy[0]), math.degrees(rpy[1]),
-                                      math.degrees(rpy[2])))
-                if last_ref is not None:
-                    kml_ref_track.append((math.degrees(last_ref["lat_rad"]),
-                                          math.degrees(last_ref["lon_rad"]),
-                                          last_ref["h_m"]))
-                if last_fix is not None:
-                    fx = (math.degrees(last_fix["lat_rad"]),
-                         math.degrees(last_fix["lon_rad"]),
-                         last_fix["h_m"])
-                    # North/East/(North-East) position covariance in m^2,
-                    # for --map-frames' error ellipses; NaN if this fix
-                    # carries none (drawn as no ellipse there).
-                    cov_p = last_fix.get("cov_pos")
-                    cov_ne = ((cov_p[0][0], cov_p[0][1], cov_p[1][1])
-                             if cov_p is not None
-                             else (math.nan, math.nan, math.nan))
-                    # Dedup repeats (fix rate is usually slower than
-                    # --kml-hz) so a stale fix during an outage draws as
-                    # one held point, not a cluster of identical vertices.
-                    # t_rel is kept even on a repeat (--map-frames uses it to
-                    # tell "still the last fix" from "no fix yet at all").
-                    if not kml_fix_track or fx != kml_fix_track[-1][1:4]:
-                        kml_fix_track.append(
-                            ((t - t0_us) / US_PER_SEC,) + fx + cov_ne)
-
-        # --dump-solution: the filter's own trajectory in the dataset ref
-        # format. Independent of the reference (there may not be one), and of
-        # the warmup, so the caller sees the whole run including the
-        # convergence at its start.
-        if sol_dump is not None and (last_sol_us is None
-                                     or (t - last_sol_us) >= sol_period_us):
-            ecef = nav.position_ecef()
-            rpy = nav.rpy_ins()
-            vel = nav.velocity_ned()
-            if ecef is not None and rpy is not None and vel is not None:
-                last_sol_us = t
-                lat, lon, alt = ecef_to_llh(*ecef)
-                sol_dump.write(
-                    "%d,%.9f,%.9f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n" % (
-                        t, math.degrees(lat), math.degrees(lon), alt,
-                        math.degrees(rpy[0]), math.degrees(rpy[1]),
-                        math.degrees(rpy[2]), vel[0], vel[1], vel[2]))
-
-        # Score against the ground truth after the warmup (same metrics
-        # as the C harness: attitude mean/std, position rms), optionally
-        # further restricted to the --eval-start/--eval-end window.
-        rel_us = t - t0_us
-        in_eval_window = ((eval_lo_us is None or rel_us >= eval_lo_us)
-                          and (eval_hi_us is None or rel_us <= eval_hi_us))
-        if (ref_now is not None and nav.is_ready() and t >= t_warmup_end
-                and in_eval_window):
-            err = pos_error_ecef(nav, ref_now, score_la)
-            if err is not None:
-                e_pos.add(math.sqrt(sum(e * e for e in err)))
-                if err_dump is not None:
-                    # Split into horizontal and vertical. The scored
-                    # "pos error" is the 3D magnitude, and on a
-                    # baro-driven vertical channel that number can be
-                    # dominated by the height - which says nothing about
-                    # how well the horizontal dead reckoning did.
-                    ned = _matvec_rm(
-                        ecef_to_ned_rot(ref_now["lat_rad"], ref_now["lon_rad"]),
-                        err)
-                    err_dump.write("%.3f,%.3f,%.3f,%.3f,%.3f\n" % (
-                        rel_us / US_PER_SEC, math.hypot(ned[0], ned[1]),
-                        ned[2], ned[0], ned[1]))
-            rpy = nav.rpy_ins()
-            if rpy is not None:
-                e_roll.add(math.degrees(wrap_pi(rpy[0] - ref_now["roll_rad"])))
-                e_pitch.add(math.degrees(wrap_pi(rpy[1] - ref_now["pitch_rad"])))
-                e_yaw.add(math.degrees(wrap_pi(rpy[2] - ref_now["yaw_rad"])))
-        # nav_suite_get_height_ellipsoid() vs ref_now["h_m"] directly
-        # (absolute, like the C harness's ell_h): deliberately NOT gated on
-        # nav.is_ready() like the block above -- the accessor still succeeds
-        # during COASTING/ATTITUDE_ONLY (baro_alt + the offset filter's
-        # estimate), which is exactly the case worth scoring, unlike e_pos.
-        if ref_now is not None and t >= t_warmup_end and in_eval_window:
-            h_ell = nav.height_ellipsoid()
-            if h_ell is not None:
-                # REQ-VER-037: the reference point's height, not the IMU's
-                e_height_ell.add(h_ell - ref_point_offset_ned(nav, score_la)[2]
-                                 - ref_now["h_m"])
-
-        if args.realtime:
-            target = wall0 + (t - t0_us) / US_PER_SEC / max(args.speed, 1e-6)
-            sleep = target - time.perf_counter()
-            if sleep > 0:
-                time.sleep(sleep)
+    run.run(progress=progress,
+            pacer=replay_core.Pacer(args.speed) if args.realtime else None)
 
     progress_done()
-    if gnss_cur_phase:  # close a standstill phase still open at EOF
-        gnss_static_phases.append(gnss_cur_phase)
-    if baro_cur_phase:
-        baro_static_phases.append(baro_cur_phase)
-    if mag_cur_phase:
-        mag_static_phases.append(mag_cur_phase)
-    if sol_dump is not None:
-        sol_dump.close()
+    if sol_obs is not None:
+        sol_obs.close()
         print(f"solution written to {args.dump_solution}")
-    diag = nav.diag()
-    print(f"\nreplayed {n_imu} IMU samples, {len(fixes)} fixes, "
-          f"{len(ref)} reference epochs"
-          f"{f', {len(mags)} mag' if mags else ''}"
-          f"{f', {len(baros)} baro' if baros else ''}"
-          f"{f', {len(speeds)} speed' if speeds else ''}"
-          f"{f', {len(headings)} heading' if headings else ''}")
-    if n_fi_offers:
-        print(f"free-inertial start: {n_fi_offers} declaration(s) offered at "
-              f"{fi_spec['lat_deg']:.7f} {fi_spec['lon_deg']:.7f} "
-              f"h={fi_spec['height_m']:.1f} m +-{fi_spec['stddev_m']:g} m, "
-              f"then the filter is on its own")
-    if headings:
-        print(f"heading aiding: {len(headings)} rows, "
-              f"{heading_reasons.get(HEADING_OK, 0)} offered as yaw, "
-              f"{heading_reasons.get(HEADING_NOT_FIXED, 0)} not fixed, "
-              f"{heading_reasons.get(HEADING_BAD_STDDEV, 0)} bad 1-sigma, "
-              f"{heading_reasons.get(HEADING_BAD_GEOMETRY, 0)} refused by the "
-              f"baseline geometry")
-    if speeds:
-        d = diag
-        print(f"speed aiding: {n_speed_fused} samples offered, "
-              f"{d.get('n_speed_used', 0)} fused, "
-              f"{d.get('n_speed_skipped', 0)} skipped below the speed gate, "
-              f"last residual {d.get('last_speed_residual_mps', 0.0):+.3f} m/s")
-    print(f"ins: {diag['n_predict']} predicts, {diag['n_gnss_used']} gnss "
-          f"fusions ({diag['n_gnss_seen']} seen), {diag['n_fuse_fail']} fuse "
-          f"fails, {diag['n_auto_zupt']} auto-zupt, "
-          f"{diag['n_downweighted']} downweighted")
-    dw = nav.downweight_counts()
-    print(f"downweighted (chi2 outlier): ars {dw['ars']}, "
-          f"ahrs {dw['ahrs']}, baro_alt {dw['baro_alt']}, "
-          f"local_gnss_offset {dw['local_gnss']}")
-    # Which sub-filters were alive at the end, and - when the 3D filter
-    # was not - the reason (same codes telemetry publishes live under
-    # INSLIB/status, so a replay and a live session agree on the verdict).
-    st_tree, _blocked, blocked_text = suite_status(nav)
-    running = [n for n, k in (("ars", "ars_running"), ("ahrs", "ahrs_running"),
-                              ("baro_alt", "baro_running"),
-                              ("full3d", "full3d_running"))
-               if st_tree[k] > 0.0]
-    print(f"final state: mode {nav.mode_name()}, running "
-          f"[{', '.join(running) if running else 'none'}] - {blocked_text}")
-    # Final filter-reported 1-σ of the ins error state (last epoch): the
-    # exact sqrt of the covariance diagonal, i.e. how uncertain ins believes
-    # its own solution is at the end of the run (not a vs-truth error).
-    sd = nav.stddev()
-    if sd is not None:
-        p, v, a = sd["pos_ned"], sd["vel_ned"], sd["rpy"]
-        ab, gb = sd["acc_bias"], sd["gyr_bias"]
-        print("final 1-σ (last epoch, filter-reported):")
-        print(f"  pos NED   {p[0]:.3f} {p[1]:.3f} {p[2]:.3f} m")
-        print(f"  vel NED   {v[0]:.3f} {v[1]:.3f} {v[2]:.3f} m/s")
-        print(f"  att RPY   {math.degrees(a[0]):.3f} {math.degrees(a[1]):.3f} "
-              f"{math.degrees(a[2]):.3f} deg")
-        print(f"  acc bias  {ab[0]:.4f} {ab[1]:.4f} {ab[2]:.4f} m/s^2")
-        print(f"  gyr bias  {math.degrees(gb[0]):.4f} {math.degrees(gb[1]):.4f} "
-              f"{math.degrees(gb[2]):.4f} deg/s")
-        if "mag_bias" in sd:
-            mb = sd["mag_bias"]
-            print(f"  mag bias  {mb[0]:.3f} {mb[1]:.3f} {mb[2]:.3f} uT")
-    fix_acc_lines = last_fix_accuracy_lines(last_fix)
-    if fix_acc_lines is not None:
-        for line in fix_acc_lines:
-            print(line)
-    for line in growth_rate_lines(noise):
-        print(line)
-    for line in baro_growth_rate_lines(baro_cfg):
-        print(line)
-    for line in ahrs_growth_rate_lines(ahrs_cfg):
-        print(line)
-    # Overconfidence / covariance-collapse watchdog (REQ-NAV-040): the filter
-    # reporting a physically implausible accuracy means its covariance has
-    # collapsed and it may be silently diverging while looking confident.
-    oc = nav.overconfidence()
-
-    def _mm(x):
-        return "-" if not math.isfinite(x) else f"{x:.2e}"
-    print(f"covariance watchdog: best reported stddev pos {_mm(oc['min_pos_m'])} m, "
-          f"vel {_mm(oc['min_vel_mps'])} m/s, att {_mm(oc['min_att_deg'])} deg")
-    print(f"  ARS best att stddev {_mm(oc['ars']['min_att_deg'])} deg, "
-          f"AHRS best att stddev {_mm(oc['ahrs']['min_att_deg'])} deg")
-    for who, sub in (("INSLIB", oc), ("ARS", oc["ars"]), ("AHRS", oc["ahrs"])):
-        if sub["tripped"]:
-            print(f"  WARNING: {who} reported an implausibly small stddev at "
-                  f"{sub['n']} epoch(s) - likely covariance collapse / divergence.")
-    if e_pos.n:
-        window = ""
-        if args.eval_start is not None or args.eval_end is not None:
-            lo = f"{args.eval_start:g}" if args.eval_start is not None else "0"
-            hi = f"{args.eval_end:g}" if args.eval_end is not None else "end"
-            window = f", eval window [{lo}, {hi}] s"
-        print(f"ins vs ground truth (n={e_pos.n}, "
-              f"after {spec['score']['warmup_sec']:g} s warmup{window}):")
-        # score.attitude = 0 means the dataset states it has no attitude
-        # reference (ref.csv carries a 0/0/0 placeholder). Printing an error
-        # against that reads as a 40 deg yaw failure of the filter, which is
-        # not what the number means.
-        if spec["score"]["attitude"]:
-            for name, s in (("roll", e_roll), ("pitch", e_pitch), ("yaw", e_yaw)):
-                print(f"  {name:5s} error: mean {s.mean():+7.3f}  "
-                      f"std {s.std():6.3f}  max |{s.max_abs:6.3f}| deg")
-        else:
-            print("  attitude error: n/a (score.attitude = 0, no attitude "
-                  "reference in this dataset)")
-        print(f"  pos rms: {e_pos.rms():.3f} m  max {e_pos.max_abs:.3f} m")
-    if e_height_ell.n:
-        print(f"nav_suite_get_height_ellipsoid() vs ground truth (absolute, "
-              f"n={e_height_ell.n}):")
-        print(f"  height error: mean {e_height_ell.mean():+.3f}  "
-              f"std {e_height_ell.std():.3f}  rms {e_height_ell.rms():.3f}  "
-              f"max |{e_height_ell.max_abs:.3f}| m")
-    print(f"final nav_suite mode: {nav.mode_name()}")
-
-    # --- data quality summary ----------------------------------------------
-    print("\ndata quality summary:")
-    print(f"  imu:  {imu_hz:6.1f} Hz avg (n={n_imu_total}, {imu_duration:.1f} s), "
-         f"max gap {imu_max_gap * 1000.0:.0f} ms at t={imu_max_gap_at:.1f} s")
-
-    def _report_stream(label, timestamps_us):
-        n, dur, hz, gap, gap_at = _stream_gap_stats(timestamps_us)
-        if n < 2:
-            print(f"  {label}: n/a")
-            return
-        print(f"  {label}: {hz:6.2f} Hz avg (n={n}, {dur:.1f} s), "
-             f"max gap {gap:.2f} s at t={gap_at:.1f} s")
-
-    _report_stream("gnss", [fx["t_us"] for fx in fixes])
-    if mags:
-        _report_stream("mag ", [row[0] for row in mags])
-    if baros:
-        _report_stream("baro", [row[0] for row in baros])
-
-    if n_static:
-        frac = 100.0 * n_static / n_imu_total if n_imu_total else 0.0
-        print(f"  stationary epochs: {n_static}/{n_imu_total} "
-             f"({frac:.1f}% of trial, ins auto-ZUPT/ZARU-detected)")
-    else:
-        print("  stationary epochs: none detected"
-             f"{' (aiding: none - ins never runs auto-ZUPT/ZARU)' if aiding_mode == 'none' else ''}")
-
-    # Is the configured/reported GNSS accuracy realistic? Only for real
-    # GNSS aiding (ref-synthesized fixes equal the truth).
-    if aiding_mode == "gnss":
-        print_gnss_standstill_accuracy(gnss_static_phases)
-
-    # Same check for the raw baro/mag channels (any aiding mode).
-    if baros:
-        print_channel_standstill_accuracy(
-            "baro", "m", baro_static_phases, float(baro_cfg["stddev_m"]))
-    if mags:
-        print_channel_standstill_accuracy(
-            "mag ", "uT", mag_static_phases, mag_sd)
-
-    def _noise_report(label, unit, motion_stat, expect, to_unit):
-        # Per-sample sensor noise floor vs. the configured model, measured
-        # in-motion: whole-trial second difference (see _imu_prepass) cancels
-        # bias and smooth vehicle dynamics, keeps sensor noise + vibration,
-        # and works even when the platform never stops. Divide by sqrt(6):
-        # Var(2nd diff) = 6*σ^2 for white noise. This is the basis for
-        # the suggested model below.
-        if motion_stat[0].n <= 1:
-            return
-        meas = math.sqrt(sum(s.std() ** 2 for s in motion_stat) / 3.0) / math.sqrt(6.0)
-        ratio = meas / expect if expect > 0 else math.nan
-        print(f"  {label} noise vs. configured {to_unit(expect):.4f} {unit}:")
-        print(f"    in-motion (no dynamics): {to_unit(meas):8.4f} {unit}  "
-             f"(ratio {ratio:.2f}, n={motion_stat[0].n})")
-
-    def _suggest_psd(d2_stat, dt_nominal):
-        # Invert the maneuver-robust second-difference noise estimate back
-        # into the PSD the filter's noise model wants: expect = sqrt(psd/dt)
-        # -> psd = σ^2 * dt. σ is the per-sample per-axis stddev,
-        # averaged over the 3 axes (the config carries one scalar
-        # gyr_psd/acc_psd applied to all axes). For the second difference
-        # Var = 6*σ^2 (vs 2 for the first), so divide by 6 - this is
-        # what drops smooth vehicle dynamics while keeping vibration+noise.
-        if d2_stat[0].n < 2:
-            return None
-        var = sum(s.std() ** 2 for s in d2_stat) / 3.0 / 6.0
-        return var * dt_nominal
-
-    noise_metrics = None  # measured/expected ratios for the Dr. INS check
-    if imu_hz > 0:
-        dt_nominal = 1.0 / imu_hz
-        gyr_expect = math.sqrt(noise["gyr_psd"] / dt_nominal)
-        acc_expect = math.sqrt(noise["acc_psd"] / dt_nominal)
-        _noise_report("gyro ", "deg/s", gyr_d2_stat, gyr_expect, math.degrees)
-        _noise_report("accel", "m/s^2", acc_d2_stat, acc_expect, lambda x: x)
-
-        def _meas_floor(d2_stat):
-            return (math.sqrt(sum(s.std() ** 2 for s in d2_stat) / 3.0) / math.sqrt(6.0)
-                    if d2_stat[0].n > 1 else None)
-        gyr_meas = _meas_floor(gyr_d2_stat)
-        acc_meas = _meas_floor(acc_d2_stat)
-
-        # Turn the measurement into a concrete config action: which noise
-        # term to set, and to what. Based on the maneuver-robust
-        # second-difference estimate ON PURPOSE - the goal is the effective
-        # sensor noise floor under real flight conditions (white noise +
-        # vibration), NOT vehicle dynamics (which the second difference
-        # cancels), and not the datasheet/lab or stationary-epoch value.
-        gyr_psd_sugg = _suggest_psd(gyr_d2_stat, dt_nominal)
-        acc_psd_sugg = _suggest_psd(acc_d2_stat, dt_nominal)
-        if gyr_psd_sugg is not None and acc_psd_sugg is not None:
-            print("  suggested imu noise model for real flight conditions "
-                 "(paste into config.yaml `imu:`):")
-            print(f"    gyr_psd: {gyr_psd_sugg:.3e}   # (rad/s)^2/Hz  "
-                 f"(now {noise['gyr_psd']:.3e}, x{gyr_psd_sugg / noise['gyr_psd']:.1f})")
-            print(f"    acc_psd: {acc_psd_sugg:.3e}   # (m/s^2)^2/Hz  "
-                 f"(now {noise['acc_psd']:.3e}, x{acc_psd_sugg / noise['acc_psd']:.1f})")
-            print("    (from the in-motion (no-dynamics) line above: sensor noise + "
-                 "vibration,")
-            print("     not vehicle motion.")
-            # The bias random walk (imu.*_bias_rw) is a slow drift we can't
-            # read off a moving trial - it needs Allan variance on a long
-            # static recording. Point the user at the dedicated tool.
-            print("  bias random walk (imu.gyr_bias_rw / acc_bias_rw) is NOT "
-                 "estimated here -")
-            print("  it needs a long STATIC recording, use "
-                 "allan_variance.py for those.")
-
-        noise_metrics = {
-            "gyr_ratio": (gyr_meas / gyr_expect if gyr_meas and gyr_expect > 0 else None),
-            "acc_ratio": (acc_meas / acc_expect if acc_meas and acc_expect > 0 else None),
-            "gyr_psd_sugg": gyr_psd_sugg, "acc_psd_sugg": acc_psd_sugg,
-        }
-
-    # --- Dr. INS findings: prioritized health check over everything above ---
-    # Computed once, printed here and (below) rendered as the --plot PDF's
-    # cover page.
-    insdoctor = insdoctor_findings({
-        "aiding_mode": aiding_mode,
-        "imu_hz": imu_hz,
-        "imu_max_gap": imu_max_gap, "imu_max_gap_at": imu_max_gap_at,
-        "imu_rate_hz": imu_rate_hz,
-        "gnss": _stream_gap_stats([fx["t_us"] for fx in fixes]) if fixes else None,
-        "noise": noise_metrics,
-        "gnss_acc": (gnss_standstill_accuracy(gnss_static_phases)
-                     if aiding_mode == "gnss" else None),
-        "gnss_vel": (gnss_vel_accuracy_stats(fixes)
-                    if aiding_mode == "gnss" else None),
-        "gnss_max_hor_vel_stddev_mps": gnss_cfg["max_horizontal_vel_stddev_mps"],
-        "baro_acc": (channel_standstill_accuracy(
-            baro_static_phases, float(baro_cfg["stddev_m"])) if baros else None),
-        "mag_acc": (channel_standstill_accuracy(
-            mag_static_phases, mag_sd) if mags else None),
-        "health": {"n": health_n, "limits": STDDEV_LIMITS, "stats": health_stats},
-        "overconfidence": oc,
-        "leverarm": {"gnss": leverarm, "score": score_la},
-        "baro_height": {
-            # n_baro_height_used > 0 <=> ins latched the barometric height
-            # source at bootstrap (REQ-NAV-053/-054).
-            "active": diag["n_baro_height_used"] > 0,
-            # rec is only populated when the plot/telemetry recorder runs
-            # (--plot/--plotjuggler/...); without it the span is unknown.
-            "offset_span_m": (_span(rec["local_gnss_offset"])
-                              if rec is not None else None),
-        },
-        "diag": diag,
-    })
+    if err_obs is not None:
+        err_obs.close()
+    run.report()
+    rec = rec_obs.rec if rec_obs is not None else None
+    # Dr. INS findings: prioritized health check over everything above,
+    # printed here and rendered as the --plot PDF's cover page.
+    insdoctor = run.findings(rec)
     print_insdoctor(insdoctor)
 
     nav.close()
@@ -3885,112 +2707,57 @@ def main():
     # below and the --plot PDF's GNSS-delay page.
     gnss_delay_curve = (gnss_delay_correlation_curve(rec["t"], rec["baro_vel_d"],
                                                      rec["gnss_vel_d"])
-                       if do_gnss_delay_estimate else None)
+                        if do_gnss_delay_estimate else None)
 
     if args.plot:
         # High-rate ground track for the North-East map page (empty when
         # --plot-track-hz is 0, which makes _ne_page fall back to the
         # --plot-hz state history). Its own length, unrelated to rec["t"].
-        rec["track_ne"] = track_est or []
-        rec["track_ref_ne"] = track_ref or []
-        # Raw magnetometer point cloud for the hard-iron sphere page. Kept at
-        # full resolution (thinned in the plot itself); an all-zero fixed_bias
-        # means "no fixed calibration" and is passed through as None.
-        rec["mag_raw"] = [tuple(m[1]) for m in mags]
-        rec["mag_fixed_bias"] = mag_bias_cfg if any(mag_bias_cfg) else None
-        # Calibrated field magnitude |B|(t) vs. the WMM total field F, for the
-        # "deviation from WMM" page: the calibration the filter applies is
-        # applied here too, so the page scores the field the filter fuses. The
-        # uncalibrated magnitude comes along as a second trace to show what the
-        # calibration bought. Times share rec["t"]'s origin (t0_us).
-        rec["wmm_field_uT"] = None
-        rec["mag_field_t"] = []
-        rec["mag_field_mag"] = []
-        rec["mag_field_mag_raw"] = []
-        # WGS84 ellipsoid height of nav's own (fixed) local-NED origin, so
-        # the baro_alt page can convert its ref_pos/fix_pos_d (already
-        # expressed relative to that origin, see ref_to_local_ned above)
-        # back to absolute ellipsoid height and overlay it against
-        # baro_h_d + local_gnss_offset -- the same origin_ecef this
-        # replay loop cached earlier for ref_to_local_ned.
-        rec["origin_ellipsoid_h_m"] = origin_h if origin_ecef is not None else math.nan
-        if mags and float(mag_cfg["wmm_year"]) > 0:
-            from INSLIB import wmm_field_ned
-            b_ned = wmm_field_ned(math.degrees(ref[0]["lat_rad"]),
-                                  math.degrees(ref[0]["lon_rad"]),
-                                  float(mag_cfg["wmm_year"]))
-            rec["wmm_field_uT"] = math.sqrt(sum(c * c for c in b_ned))
-            rec["mag_field_t"] = [(m[0] - t0_us) / US_PER_SEC for m in mags]
-            rec["mag_field_mag"] = [
-                math.sqrt(sum(c * c for c in
-                              mag_calibrate(m[1], mag_misalign, mag_bias_cfg)))
-                for m in mags]
-            # Only worth a second trace when a calibration is actually
-            # configured, otherwise it would sit exactly on the first one.
-            if mag_cal_active:
-                rec["mag_field_mag_raw"] = [math.sqrt(sum(c * c for c in m[1]))
-                                            for m in mags]
+        rec["track_ne"] = track_obs.est if track_obs is not None else []
+        rec["track_ref_ne"] = track_obs.ref if track_obs is not None else []
+        rec.update(run.plot_extras())
         from ins_plots import plot_results
         plot_results(rec, spec["name"] or args.dataset, spec["score"]["warmup_sec"],
-                    out_path=args.plot_out, gnss_delay_curve=gnss_delay_curve,
-                    sensor_rate=sensor_rate, findings=insdoctor,
-                    configured_gnss_delay_ms=gnss_delay_ms,
-                    growth_rate=process_noise_growth_rate(noise),
-                    baro_growth_rate=baro_alt_growth_rate(baro_cfg),
-                    ahrs_growth_rate=ahrs_growth_rate(ahrs_cfg))
+                     out_path=args.plot_out, gnss_delay_curve=gnss_delay_curve,
+                     sensor_rate=run.sensor_rate, findings=insdoctor,
+                     configured_gnss_delay_ms=run.gnss_delay_ms,
+                     growth_rate=process_noise_growth_rate(spec["imu"]),
+                     baro_growth_rate=baro_alt_growth_rate(spec["baro"]),
+                     ahrs_growth_rate=ahrs_growth_rate(spec["ahrs"]))
 
     if args.kml:
         from ins_kml import write_kml
-        write_kml(args.kml, kml_est_track, kml_ref_track, kml_fix_track,
-                 spec["name"] or args.dataset)
+        write_kml(args.kml, kml_obs.est, kml_obs.ref, kml_obs.fix,
+                  spec["name"] or args.dataset)
 
     if args.map_frames:
         from ins_map_frames import write_frames
-        write_frames(args.map_frames, kml_est_track, kml_fix_track,
-                    spec["name"] or args.dataset,
-                    fps=args.map_fps, t_start=args.map_t_start,
-                    t_end=args.map_t_end)
+        write_frames(args.map_frames, kml_obs.est, kml_obs.fix,
+                     spec["name"] or args.dataset,
+                     fps=args.map_fps, t_start=args.map_t_start,
+                     t_end=args.map_t_end)
 
     if do_gnss_delay_estimate:
-        if gnss_delay_curve is None:
-            print("gnss delay estimate: not enough data (need baro_alt "
-                 "running and at least one GNSS fix)")
-        else:
-            delay_ms, corr = max(gnss_delay_curve, key=lambda row: row[1])
-            quality = ("good" if corr > 0.7 else
-                      "weak - probably not enough vertical motion in "
-                      "this trial to tell" if corr > 0.3 else
-                      "poor - do not trust this number")
-            print(f"gnss delay estimate: {delay_ms:.0f} ms "
-                 f"(correlation {corr:.2f}, {quality}) - relative to "
-                 f"baro_alt, which is not necessarily latency-free "
-                 f"either (see --estimate-gnss-delay's help)")
-            # Point at the knob that consumes this number (REQ-VER-008):
-            # config `gnss: delay_ms` history-anchors the fix by this much.
-            if corr > 0.7:
-                print(f"  -> set `gnss: delay_ms: {delay_ms:.0f}` in "
-                     f"config.yaml to compensate it "
-                     f"(currently {gnss_delay_ms} ms)")
-            else:
-                print(f"  (would go into config `gnss: delay_ms`, now "
-                     f"{gnss_delay_ms} ms - but the correlation is too low "
-                     f"to trust this value)")
+        for line in replay_core.gnss_delay_lines(gnss_delay_curve,
+                                                 run.gnss_delay_ms):
+            print(line)
 
     # --- machine-readable accuracy summary ---------------------------------
     # Dump the same accuracy numbers just printed above as JSON, for a
     # downstream consumer that wants them without parsing console text.
     # E.g. a regression harness (datasets/check_simulated.py, REQ-VER-016).
     if args.summary_json:
+        e_roll, e_pitch, e_yaw = run.e_roll, run.e_pitch, run.e_yaw
         summary = {
             "dataset": os.path.basename(os.path.normpath(data_dir)),
             "name": spec["name"],
             "warmup_sec": float(spec["score"]["warmup_sec"]),
-            "t_warmup_end_us": int(t_warmup_end),
+            "t_warmup_end_us": int(run.t_warmup_end),
             "eval_start_sec": args.eval_start,
             "eval_end_sec": args.eval_end,
-            "scored_epochs": e_pos.n,
-            "pos_rms_m": e_pos.rms(),
-            "pos_max_m": e_pos.max_abs,
+            "scored_epochs": run.e_pos.n,
+            "pos_rms_m": run.e_pos.rms(),
+            "pos_max_m": run.e_pos.max_abs,
             "att_err_deg": {
                 "roll": {"mean": e_roll.mean(), "std": e_roll.std(), "max_abs": e_roll.max_abs},
                 "pitch": {"mean": e_pitch.mean(), "std": e_pitch.std(), "max_abs": e_pitch.max_abs},
@@ -4000,6 +2767,93 @@ def main():
         with open(args.summary_json, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
         print(f"\nwrote accuracy summary to {args.summary_json}")
+
+
+class _TelemetryPublisher(replay_core.Observer):
+    """Live telemetry, throttled in sim time so fast replays don't flood.
+    Publishes the estimate (INSLIB/...), the individual sub-filter outputs
+    (INSLIB/ars|ahrs|full3d|baroalt/...), the ground truth (ref/...) and
+    the raw input measurements (meas/...), so everything available can be
+    overlaid in one PlotJuggler session."""
+
+    def __init__(self, tele, rate_hz):
+        self.tele = tele
+        self.period_us = US_PER_SEC / max(rate_hz, 1e-3)
+        self._last_us = None
+
+    def on_epoch(self, r):
+        if self._last_us is not None and (r.t - self._last_us) < self.period_us:
+            return
+        self._last_us = r.t
+        self.tele.publish_suite(r.nav)
+        if r.last_ref is not None:
+            ref_local = (ref_to_local_ned(r.last_ref, r.origin_ecef,
+                                          r.origin_lat, r.origin_lon)
+                         if r.origin_ecef is not None else None)
+            self.tele.publish_extra(ref_overlay_tree(r.last_ref, ref_local))
+        self.tele.publish_extra(
+            meas_overlay_tree(r.a, r.g, r.last_fix, r.last_mag, r.last_baro,
+                              r.origin_ecef, r.origin_lat, r.origin_lon))
+
+
+class _SolutionDump(replay_core.Observer):
+    """--dump-solution: the filter's own trajectory in the dataset ref
+    format. Independent of the reference (there may not be one) and of the
+    warmup, so the caller sees the whole run including the convergence at
+    its start."""
+
+    def __init__(self, path, rate_hz):
+        self.period_us = US_PER_SEC / rate_hz if rate_hz > 0 else 0.0
+        self._last_us = None
+        # newline="\n" so the dataset CSVs stay LF on every platform,
+        # matching datasets/replay_format.py's writers
+        self.f = open(path, "w", encoding="utf-8", newline="\n")
+        self.f.write("# t_us, lat_deg, lon_deg, h_m, roll_deg, pitch_deg,"
+                     " yaw_deg, vn_mps, ve_mps, vd_mps\n")
+        self.f.write("# INSLIB nav_suite solution, tools/replay.py"
+                     " --dump-solution\n")
+
+    def on_epoch(self, r):
+        if self._last_us is not None and (r.t - self._last_us) < self.period_us:
+            return
+        nav = r.nav
+        ecef = nav.position_ecef()
+        rpy = nav.rpy_ins()
+        vel = nav.velocity_ned()
+        if ecef is None or rpy is None or vel is None:
+            return
+        self._last_us = r.t
+        lat, lon, alt = ecef_to_llh(*ecef)
+        self.f.write("%d,%.9f,%.9f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n" % (
+            r.t, math.degrees(lat), math.degrees(lon), alt,
+            math.degrees(rpy[0]), math.degrees(rpy[1]),
+            math.degrees(rpy[2]), vel[0], vel[1], vel[2]))
+
+    def close(self):
+        self.f.close()
+
+
+class _ErrorDump(replay_core.Observer):
+    """--dump-errors: every scored position error, split into horizontal
+    and vertical. The scored "pos error" is the 3D magnitude, and on a
+    baro-driven vertical channel that number can be dominated by the
+    height, which says nothing about how well the horizontal dead
+    reckoning did."""
+
+    def __init__(self, path):
+        self.f = open(path, "w", encoding="utf-8")
+        self.f.write("# t_s, horizontal_m, down_m, north_m, east_m\n")
+
+    def on_pos_error(self, r, err):
+        ref_now = r.ref_now
+        ned = _matvec_rm(ecef_to_ned_rot(ref_now["lat_rad"], ref_now["lon_rad"]),
+                         err)
+        self.f.write("%.3f,%.3f,%.3f,%.3f,%.3f\n" % (
+            (r.t - r.t0_us) / US_PER_SEC, math.hypot(ned[0], ned[1]),
+            ned[2], ned[0], ned[1]))
+
+    def close(self):
+        self.f.close()
 
 
 if __name__ == "__main__":

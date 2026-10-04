@@ -43,11 +43,11 @@ score:
   min_epochs: 700
   # Regression guard-rails vs. Lighthouse ground truth: observed + margin,
   # NOT accuracy claims. Trip means inspect and retune.
-  lim_att_bias_deg: 0.45    # observed 0.305
-  lim_att_std_deg: 1.70    # observed 1.258
-  lim_yaw_bias_deg: 0.35    # observed 0.182
-  lim_yaw_std_deg: 2.40    # observed 1.775
-  lim_pos_rms_m: 0.05    # observed 0.025
+  lim_att_bias_deg: 0.19   # observed 0.181 (pitch)
+  lim_att_std_deg: 1.35    # observed 1.284 (roll)
+  lim_yaw_bias_deg: 0.169  # observed 0.160
+  lim_yaw_std_deg: 1.84    # observed 1.748
+  lim_pos_rms_m: 0.039     # observed 0.035
   leverarm_frd: [0, 0, 0]
 
 origin:
