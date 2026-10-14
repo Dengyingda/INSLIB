@@ -28,6 +28,7 @@ agree with it.
 (c) Jan Zwiener (jan@zwiener.org)
 """
 
+import array
 import contextlib
 import math
 import os
@@ -42,8 +43,11 @@ import replay as rp  # noqa: E402  (loaders, build_config, Stat, ...)
 from INSLIB import Navigator, ecef_to_llh  # noqa: E402
 from INSLIB.telemetry import isa_pressure_to_altitude, suite_status  # noqa: E402
 from geodetic_toolbox import mag_heading  # noqa: E402
+import ins_solution  # noqa: E402  (timesync.csv, the solution files)
 
 US_PER_SEC = 1_000_000
+# gnss.csv's interference and authentication columns, in plot order.
+GNSS_IND_KEYS = ("jamming", "spoofing", "sig_auth", "nav_auth")
 
 
 class ReplayError(Exception):
@@ -239,6 +243,9 @@ def load_inputs(spec, data_dir, gnss_outages=(), log=print):
             gyr_bias, ref, first_imu_us, spec["gyro_bias_window_sec"])
         inp.bias_note += ", ref motion + earth/transport rate removed"
     inp.gyr_bias = gyr_bias
+    # The recording clock on GPS time (timesync.csv), for the time stamps
+    # of an RTKLIB .pos solution file. None without one.
+    inp.gps_clock = ins_solution.load_gps_clock(data_dir)
     return inp
 
 
@@ -255,6 +262,9 @@ def log_startup(spec, inp, log=print):
         f"{', automotive' if spec['automotive_mode'] else ''}"
         f"{', mag' if inp.mags else ''}{', baro' if inp.baros else ''}"
         f"{f', gnss delay {gnss_delay_ms} ms' if gnss_delay_ms else ''}")
+    clock = getattr(inp, "gps_clock", None)
+    if clock is not None:
+        log(f"gps time: {clock.describe()}")
     log(f"initial gyro bias: "
         f"{[round(math.degrees(b), 4) for b in (inp.gyr_bias or (0, 0, 0))]} deg/s "
         f"({inp.bias_note})")
@@ -301,6 +311,16 @@ def make_navigator(spec, inp, log=print):
     nav.set_ahrs_rpy_pred_stddev(float(ahrs_cfg.get("rpy_pred_stddev_rad_sqrts", 0.0)))
     nav.set_ahrs_gyr_bias_init_stddev(
         math.radians(float(ahrs_cfg.get("gyr_bias_init_stddev_rps_deg", 0.0))))
+    nav.set_ahrs_tuning(
+        acc_freq_hz=float(ahrs_cfg.get("acc_freq_hz", 0.0)),
+        acc_cutoff_freq_hz=float(ahrs_cfg.get("acc_cutoff_freq_hz", 0.0)),
+        gravity_diff_penalty=float(ahrs_cfg.get("gravity_diff_penalty", 0.0)),
+        acc_reject_gravity_mps2=float(ahrs_cfg.get("acc_reject_gravity_mps2", 0.0)),
+        chi2_threshold=float(ahrs_cfg.get("chi2_threshold", 0.0)),
+        kalman_update_dt_sec=float(ahrs_cfg.get("kalman_update_dt_sec", 0.0)),
+        mag_yaw_stddev_rad=math.radians(float(ahrs_cfg.get("mag_yaw_stddev_deg", 0.0))),
+        mag_freq_hz=float(ahrs_cfg.get("mag_freq_hz", 0.0)),
+        mag_chi2_threshold=float(ahrs_cfg.get("mag_chi2_threshold", 0.0)))
     init_hint = spec["init_hint"]
     nav.set_init_att_hint(
         math.radians(init_hint["roll_deg"]), math.radians(init_hint["pitch_deg"]),
@@ -368,6 +388,26 @@ class Pacer:
             time.sleep(min(sleep, 0.2))
 
 
+# Reference rows further apart than this are not interpolated between.
+REF_ATT_INTERP_MAX_US = 1_000_000
+
+
+def ref_rpy_at(ref_row, next_row, t_us):
+    """Reference attitude at IMU epoch t_us (REQ-VER-047), as tools/replay.c's
+    ref_rpy_at: the row is up to one IMU period older than the estimate it
+    is scored against, so the attitude is interpolated towards the next
+    row, never across a gap in the reference."""
+    rpy = [ref_row["roll_rad"], ref_row["pitch_rad"], ref_row["yaw_rad"]]
+    if next_row is None or t_us <= ref_row["t_us"] or next_row["t_us"] <= t_us:
+        return rpy
+    span = next_row["t_us"] - ref_row["t_us"]
+    if span > REF_ATT_INTERP_MAX_US:
+        return rpy
+    f = (t_us - ref_row["t_us"]) / span
+    nxt = (next_row["roll_rad"], next_row["pitch_rad"], next_row["yaw_rad"])
+    return [rpy[k] + f * rp.wrap_pi(nxt[k] - rpy[k]) for k in range(3)]
+
+
 def ins_pos_in_replay_frame(nav, r):
     """nav.position_local() in the replay's local frame, the one latched
     once at r.origin_ecef that the reference and the fixes are drawn in.
@@ -414,8 +454,12 @@ class Replay:
     the results off the attributes or report()/findings()."""
 
     def __init__(self, spec, inp, nav, observers=(), eval_start=None,
-                 eval_end=None, rate_bucket_sec=5.0):
+                 eval_end=None, rate_bucket_sec=5.0, stepper=None):
         self.spec, self.inp, self.nav = spec, inp, nav
+        # stepper: an object whose step(replay) runs the epoch in place of
+        # nav.update(), e.g. ins_rts.RtsRecorder, which splits it into
+        # predict() and correct() to record the forward pass in between.
+        self.stepper = stepper
         self.observers = list(observers)
         self.eval_start, self.eval_end = eval_start, eval_end
         self.fixes, self.ref = inp.fixes, inp.ref
@@ -481,6 +525,8 @@ class Replay:
         self.n_imu = 0
         self.ifix = 0
         self.n_static = 0
+        # |acc| of the standstill epochs, for the gravity check (Dr. INS).
+        self.static_acc_norms = array.array("f")
         self.n_speed_fused = 0
         self.heading_reasons = {}
         self.n_ranges_offered = self.n_ranges_carried = 0
@@ -616,9 +662,13 @@ class Replay:
                 # REQ-VER-008: assumed fixed processing/telemetry latency,
                 # applied uniformly regardless of aiding source, history-
                 # anchors the fusion via ins's existing gnss_delay_ms.
+                # The fix rides on the first IMU epoch at or after its
+                # timestamp, so it is that much older than the epoch on
+                # top (REQ-NAV-092).
                 nav.gnss_pos_llh((fix_now["lat_rad"], fix_now["lon_rad"],
                                   fix_now["h_m"]),
-                                 fix_now["cov_pos"], delay_ms=gnss_delay_ms)
+                                 fix_now["cov_pos"], delay_ms=gnss_delay_ms,
+                                 delay_us=int(t - fix_now["t_us"]))
                 if fix_now["vel_ok"] and fix_now["cov_vel"] is not None:
                     nav.gnss_vel(fix_now["vel_ned"], fix_now["cov_vel"])
                 nav.gnss_leverarm(leverarm)
@@ -654,7 +704,8 @@ class Replay:
                 speed_now = speeds[ispeed]
                 ispeed += 1
             if speed_now is not None:
-                nav.speed(speed_now[1], speed_sd_cfg, speed_delay_cfg)
+                nav.speed(speed_now[1], speed_sd_cfg, speed_delay_cfg,
+                          delay_us=int(t - speed_now[0]))  # REQ-NAV-092
                 self.n_speed_fused += 1
 
             # Dual-antenna heading (REQ-NAV-010/087). Newest row only, same
@@ -668,7 +719,8 @@ class Replay:
                     heading_cfg, heading_now, nav.rpy())
                 heading_reasons[why] = heading_reasons.get(why, 0) + 1
                 if why == rp.HEADING_OK:
-                    nav.yaw(yaw_meas, sd_meas, heading_delay_cfg)
+                    nav.yaw(yaw_meas, sd_meas, heading_delay_cfg,
+                            delay_us=int(t - heading_now[0]))  # REQ-NAV-092
 
             # Ranges (REQ-NAV-082, REQ-VER-038): every row up to this epoch,
             # each anchored at its own age. What does not fit the filter's
@@ -689,11 +741,16 @@ class Replay:
             if k:
                 nav.range_leverarm(rng_lever)
 
-            nav.update()
+            if self.stepper is not None:
+                self.stepper.step(self)
+            else:
+                nav.update()
 
             standstill = nav.auto_zupt_active()
             if standstill:
                 self.n_static += 1
+                self.static_acc_norms.append(
+                    math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]))
 
             ref_now = None
             while iref < len(ref) and ref[iref]["t_us"] <= t:
@@ -815,16 +872,17 @@ class Replay:
                               and (eval_hi_us is None or rel_us <= eval_hi_us))
             if (ref_now is not None and nav.is_ready() and t >= self.t_warmup_end
                     and in_eval_window):
-                err = rp.pos_error_ecef(nav, ref_now, score_la)
+                err = rp.pos_error_ecef(nav, ref_now, score_la, t)
                 if err is not None:
                     self.e_pos.add(math.sqrt(sum(e * e for e in err)))
                     for obs in observers:
                         obs.on_pos_error(self, err)
                 rpy = nav.rpy_ins()
                 if rpy is not None:
-                    self.e_roll.add(math.degrees(rp.wrap_pi(rpy[0] - ref_now["roll_rad"])))
-                    self.e_pitch.add(math.degrees(rp.wrap_pi(rpy[1] - ref_now["pitch_rad"])))
-                    self.e_yaw.add(math.degrees(rp.wrap_pi(rpy[2] - ref_now["yaw_rad"])))
+                    ref_rpy = ref_rpy_at(ref_now, ref[iref] if iref < len(ref) else None, t)
+                    self.e_roll.add(math.degrees(rp.wrap_pi(rpy[0] - ref_rpy[0])))
+                    self.e_pitch.add(math.degrees(rp.wrap_pi(rpy[1] - ref_rpy[1])))
+                    self.e_yaw.add(math.degrees(rp.wrap_pi(rpy[2] - ref_rpy[2])))
             # nav_suite_get_height_ellipsoid() vs ref_now["h_m"] directly
             # (absolute, like the C harness's ell_h). Deliberately NOT gated
             # on nav.is_ready() like the block above: the accessor still
@@ -1005,6 +1063,17 @@ class Replay:
                 f"max gap {gap:.2f} s at t={gap_at:.1f} s")
 
         _report_stream("gnss", [fx["t_us"] for fx in self.fixes])
+        quality, latency = self.gnss_quality_latency()
+        if quality:
+            log(f"  gnss fix quality: {rp.gnss_quality_text(quality)}")
+        if latency:
+            log(f"  gnss transport latency: median {latency['median']:.0f} ms, "
+                f"p5..p95 {latency['p5']:.0f}..{latency['p95']:.0f} ms "
+                f"(n={latency['n']}), configured delay {self.gnss_delay_ms} ms")
+        integrity = self.gnss_integrity()
+        if integrity:
+            for line in rp.gnss_integrity_lines(integrity):
+                log(f"  gnss {line}")
         if self.mags:
             _report_stream("mag ", [row[0] for row in self.mags])
         if self.baros:
@@ -1013,7 +1082,7 @@ class Replay:
         if self.n_static:
             frac = 100.0 * self.n_static / n_imu_total if n_imu_total else 0.0
             log(f"  stationary epochs: {self.n_static}/{n_imu_total} "
-                f"({frac:.1f}% of trial, ins auto-ZUPT/ZARU-detected)")
+                f"({frac:.1f}% of trial, INS auto-ZUPT/ZARU-detected)")
         else:
             log("  stationary epochs: none detected"
                 f"{' (aiding: none - ins never runs auto-ZUPT/ZARU)' if self.aiding == 'none' else ''}")
@@ -1100,6 +1169,9 @@ class Replay:
             "noise": rp.noise_model_metrics(self.gyr_d2_stat, self.acc_d2_stat,
                                             self.gyr_d3_stat, self.acc_d3_stat,
                                             self.imu_hz, self.noise),
+            "acc_gravity": (rp.acc_gravity_metrics(self.static_acc_norms,
+                                                   self.origin_lat, self.origin_h)
+                            if self.origin_ecef is not None else None),
             "gnss_acc": (rp.gnss_standstill_accuracy(self.gnss_static_phases)
                          if aiding == "gnss" else None),
             "gnss_vel": (rp.gnss_vel_accuracy_stats(self.fixes)
@@ -1113,6 +1185,10 @@ class Replay:
             "health": {"n": self.health_n, "limits": rp.STDDEV_LIMITS,
                        "stats": self.health_stats},
             "overconfidence": nav.overconfidence(),
+            "gnss_quality": self.gnss_quality_latency()[0],
+            "gnss_latency": self.gnss_quality_latency()[1],
+            "gnss_delay_ms": float(self.gnss_delay_ms),
+            "gnss_integrity": self.gnss_integrity(),
             "leverarm": {"gnss": self.leverarm, "score": self.score_la},
             "baro_height": {
                 # n_baro_height_used > 0 <=> ins latched the barometric
@@ -1123,6 +1199,24 @@ class Replay:
             },
             "diag": diag,
         })
+
+    def gnss_quality_latency(self):
+        """(rp.gnss_quality_stats(), rp.gnss_latency_stats()) of the fixes
+        offered to the filter, the latency with the dataset's timesync.csv
+        clock. Either is None where the data does not carry it."""
+        if not hasattr(self, "_gnss_ql"):
+            self._gnss_ql = (rp.gnss_quality_stats(self.fixes),
+                             rp.gnss_latency_stats(
+                                 self.fixes, getattr(self.inp, "gps_clock", None)))
+        return self._gnss_ql
+
+    def gnss_integrity(self):
+        """rp.gnss_integrity_stats() of the fixes offered to the filter
+        (satellites used, jamming/spoofing, authentication), None where
+        gnss.csv carries none of it."""
+        if not hasattr(self, "_gnss_integrity"):
+            self._gnss_integrity = rp.gnss_integrity_stats(self.fixes)
+        return self._gnss_integrity
 
     def gnss_delay_auto(self):
         """Whether a GNSS-delay estimate is meaningful on its own: real GNSS
@@ -1158,7 +1252,36 @@ class Replay:
             # absolute ellipsoid height.
             "origin_ellipsoid_h_m": (self.origin_h if self.origin_ecef is not None
                                      else math.nan),
+            # GNSS fix quality (RTKLIB numbering), transport latency,
+            # satellites used and the receiver's interference and
+            # authentication states over time, for the GNSS quality page.
+            # Empty where gnss.csv or timesync.csv do not carry them.
+            "gnss_q_t": [], "gnss_q": [], "gnss_lat_t": [], "gnss_lat_ms": [],
+            "gnss_sv_t": [], "gnss_sv": [], "gnss_ind_t": [], "gnss_ind": {},
+            "gnss_delay_ms": float(self.gnss_delay_ms),
         }
+        if t0_us is not None:
+            quality, latency = self.gnss_quality_latency()
+            if quality:
+                rows = [fx for fx in self.fixes if fx.get("quality", 0)]
+                extra["gnss_q_t"] = [(fx["t_us"] - t0_us) / US_PER_SEC for fx in rows]
+                extra["gnss_q"] = [fx["quality"] for fx in rows]
+            if latency:
+                extra["gnss_lat_t"] = [(t - t0_us) / US_PER_SEC for t in latency["t_us"]]
+                extra["gnss_lat_ms"] = list(latency["latency_ms"])
+            integrity = self.gnss_integrity()
+            if integrity:
+                if integrity["num_sv"]:
+                    rows = [fx for fx in self.fixes if fx.get("num_sv", 0) > 0]
+                    extra["gnss_sv_t"] = [(fx["t_us"] - t0_us) / US_PER_SEC
+                                          for fx in rows]
+                    extra["gnss_sv"] = [fx["num_sv"] for fx in rows]
+                keys = [k for k in GNSS_IND_KEYS if integrity[k]]
+                if keys:
+                    extra["gnss_ind_t"] = [(fx["t_us"] - t0_us) / US_PER_SEC
+                                           for fx in self.fixes]
+                    extra["gnss_ind"] = {k: [fx.get(k, 0) for fx in self.fixes]
+                                         for k in keys}
         wmm_year = float(self.spec["mag"]["wmm_year"])
         if (mags and wmm_year > 0 and t0_us is not None
                 and self.site_llh is not None):
@@ -1466,7 +1589,7 @@ class PlotRecorder(Observer):
             row["gnss_vel_sigma"] = nan3[:]
 
         if last_ref is not None and origin_ecef is not None:
-            err_ecef = (rp.pos_error_ecef(nav, last_ref, r.score_la)
+            err_ecef = (rp.pos_error_ecef(nav, last_ref, r.score_la, r.t)
                         if nav.is_ready() else None)
             row["ref_pos"] = rp.ref_to_local_ned(
                 last_ref, origin_ecef, r.origin_lat, r.origin_lon)

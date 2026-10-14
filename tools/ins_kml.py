@@ -65,6 +65,7 @@ import simplekml
 _EST_COLOR = "ffffff00"   # opaque cyan
 _REF_COLOR = "ff00ffff"   # opaque yellow
 _FIX_COLOR = "ff0000ff"   # opaque red
+_RTS_COLOR = "ffd04cf4"   # opaque magenta, the RTS smoother's solution
 _MODEL_TRACK_COLOR = "ff0080ff"  # opaque orange, distinct from the static
                                  # "ins estimate (path)" line's cyan
 _EST_ICON_COLOR = "ffffff00"
@@ -101,7 +102,7 @@ def _geoid_undulation_m(lat_deg, lon_deg):
         return None
 
 
-def write_kml(path, est_track, ref_track, fix_track, name):
+def write_kml(path, est_track, ref_track, fix_track, name, rts_track=()):
     """est_track: list of (t_rel_sec, lat_deg, lon_deg, alt_m, roll_deg,
     pitch_deg, yaw_deg) (t_rel_sec seconds since replay start -- only used
     to animate the gx:Track time slider, not a real calendar time).
@@ -112,7 +113,9 @@ def write_kml(path, est_track, ref_track, fix_track, name):
     position covariance in m^2 is for --map-frames' error ellipses, unused
     here), held flat while no fix arrives (e.g. a GNSS outage) so an
     outage shows as a frozen point followed by a jump, not a smooth
-    interpolation -- or empty if no GNSS fix stream was recorded."""
+    interpolation -- or empty if no GNSS fix stream was recorded.
+    rts_track: the RTS smoother's solution in est_track's layout
+    (ins_rts.kml_track()), drawn as its own path, or empty."""
     if not est_track:
         print("kml: no recorded samples (filter never initialized?)")
         return
@@ -155,6 +158,17 @@ def write_kml(path, est_track, ref_track, fix_track, name):
         ref_line.linestyle.color = _REF_COLOR
         ref_line.linestyle.width = 2
 
+    if rts_track:
+        rts_line = kml.newlinestring(
+            name="RTS smoother (path)",
+            coords=[(lon, lat, line_alt(alt))
+                    for _, lat, lon, alt, _, _, _ in rts_track])
+        rts_line.altitudemode = line_mode
+        rts_line.extrude = 1 if N is not None else 0
+        rts_line.tessellate = 1
+        rts_line.linestyle.color = _RTS_COLOR
+        rts_line.linestyle.width = 3
+
     if fix_track:
         fix_line = kml.newlinestring(
             name="raw GNSS fix (path)",
@@ -195,5 +209,6 @@ def write_kml(path, est_track, ref_track, fix_track, name):
 
     kml.savekmz(path)
     print(f"wrote {path} ({len(est_track)} estimate points, "
-          f"{len(ref_track)} reference points, "
+          + (f"{len(rts_track)} RTS points, " if rts_track else "")
+          + f"{len(ref_track)} reference points, "
           f"{len(fix_track)} raw GNSS fix points)")

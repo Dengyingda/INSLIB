@@ -3050,11 +3050,11 @@ static void scenario_height_gnss_noise_outage_cycle(void)
 /* ---------------------------------------------------------------------------
  * Scenario 16b: absolute height without a barometer (REQ-SUITE-008)
  *
- * The offset filter is source-agnostic: with no barometer at all, the
- * local height reference is the ins local height, and the offset must
- * still converge to the ellipsoid height of the datum origin. After the
- * GNSS drops (mode leaves FULL) the absolute height is then formed from
- * the local height + offset rather than from the fix.
+ * Under GNSS alone ins's height is itself a GNSS height, so there is no
+ * GNSS-independent local height reference and the offset filter must stay
+ * idle: it would only re-estimate the datum origin's ellipsoid height,
+ * which ins already knows. After the GNSS drops (mode leaves FULL) the
+ * absolute height comes from the coasting ins.
  * ---------------------------------------------------------------------------
  */
 
@@ -3143,12 +3143,11 @@ static void scenario_height_ellipsoid_no_baro(void)
     }
     CHECK_TRUE(!s.baro_alt.is_initialized, "no barometer involved");
     CHECK_TRUE(nav_suite_get_mode(&s) == NAV_SUITE_MODE_FULL, "FULL mode");
-    CHECK_TRUE(local_gnss_alt_get(&s.local_gnss, &off, (float*)0),
-               "offset filter runs without a barometer");
-    CHECK_NEAR(off, h_ell_fix, 1.5, "offset = ellipsoid height of the datum origin");
+    CHECK_TRUE(!local_gnss_alt_get(&s.local_gnss, &off, (float*)0),
+               "offset filter idle without a GNSS-independent height");
 
     /* GNSS drops. ins stays ready but leaves FULL, so the absolute
-       height now comes from the local height reference + offset. */
+       height now comes from the coasting ins. */
     for (i = 1; i <= 500; ++i)
     {
         t += US_PER_SEC / 100;
@@ -3160,18 +3159,19 @@ static void scenario_height_ellipsoid_no_baro(void)
         m.acc.data[2]      = -GRAVITY;
         nav_suite_update(&s, &m);
     }
-    CHECK_TRUE(nav_suite_get_mode(&s) == NAV_SUITE_MODE_COASTING,
-               "coasting: offset branch is live");
+    CHECK_TRUE(nav_suite_get_mode(&s) == NAV_SUITE_MODE_COASTING, "coasting");
     CHECK_TRUE(nav_suite_get_height(&s, &h), "local height available");
     CHECK_NEAR(h, 0.0, 1.0, "local height still zero at the origin");
     CHECK_TRUE(nav_suite_get_height_ellipsoid(&s, &h_ell), "absolute height without a barometer");
-    CHECK_NEAR(h_ell, h_ell_fix, 2.0, "ellipsoid height from local height + offset");
+    CHECK_NEAR(h_ell, (float)s.ins.latlonh[2], 1e-3, "ellipsoid height from the coasting ins");
+    CHECK_NEAR(h_ell, h_ell_fix, 2.0, "ellipsoid height still the fix's");
 }
 
 /* ---------------------------------------------------------------------------
  * Scenario 16b2: absolute height with the GNSS antenna above the IMU
  *
- * The fix reports the antenna, ins and the local height reference the IMU.
+ * The fix reports the antenna, ins and the local height reference (a
+ * static barometer on the sensor board) the IMU.
  * The offset filter has to be fed the IMU's ellipsoid height, or it absorbs
  * the lever arm and nav_suite_get_height_ellipsoid() jumps by it when it
  * hands over from ins (FULL) to reference + offset (COASTING). Run level
@@ -3250,6 +3250,8 @@ static void run_height_ellipsoid_leverarm(float pitch_deg)
         m.gnss_leverarm_b[0] = la_b[0];
         m.gnss_leverarm_b[1] = la_b[1];
         m.gnss_leverarm_b[2] = la_b[2];
+        m.baro.is_valid      = true;
+        m.baro.pressure_pa   = pressure_from_altitude(300.0f);
         if ((i % 100) == 1)
         {
             m.gnss_pos.is_valid = true;
@@ -3277,6 +3279,8 @@ static void run_height_ellipsoid_leverarm(float pitch_deg)
         m.gyr.is_valid     = true;
         m.acc.data[0]      = GRAVITY * sinf(pitch);
         m.acc.data[2]      = -GRAVITY * cosf(pitch);
+        m.baro.is_valid    = true;
+        m.baro.pressure_pa = pressure_from_altitude(300.0f);
         nav_suite_update(&s, &m);
     }
     CHECK_TRUE(nav_suite_get_mode(&s) == NAV_SUITE_MODE_COASTING, "coasting: offset branch");

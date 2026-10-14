@@ -20,8 +20,9 @@
  *            rotation comes from the best available attitude source.
  *   - local_gnss: 1-state offset filter estimating the ellipsoid height of the
  *            NED origin, fed from epochs carrying both a GNSS position and a
- *            local height; enables an absolute height during GNSS outages
- *            (nav_suite_get_height_ellipsoid).
+ *            GNSS-independent local height (barometer, or ins under local
+ *            position aiding); enables an absolute height during GNSS
+ *            outages (nav_suite_get_height_ellipsoid). Idle under GNSS alone.
  *
  * Height systems:
  *
@@ -283,6 +284,9 @@ typedef struct
         bool last_ins_initialized;          /**< ins.is_initialized as of the
                                                   previous nav_suite_update()
                                                   call, to spot a shutdown */
+        bool last_ins_ready;                /**< ins_is_ready() as of the previous
+                                                 epoch (edge detection for the
+                                                 carry-over log, REQ-SUITE-022) */
     } log_state;
 } nav_suite_t;
 

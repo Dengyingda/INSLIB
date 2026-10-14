@@ -235,6 +235,11 @@ _Static_assert(KALMAN_MAX_NOISE_SIZE >= INS_NOISE_COLS_MAX,
    after a frozen coasting window (REQ-NAV-059), which is the same state:
    "nothing in the filter knows where the platform points". */
 #define INS_YAW_UNKNOWN_STDDEV (3.14159265f)
+/* Velocity stddev at a re-acquisition without a velocity measurement
+   (REQ-NAV-091): the frozen velocity dates from the start of the outage and
+   says nothing about the platform at its end, so it is kept only as a value
+   and the next position fixes determine the velocity. */
+#define INS_VEL_UNKNOWN_STDDEV_MPS (30.0f)
 /* Acceptance band for absolute heading inputs (REQ-NAV-060): the yaw
    measurement and the attitude hint's yaw. Any single-turn convention is
    accepted ([-pi, pi], [0, 2pi), ...) and normalized to [-pi, pi] at the API
@@ -1271,7 +1276,7 @@ static bool ins_fuse_is_outlier(const ins_t* f, const float* z, const float* R, 
  * whitened in-place with decorrelate() first, so the scalar Bierman updates
  * inside kalman_udu() see independent unit-variance measurements. Returns 0 on
  * success. */
-/* @satisfies REQ-NAV-002 REQ-NAV-035 REQ-NAV-036 */
+/* @satisfies REQ-NAV-002 REQ-NAV-035 REQ-NAV-036 REQ-NAV-090 */
 static int ins_fuse(ins_t* f, float* z, float* R, float* Ht, int m_count, float chi2_threshold,
                     int downweight_outlier)
 {
@@ -1340,31 +1345,150 @@ static int ins_fuse(ins_t* f, float* z, float* R, float* Ht, int m_count, float 
     return rc;
 }
 
-/* Find the history item closest to t_target. Returns NULL if the history
- * holds no usable entry near that time. Delayed measurements: Zwiener 2019,
- * "Einbeziehung von Messdaten mit verzoegerter Verfuegbarkeit". */
-/* @satisfies REQ-NAV-008 */
-static const ins_history_item_t* ins_find_history(const ins_t* f, ins_time_us_t t_target)
+/* Total age of a measurement [us] from its whole-ms and its us part
+ * (REQ-NAV-092). Non-positive parts count as zero. */
+static ins_time_us_t ins_meas_age_us(int delay_ms, int32_t delay_us)
 {
-    const ins_history_item_t* best    = NULL;
-    ins_time_us_t             best_dt = 0;
+    ins_time_us_t age = 0;
+    if (delay_ms > 0) { age += (ins_time_us_t)delay_ms * INS_US_PER_MS; }
+    if (delay_us > 0) { age += (ins_time_us_t)delay_us; }
+    return age;
+}
 
-    int i;
+/* Two bracketing states further apart than this are not interpolated (a gap
+   in the history, e.g. after a time jump): the nearer one is used instead. */
+#define INS_TOV_MAX_SPAN_US (2 * INS_HISTORY_MATCH_TOL_US)
+
+/* Nominal state at a measurement's time of validity (REQ-NAV-008,
+ * REQ-NAV-092). Copies, since it is generally interpolated. */
+typedef struct
+{
+    double latlonh[3];    /* absolute position */
+    float  pos_local[3];  /* local NED position */
+    float  vel_ned[3];    /* velocity */
+    float  R_b_to_n[9];   /* attitude */
+    float  omega_b_nb[3]; /* body rate (lever-arm velocity) */
+    float  dt_sec;        /* time of validity minus the time of the state
+                             above [s]. 0 when interpolated, nonzero only when
+                             the time of validity is not bracketed and the
+                             nearest state stands in. Position callers then
+                             carry the position over it at first order. */
+} ins_tov_state_t;
+
+/* One state the time of validity is interpolated from: a history entry or the
+ * current state. */
+typedef struct
+{
+    ins_time_us_t t;
+    const double* latlonh;
+    const float*  pos_local;
+    const float*  vel_ned;
+    const float*  qbn;
+    const float*  omega_b_nb;
+} ins_tov_src_t;
+
+static void ins_tov_src_history(const ins_history_item_t* h, ins_tov_src_t* s)
+{
+    s->t          = h->time;
+    s->latlonh    = h->latlonh;
+    s->pos_local  = h->state.pos_local;
+    s->vel_ned    = h->state.vel_ned;
+    s->qbn        = h->state.qbn;
+    s->omega_b_nb = h->omega_b_nb;
+}
+
+/* out = a + w * (b - a), attitude by normalized linear quaternion
+ * interpolation (shorter arc), which is exact enough for the few degrees
+ * one history step spans. */
+static void ins_tov_interp(const ins_tov_src_t* a, const ins_tov_src_t* b, float w,
+                           ins_tov_state_t* out)
+{
+    const float  w0 = 1.0f - w;
+    const double wd = (double)w;
+    int          i;
+    for (i = 0; i < 3; ++i)
+    {
+        out->latlonh[i]    = a->latlonh[i] + wd * (b->latlonh[i] - a->latlonh[i]);
+        out->pos_local[i]  = w0 * a->pos_local[i] + w * b->pos_local[i];
+        out->vel_ned[i]    = w0 * a->vel_ned[i] + w * b->vel_ned[i];
+        out->omega_b_nb[i] = w0 * a->omega_b_nb[i] + w * b->omega_b_nb[i];
+    }
+    float dot = 0.0f;
+    for (i = 0; i < 4; ++i) { dot += a->qbn[i] * b->qbn[i]; }
+    const float wb = (dot < 0.0f) ? -w : w;
+    float       q[4];
+    for (i = 0; i < 4; ++i) { q[i] = w0 * a->qbn[i] + wb * b->qbn[i]; }
+    ins_quat_normalize(q);
+    ins_quat_to_rotmat(q, out->R_b_to_n);
+    out->dt_sec = 0.0f;
+}
+
+/* State at the time of validity t_now - age_us (REQ-NAV-008, REQ-NAV-092),
+ * linearly interpolated between the two states around it: two history
+ * entries, or the newest entry and the current state (valid at t_now). The
+ * history grid is INS_HISTORY_DT_MS coarse, a measurement is generally valid
+ * in between. If the time of validity is not bracketed within
+ * INS_TOV_MAX_SPAN_US, the nearer of the two stands in with the remaining
+ * offset in dt_sec. Returns false if no state lies within
+ * INS_HISTORY_MATCH_TOL_US of the time of validity (the measurement cannot be
+ * placed in time). Delayed measurements: Zwiener 2019, "Einbeziehung von
+ * Messdaten mit verzoegerter Verfuegbarkeit". */
+/* @satisfies REQ-NAV-008 REQ-NAV-092 */
+static bool ins_state_at_tov(const ins_t* f, ins_time_us_t t_now, ins_time_us_t age_us,
+                             ins_tov_state_t* out)
+{
+    ins_tov_src_t cur;
+    cur.t          = t_now;
+    cur.latlonh    = f->latlonh;
+    cur.pos_local  = f->state.pos_local;
+    cur.vel_ned    = f->state.vel_ned;
+    cur.qbn        = f->state.qbn;
+    cur.omega_b_nb = f->last_omega_b_nb;
+    if (age_us <= 0)
+    {
+        ins_tov_interp(&cur, &cur, 0.0f, out);
+        return true;
+    }
+
+    /* Newest state at or before the time of validity (lo) and oldest one
+       after it (hi, the current state unless a history entry is closer). */
+    const ins_time_us_t       t_tov = t_now - age_us;
+    const ins_history_item_t* lo    = NULL;
+    const ins_history_item_t* hi    = NULL;
+    int                       i;
     for (i = 0; i < INS_HISTORY_ITEMS_MAX; ++i)
     {
         const ins_history_item_t* h = &f->history[i];
         if (h->d[0] <= 0.0f) { continue; /* empty (never written) ring buffer slot */ }
-        ins_time_us_t dt = h->time - t_target;
-        if (dt < 0) dt = -dt;
-        if (best == NULL || dt < best_dt)
+        if (h->time > t_now) { continue; /* stale, from before a backward time jump */ }
+        if (h->time <= t_tov)
         {
-            best    = h;
-            best_dt = dt;
+            if (lo == NULL || h->time > lo->time) { lo = h; }
         }
+        else if (hi == NULL || h->time < hi->time) { hi = h; }
     }
 
-    if (best != NULL && best_dt > INS_HISTORY_MATCH_TOL_US) { return NULL; }
-    return best;
+    ins_tov_src_t b = cur;
+    if (hi != NULL) { ins_tov_src_history(hi, &b); }
+    if (lo != NULL)
+    {
+        ins_tov_src_t a;
+        ins_tov_src_history(lo, &a);
+        if (b.t - a.t <= INS_TOV_MAX_SPAN_US)
+        {
+            const float w = (b.t > a.t) ? (float)(t_tov - a.t) / (float)(b.t - a.t) : 0.0f;
+            ins_tov_interp(&a, &b, w, out);
+            return true;
+        }
+        /* Not bracketed closely enough: the nearer state stands in. */
+        if (t_tov - a.t < b.t - t_tov) { b = a; }
+    }
+    const ins_time_us_t dt_us  = t_tov - b.t;
+    const ins_time_us_t dt_abs = (dt_us < 0) ? -dt_us : dt_us;
+    if (dt_abs > INS_HISTORY_MATCH_TOL_US) { return false; }
+    ins_tov_interp(&b, &b, 0.0f, out);
+    out->dt_sec = (float)dt_us * (1.0f / INS_US_PER_SEC);
+    return true;
 }
 
 /* Fuse a scalar yaw-error residual (n-frame, [rad]) for the absolute-yaw
@@ -1530,21 +1654,17 @@ static void ins_fuse_yaw(ins_t* f, const ins_measurements_t* m)
     if (!m->yaw.is_valid) return;
     if (m->yaw.stddev_rad <= 0.0f) return;
 
-    const int delay_ms = (m->yaw_delay_ms > 0) ? m->yaw_delay_ms : 0;
-    if (delay_ms > INS_MAX_DELAY_MS) return;
+    const ins_time_us_t age_us = ins_meas_age_us(m->yaw_delay_ms, m->yaw_delay_us);
+    if (age_us > INS_MAX_DELAY_MS * INS_US_PER_MS) return;
 
-    /* Attitude at time-of-validity. */
-    const float* R_tov = f->R_b_to_n;
-    if (delay_ms > 0)
+    /* Attitude at time-of-validity (REQ-NAV-008, REQ-NAV-092). */
+    ins_tov_state_t tov;
+    if (!ins_state_at_tov(f, m->timestamp, age_us, &tov))
     {
-        const ins_history_item_t* h = ins_find_history(f, m->timestamp - delay_ms * INS_US_PER_MS);
-        if (h == NULL)
-        {
-            LOG_INFO("ins: cannot anchor yaw measurement in history -> skip");
-            return;
-        }
-        R_tov = h->R_b_to_n;
+        LOG_INFO("ins: cannot anchor yaw measurement in history -> skip");
+        return;
     }
+    const float* R_tov = tov.R_b_to_n;
 
     /* Yaw is ill-defined near pitch = +/-90 deg -> skip. */
     const float sp = -MAT_ELEM(R_tov, 2, 0, 3, 3);
@@ -1924,7 +2044,7 @@ static void ins_reacquire(ins_t* f, const ins_measurements_t* m, const float pos
  * of pos_local (+ sensor lever arm), no coordinate conversion needed since the
  * measurement lives in the same local n-frame as the position state. Delayed
  * measurements are anchored in the history, like GNSS. */
-/* @satisfies REQ-NAV-011 REQ-NAV-024 */
+/* @satisfies REQ-NAV-011 REQ-NAV-024 REQ-NAV-091 */
 static void ins_fuse_local_pos(ins_t* f, const ins_measurements_t* m)
 {
     if (!m->local_pos.is_valid) return;
@@ -1941,7 +2061,7 @@ static void ins_fuse_local_pos(ins_t* f, const ins_measurements_t* m)
             pos_new[i]    = m->local_pos.pos_ned[i] - la_n[i];
             const float v = MAT_ELEM(m->local_pos.Qll_ned, i, i, 3, 3);
             pos_var[i]    = (v > 0.0f) ? v : qsquare(f->init.pos_init_stddev_m);
-            vel_var[i]    = qsquare(f->init.vel_init_stddev_mps);
+            vel_var[i]    = qsquare(INS_VEL_UNKNOWN_STDDEV_MPS); /* REQ-NAV-091 */
         }
         /* REQ-NAV-066: under the barometric height source the height comes
            from the barometer, not from this measurement. */
@@ -1951,23 +2071,17 @@ static void ins_fuse_local_pos(ins_t* f, const ins_measurements_t* m)
         return;
     }
 
-    const int delay_ms = (m->local_pos_delay_ms > 0) ? m->local_pos_delay_ms : 0;
-    if (delay_ms > INS_MAX_DELAY_MS) return;
+    const ins_time_us_t age_us = ins_meas_age_us(m->local_pos_delay_ms, m->local_pos_delay_us);
+    if (age_us > INS_MAX_DELAY_MS * INS_US_PER_MS) return;
 
-    /* State at time-of-validity. */
-    const float* pos_tov = f->state.pos_local;
-    const float* R_tov   = f->R_b_to_n;
-    if (delay_ms > 0)
+    /* State at time-of-validity (REQ-NAV-008, REQ-NAV-092). */
+    ins_tov_state_t tov;
+    if (!ins_state_at_tov(f, m->timestamp, age_us, &tov))
     {
-        const ins_history_item_t* h = ins_find_history(f, m->timestamp - delay_ms * INS_US_PER_MS);
-        if (h == NULL)
-        {
-            LOG_WARN("ins: State not found in history.");
-            return; /* cannot anchor the residual in time -> skip */
-        }
-        pos_tov = h->state.pos_local;
-        R_tov   = h->R_b_to_n;
+        LOG_WARN("ins: State not found in history.");
+        return; /* cannot anchor the residual in time -> skip */
     }
+    const float* R_tov = tov.R_b_to_n;
 
     /* Predicted sensor position: body position + lever arm. */
     float la_n[3];
@@ -1987,9 +2101,13 @@ static void ins_fuse_local_pos(ins_t* f, const ins_measurements_t* m)
     int i, j;
     for (i = 0; i < 3; ++i)
     {
-        z[i] = pos_tov[i] + la_n[i] - m->local_pos.pos_ned[i];
+        /* dt_sec is 0 for an interpolated state, else the stand-in state is
+           carried to the time of validity (REQ-NAV-092), first order, so the
+           velocity also enters H. */
+        z[i] = tov.pos_local[i] + tov.vel_ned[i] * tov.dt_sec + la_n[i] - m->local_pos.pos_ned[i];
 
         MAT_ELEM(Ht, INS_IDX_POS + i, i, f->n, 3) = 1.0f;
+        MAT_ELEM(Ht, INS_IDX_VEL + i, i, f->n, 3) = tov.dt_sec;
         for (j = 0; j < 3; ++j)
         {
             /* Ht stored transposed: Ht[state, meas] = H[meas, state]. */
@@ -2492,7 +2610,7 @@ static void ins_fuse_gnss(ins_t* f, const ins_measurements_t* m)
                reported one. usable gates guarantee positive variances. */
             pos_var[i] = MAT_ELEM(f->step_ctx.gnss_pos_Qll_fuse, i, i, 3, 3);
             vel_var[i] = use_vel ? MAT_ELEM(f->step_ctx.gnss_vel_Qll_fuse, i, i, 3, 3)
-                                 : qsquare(f->init.vel_init_stddev_mps);
+                                 : qsquare(INS_VEL_UNKNOWN_STDDEV_MPS); /* REQ-NAV-091 */
         }
         /* REQ-NAV-054/055/066: height is barometric, never re-anchored
            from the GNSS position whose vertical row this filter does not
@@ -2536,41 +2654,33 @@ static void ins_fuse_gnss(ins_t* f, const ins_measurements_t* m)
         return;
     }
 
-    int delay_ms = 0;
-    if (m->gnss_delay_ms > 0) { delay_ms = m->gnss_delay_ms; }
+    const ins_time_us_t age_us = ins_meas_age_us(m->gnss_delay_ms, m->gnss_delay_us);
     if (!f->log_state.gnss_delay_logged)
     {
         f->log_state.gnss_delay_logged = true;
-        LOG_INFO("ins: first GNSS fix has a %d ms measurement delay "
+        LOG_INFO("ins: first GNSS fix has a %.3f ms measurement delay "
                  "(used for history buffer)",
-                 delay_ms);
+                 (double)age_us * 1e-3);
     }
-    if (delay_ms > INS_MAX_DELAY_MS)
+    if (age_us > INS_MAX_DELAY_MS * INS_US_PER_MS)
     {
         f->diag.n_gnss_no_anchor++; /* too old to place in the history */
         return;
     }
 
-    /* State at time-of-validity (fall back to the current state for
-       delay 0). */
-    const double* latlonh_tov = f->latlonh;
-    const float*  vel_tov     = f->state.vel_ned;
-    const float*  R_tov       = f->R_b_to_n;
-    const float*  omg_tov     = f->last_omega_b_nb;
-    if (delay_ms > 0)
+    /* State at time-of-validity (REQ-NAV-008, REQ-NAV-092): the current
+       state or a history entry, plus the remaining offset to it. */
+    ins_tov_state_t tov;
+    if (!ins_state_at_tov(f, m->timestamp, age_us, &tov))
     {
-        const ins_history_item_t* h = ins_find_history(f, m->timestamp - delay_ms * INS_US_PER_MS);
-        if (h == NULL)
-        {
-            LOG_WARN("ins: State not found in history.");
-            f->diag.n_gnss_no_anchor++;
-            return; /* cannot anchor the residual in time -> skip */
-        }
-        latlonh_tov = h->latlonh;
-        vel_tov     = h->state.vel_ned;
-        R_tov       = h->R_b_to_n;
-        omg_tov     = h->omega_b_nb;
+        LOG_WARN("ins: State not found in history.");
+        f->diag.n_gnss_no_anchor++;
+        return; /* cannot anchor the residual in time -> skip */
     }
+    const double* latlonh_tov = tov.latlonh;
+    const float*  vel_tov     = tov.vel_ned;
+    const float*  R_tov       = tov.R_b_to_n;
+    const float*  omg_tov     = tov.omega_b_nb;
 
     /* Assemble the combined measurement: z (mm x 1), full R (mm x mm) and Ht
        (n x mm). R is built from the 3x3 NED blocks, plus the optional
@@ -2621,8 +2731,12 @@ static void ins_fuse_gnss(ins_t* f, const ins_measurements_t* m)
 
         for (i = 0; i < pos_rows; ++i)
         {
-            z[row + i]                                       = dz_n[i] + la_n[i];
+            /* dt_sec is 0 for an interpolated state. Otherwise vel_tov * dt_sec
+               carries the stand-in state to the time of validity (REQ-NAV-092),
+               first order, so the velocity also enters H. */
+            z[row + i] = dz_n[i] + vel_tov[i] * tov.dt_sec + la_n[i];
             MAT_ELEM(Ht, INS_IDX_POS + i, row + i, f->n, mm) = 1.0f;
+            MAT_ELEM(Ht, INS_IDX_VEL + i, row + i, f->n, mm) = tov.dt_sec;
             /* Attitude coupling uses the full 3x3 Sla regardless of pos_rows:
                dropping the vertical row does not stop the remaining (N, E) rows
                observing attitude through the lever arm. */
@@ -2704,6 +2818,9 @@ static void ins_fuse_gnss(ins_t* f, const ins_measurements_t* m)
                           : time_diff_sec(m->timestamp, f->log_state.t_last_large_pos_res_log);
             if (first_log || since_sec >= INS_LOG_LARGE_POS_REPEAT_SEC)
             {
+                /* Both branches only log, so they are identical once
+                   LOG_INFO is compiled out by the LOG_LEVEL. */
+                /* NOLINTNEXTLINE(bugprone-branch-clone) */
                 if (pos_rows > 2)
                 {
                     LOG_INFO("large GNSS position correction %.1f m pending "
@@ -2844,24 +2961,19 @@ static void ins_fuse_speed(ins_t* f, const ins_measurements_t* m)
 
     /* Velocity at the time of validity. A Bluetooth OBD-II round-trip is
        tens of ms, so the delayed case is the normal one here. */
-    const int delay_ms = (m->speed_delay_ms > 0) ? m->speed_delay_ms : 0;
-    if (delay_ms > INS_MAX_DELAY_MS)
+    const ins_time_us_t age_us = ins_meas_age_us(m->speed_delay_ms, m->speed_delay_us);
+    if (age_us > INS_MAX_DELAY_MS * INS_US_PER_MS)
     {
         f->diag.n_speed_skipped++;
         return;
     }
-    const float* vel_tov = f->state.vel_ned;
-    if (delay_ms > 0)
+    ins_tov_state_t tov;
+    if (!ins_state_at_tov(f, m->timestamp, age_us, &tov))
     {
-        const ins_history_item_t* h =
-            ins_find_history(f, m->timestamp - (ins_time_us_t)delay_ms * INS_US_PER_MS);
-        if (h == NULL)
-        {
-            f->diag.n_speed_skipped++;
-            return;
-        }
-        vel_tov = h->state.vel_ned;
+        f->diag.n_speed_skipped++;
+        return;
     }
+    const float* vel_tov = tov.vel_ned;
 
     const float sp =
         SQRTF(vel_tov[0] * vel_tov[0] + vel_tov[1] * vel_tov[1] + vel_tov[2] * vel_tov[2]);
@@ -2994,26 +3106,20 @@ static void ins_fuse_ranges(ins_t* f, const ins_measurements_t* m)
         f->diag.n_range_seen++;
 
         /* State at the time of validity, per entry. */
-        const int     delay_ms = (r->delay_ms > 0) ? r->delay_ms : 0;
-        const double* llh_tov  = f->latlonh;
-        const float*  R_tov    = f->R_b_to_n;
-        if (delay_ms > INS_MAX_DELAY_MS)
+        const ins_time_us_t age_us = ins_meas_age_us(r->delay_ms, 0);
+        if (age_us > INS_MAX_DELAY_MS * INS_US_PER_MS)
         {
             f->diag.n_range_skipped++;
             continue;
         }
-        if (delay_ms > 0)
+        ins_tov_state_t tov;
+        if (!ins_state_at_tov(f, m->timestamp, age_us, &tov))
         {
-            const ins_history_item_t* h =
-                ins_find_history(f, m->timestamp - (ins_time_us_t)delay_ms * INS_US_PER_MS);
-            if (h == NULL)
-            {
-                f->diag.n_range_skipped++;
-                continue;
-            }
-            llh_tov = h->latlonh;
-            R_tov   = h->R_b_to_n;
+            f->diag.n_range_skipped++;
+            continue;
         }
+        const double* llh_tov = tov.latlonh;
+        const float*  R_tov   = tov.R_b_to_n;
 
         float la_n[3];
         mat3_mul_vec3(R_tov, m->range_leverarm_b, la_n);
@@ -3102,19 +3208,15 @@ static void ins_fuse_gnss_course_yaw(ins_t* f, const ins_measurements_t* m)
     if (stddev < min_yaw_stddev) { stddev = min_yaw_stddev; }
 
     /* Attitude at time-of-validity */
-    const int delay_ms = (m->gnss_delay_ms > 0) ? m->gnss_delay_ms : 0;
-    if (delay_ms > INS_MAX_DELAY_MS) { return; }
-    const float* R_tov = f->R_b_to_n;
-    if (delay_ms > 0)
+    const ins_time_us_t age_us = ins_meas_age_us(m->gnss_delay_ms, m->gnss_delay_us);
+    if (age_us > INS_MAX_DELAY_MS * INS_US_PER_MS) { return; }
+    ins_tov_state_t tov;
+    if (!ins_state_at_tov(f, m->timestamp, age_us, &tov))
     {
-        const ins_history_item_t* h = ins_find_history(f, m->timestamp - delay_ms * INS_US_PER_MS);
-        if (h == NULL)
-        {
-            LOG_WARN("ins: State not found in history.");
-            return;
-        }
-        R_tov = h->R_b_to_n;
+        LOG_WARN("ins: State not found in history.");
+        return;
     }
+    const float* R_tov = tov.R_b_to_n;
 
     /* Yaw is ill-defined near pitch = +/-90 deg (gimbal lock) -> skip. */
     const float sp = -MAT_ELEM(R_tov, 2, 0, 3, 3);
@@ -4374,8 +4476,13 @@ const ins_diag_t* ins_get_diag(const ins_t* f)
 /* @satisfies REQ-NAV-013 */
 bool ins_auto_zupt_active(const ins_t* f)
 {
+    /* The dwell time is a criterion of the detector like the gates and the
+       variance verdict, so a stillness run that has not dwelled yet is not
+       reported either (the rate limit is not: it throttles the updates, the
+       platform is still all the same). */
     return f != NULL && f->is_initialized && !f->opt.auto_zupt_disable &&
-           f->auto_zupt_static_since != 0 && f->static_var_ok;
+           f->auto_zupt_static_since != 0 && f->auto_zupt_var_since != 0 && f->auto_zupt_dwelled &&
+           f->static_var_ok;
 }
 
 /* @satisfies REQ-NAV-013 */
@@ -4390,6 +4497,7 @@ void ins_set_auto_zupt_disable(ins_t* f, bool disable)
            after the next ins_update. */
         f->auto_zupt_static_since = 0;
         f->auto_zupt_var_since    = 0;
+        f->auto_zupt_dwelled      = false;
         f->auto_zupt_gyr_count    = 0;
         f->bias_prior_count       = 0;
         f->static_var_count       = 0;
@@ -4925,9 +5033,28 @@ static bool ins_autoinit_try(ins_t* f, const ins_measurements_t* m)
  * road/engine vibration a moving vehicle puts on the IMU.
  *
  * A usable fix also has to be accurate enough
- * (opt.auto_zupt_max_vel_stddev_mps, 1-sigma per axis). */
-static bool ins_auto_zupt_velocity_gate_ok(ins_t* f, const ins_measurements_t* m, float max_vel,
-                                           float max_vel_stddev)
+ * (opt.auto_zupt_max_vel_stddev_mps, 1-sigma per axis), see
+ * ins_auto_zupt_record_ext_vel. */
+static bool ins_auto_zupt_velocity_gate_ok(const ins_t* f, const ins_measurements_t* m,
+                                           float max_vel)
+{
+    if (f->auto_zupt_ext_vel_time != 0 &&
+        time_diff_sec(m->timestamp, f->auto_zupt_ext_vel_time) <= INS_AUTOZUPT_EXT_VEL_MAX_AGE_SEC)
+    {
+        return f->auto_zupt_ext_vel_mps <= max_vel;
+    }
+    return true;
+}
+
+/* Remember a GNSS velocity observation for the velocity gate. Called on every
+ * epoch before any IMU criterion is looked at: a fix arriving while the IMU
+ * shows motion (or on an epoch without an IMU sample) is just as much evidence
+ * of the platform's speed, and dropping it lets the observation age out
+ * during motion so the gate opens on the next IMU-quiet stretch, e.g. a steady
+ * turn (REQ-NAV-013). */
+/* @satisfies REQ-NAV-013 */
+static void ins_auto_zupt_record_ext_vel(ins_t* f, const ins_measurements_t* m,
+                                         float max_vel_stddev)
 {
     if (ins_gnss_vel_usable(f, &m->gnss_vel) &&
         ins_cov_stddev_within(m->gnss_vel.Qll_ned, max_vel_stddev, max_vel_stddev))
@@ -4935,12 +5062,6 @@ static bool ins_auto_zupt_velocity_gate_ok(ins_t* f, const ins_measurements_t* m
         f->auto_zupt_ext_vel_mps  = vec3_norm(m->gnss_vel.vel_ned);
         f->auto_zupt_ext_vel_time = m->timestamp;
     }
-    if (f->auto_zupt_ext_vel_time != 0 &&
-        time_diff_sec(m->timestamp, f->auto_zupt_ext_vel_time) <= INS_AUTOZUPT_EXT_VEL_MAX_AGE_SEC)
-    {
-        return f->auto_zupt_ext_vel_mps <= max_vel;
-    }
-    return true;
 }
 
 /* Decide whether this epoch should arm a synthetic zero_velocity_update /
@@ -5082,6 +5203,14 @@ static void ins_check_bias_prior(ins_t* f, const ins_measurements_t* m)
 
 static bool ins_auto_zupt_detect(ins_t* f, const ins_measurements_t* m)
 {
+    /* First, ahead of every early return below: the velocity evidence does
+       not depend on this epoch's IMU verdict, nor on the detector being
+       enabled right now (a runtime re-enable must see the latest fix). */
+    const float max_vel_stddev = (f->opt.auto_zupt_max_vel_stddev_mps > 0.0f)
+                                     ? f->opt.auto_zupt_max_vel_stddev_mps
+                                     : INS_AUTOZUPT_DEFAULT_MAX_VEL_STDDEV_MPS;
+    ins_auto_zupt_record_ext_vel(f, m, max_vel_stddev);
+
     if (f->opt.auto_zupt_disable)
     {
         /* Self-heals every call while disabled (mirrors ahrs_auto_zaru_detect):
@@ -5090,6 +5219,7 @@ static bool ins_auto_zupt_detect(ins_t* f, const ins_measurements_t* m)
            window survive into re-enablement. */
         f->auto_zupt_static_since = 0;
         f->auto_zupt_var_since    = 0;
+        f->auto_zupt_dwelled      = false;
         f->auto_zupt_gyr_count    = 0;
         f->bias_prior_count       = 0;
         f->static_var_count       = 0;
@@ -5109,19 +5239,16 @@ static bool ins_auto_zupt_detect(ins_t* f, const ins_measurements_t* m)
         return false;
     }
 
-    const float max_gyr = (f->opt.auto_zupt_static_gyr_rps > 0.0f)
-                              ? f->opt.auto_zupt_static_gyr_rps
-                              : INS_AUTOZUPT_DEFAULT_STATIC_GYR;
-    const float max_acc = (f->opt.auto_zupt_static_acc_mps2 > 0.0f)
-                              ? f->opt.auto_zupt_static_acc_mps2
-                              : INS_AUTOZUPT_DEFAULT_STATIC_ACC;
-    const float max_vel = (f->opt.auto_zupt_max_vel_mps > 0.0f) ? f->opt.auto_zupt_max_vel_mps
-                                                                : INS_AUTOZUPT_DEFAULT_MAX_VEL_MPS;
-    const float max_vel_stddev   = (f->opt.auto_zupt_max_vel_stddev_mps > 0.0f)
-                                       ? f->opt.auto_zupt_max_vel_stddev_mps
-                                       : INS_AUTOZUPT_DEFAULT_MAX_VEL_STDDEV_MPS;
-    const float dwell_sec        = (f->opt.auto_zupt_dwell_sec > 0.0f) ? f->opt.auto_zupt_dwell_sec
-                                                                       : INS_AUTOZUPT_DEFAULT_DWELL_SEC;
+    const float max_gyr   = (f->opt.auto_zupt_static_gyr_rps > 0.0f)
+                                ? f->opt.auto_zupt_static_gyr_rps
+                                : INS_AUTOZUPT_DEFAULT_STATIC_GYR;
+    const float max_acc   = (f->opt.auto_zupt_static_acc_mps2 > 0.0f)
+                                ? f->opt.auto_zupt_static_acc_mps2
+                                : INS_AUTOZUPT_DEFAULT_STATIC_ACC;
+    const float max_vel   = (f->opt.auto_zupt_max_vel_mps > 0.0f) ? f->opt.auto_zupt_max_vel_mps
+                                                                  : INS_AUTOZUPT_DEFAULT_MAX_VEL_MPS;
+    const float dwell_sec = (f->opt.auto_zupt_dwell_sec > 0.0f) ? f->opt.auto_zupt_dwell_sec
+                                                                : INS_AUTOZUPT_DEFAULT_DWELL_SEC;
     const float min_interval_sec = (f->opt.auto_zupt_min_interval_sec > 0.0f)
                                        ? f->opt.auto_zupt_min_interval_sec
                                        : INS_AUTOZUPT_DEFAULT_MIN_INTERVAL_SEC;
@@ -5143,12 +5270,13 @@ static bool ins_auto_zupt_detect(ins_t* f, const ins_measurements_t* m)
     const bool var_static = ins_static_variance_update(f, m);
     const bool is_static  = (vec3_norm(gyr_c) <= max_gyr) &&
                            (fabsf(vec3_norm(acc_c) - g_nom) <= max_acc) &&
-                           ins_auto_zupt_velocity_gate_ok(f, m, max_vel, max_vel_stddev);
+                           ins_auto_zupt_velocity_gate_ok(f, m, max_vel);
 
     if (!is_static)
     {
         f->auto_zupt_static_since = 0;
         f->auto_zupt_var_since    = 0;
+        f->auto_zupt_dwelled      = false;
         f->auto_zupt_gyr_count    = 0;
         f->bias_prior_count       = 0;
         return false;
@@ -5162,6 +5290,7 @@ static bool ins_auto_zupt_detect(ins_t* f, const ins_measurements_t* m)
     if (!var_static)
     {
         f->auto_zupt_var_since = 0;
+        f->auto_zupt_dwelled   = false;
         f->auto_zupt_gyr_count = 0;
         f->bias_prior_count    = 0;
         return false;
@@ -5213,6 +5342,7 @@ static bool ins_auto_zupt_detect(ins_t* f, const ins_measurements_t* m)
     {
         return false; /* not still long enough yet */
     }
+    f->auto_zupt_dwelled = true;
 
     const ins_time_us_t min_interval_us = (ins_time_us_t)(min_interval_sec * (float)INS_US_PER_SEC);
     if (f->t_last_auto_zupt != 0 && m->timestamp - f->t_last_auto_zupt < min_interval_us)

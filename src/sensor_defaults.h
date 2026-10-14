@@ -53,6 +53,17 @@
 /** Gyro bias random walk [rad/s/sqrt(s)]. */
 #define INS_DEFAULT_GYR_BIAS_RW_RPS_SQRTS (2e-6f)
 
+/** ARS/AHRS gyro noise density [rad/s/sqrt(Hz)] and extra attitude process
+ *  noise [rad/sqrt(s)] when the caller leaves them at 0. Split like ins
+ *  (sensor noise plus a model-error term), but sized smaller: the filter
+ *  fuses the accelerometer as a leveling correction and degrades with more
+ *  attitude noise under sustained accelerations (coordinated turns). The
+ *  root-sum-square of the two is the 0.02 deg/s/sqrt(Hz) the filter was
+ *  tuned with. */
+#define AHRS_DEFAULT_GYR_NOISE_PSD_RPS_SQRTHZ (2.0e-4f)
+/** ARS/AHRS extra attitude process noise [rad/sqrt(s)], see above. */
+#define AHRS_DEFAULT_RPY_PRED_STDDEV_RPS_SQRTS (2.86e-4f)
+
 /** IMU loss timeout [s]: once the last IMU sample is this old, ins, the
  *  ARS/AHRS and baro_alt stop and restart (REQ-NAV-089, REQ-AHRS-029,
  *  REQ-BARO-027). All of them run against the same physical IMU. */

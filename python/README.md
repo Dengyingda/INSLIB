@@ -87,6 +87,15 @@ which for a MEMS part sits at hundreds of seconds). It reads the same
 the white-noise `gyr_psd`/`acc_psd` (which should agree with `replay.py`'s
 estimate). Needs `numpy` (and `matplotlib` for `--plot`).
 
+Handling at the start and end of a bench recording (starting and stopping
+the logger) is cut by default: `--skip-start` (30 s) and `--skip-end` (60 s).
+A record shorter than `--min-duration` (30 min) after trimming is refused,
+and below 2 h it warns that only upper bounds are to be expected. If the
+`imu.csv` has the optional 8th column `imu_temp_c`, the report shows the
+temperature range and the PDF a temperature curve. The PDF also marks the
+bias instability in the plot and gives a rough IMU class (consumer, industrial,
+tactical, navigation grade) from the gyro bias instability, a heuristic only.
+
 Two things it deliberately does *not* do naively:
 
 - **It fits the asymptotes, it does not read the curve at τ = 3 s.** The

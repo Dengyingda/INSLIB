@@ -454,6 +454,26 @@ void ins_core_set_local_pos_delay_ms(void* h, int ms)
     ins_core_ctx_t* c = (ins_core_ctx_t*)h;
     if (c) c->meas.local_pos_delay_ms = ms;
 }
+void ins_core_set_gnss_delay_us(void* h, int32_t us)
+{
+    ins_core_ctx_t* c = (ins_core_ctx_t*)h;
+    if (c) c->meas.gnss_delay_us = us;
+}
+void ins_core_set_local_pos_delay_us(void* h, int32_t us)
+{
+    ins_core_ctx_t* c = (ins_core_ctx_t*)h;
+    if (c) c->meas.local_pos_delay_us = us;
+}
+void ins_core_set_yaw_delay_us(void* h, int32_t us)
+{
+    ins_core_ctx_t* c = (ins_core_ctx_t*)h;
+    if (c) c->meas.yaw_delay_us = us;
+}
+void ins_core_set_speed_delay_us(void* h, int32_t us)
+{
+    ins_core_ctx_t* c = (ins_core_ctx_t*)h;
+    if (c) c->meas.speed_delay_us = us;
+}
 void ins_core_update(void* h)
 {
     ins_core_ctx_t* c = (ins_core_ctx_t*)h;
@@ -915,6 +935,40 @@ void ins_suite_set_ahrs_gyr_bias_init_stddev(void* h, float stddev_rps)
         }
     }
 }
+/* ARS/AHRS SHARED accelerometer-leveling and magnetometer tuning, one call
+   for both templates (ahrs_config_t fields of the same names). 0 leaves a
+   field at ahrs's own default. gravity_diff_penalty and acc_reject_gravity_mps2
+   additionally take a negative value through (ahrs.h: penalty -> 0, reject ->
+   disabled), every other field ignores <= 0. Same timing contract as
+   ins_suite_set_ahrs_gyr_noise(). */
+void ins_suite_set_ahrs_tuning(void* h, float acc_freq_hz, float acc_cutoff_freq_hz,
+                               float gravity_diff_penalty, float acc_reject_gravity_mps2,
+                               float chi2_threshold, float kalman_update_dt_sec,
+                               float mag_yaw_stddev_rad, float mag_freq_hz,
+                               float mag_chi2_threshold)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    ahrs_config_t*   cfgs[2];
+    int              i;
+    if (!c) return;
+    cfgs[0] = &c->suite.ars_cfg;
+    cfgs[1] = &c->suite.ahrs_cfg;
+    for (i = 0; i < 2; ++i)
+    {
+        ahrs_config_t* a = cfgs[i];
+        if (acc_freq_hz > 0.0f) a->acc_freq_hz = acc_freq_hz;
+        if (acc_cutoff_freq_hz > 0.0f) a->acc_cutoff_freq_hz = acc_cutoff_freq_hz;
+        if (gravity_diff_penalty > 0.0f || gravity_diff_penalty < 0.0f)
+            a->gravity_diff_penalty = gravity_diff_penalty;
+        if (acc_reject_gravity_mps2 > 0.0f || acc_reject_gravity_mps2 < 0.0f)
+            a->acc_reject_gravity_mps2 = acc_reject_gravity_mps2;
+        if (chi2_threshold > 0.0f) a->chi2_threshold = chi2_threshold;
+        if (kalman_update_dt_sec > 0.0f) a->kalman_update_dt_sec = kalman_update_dt_sec;
+        if (mag_yaw_stddev_rad > 0.0f) a->mag_yaw_stddev_rad = mag_yaw_stddev_rad;
+        if (mag_freq_hz > 0.0f) a->mag_freq_hz = mag_freq_hz;
+        if (mag_chi2_threshold > 0.0f) a->mag_chi2_threshold = mag_chi2_threshold;
+    }
+}
 void ins_suite_set_gnss_delay_ms(void* h, int ms)
 {
     ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
@@ -929,6 +983,26 @@ void ins_suite_set_local_pos_delay_ms(void* h, int ms)
 {
     ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
     if (c) c->meas.local_pos_delay_ms = ms;
+}
+void ins_suite_set_gnss_delay_us(void* h, int32_t us)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    if (c) c->meas.gnss_delay_us = us;
+}
+void ins_suite_set_local_pos_delay_us(void* h, int32_t us)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    if (c) c->meas.local_pos_delay_us = us;
+}
+void ins_suite_set_yaw_delay_us(void* h, int32_t us)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    if (c) c->meas.yaw_delay_us = us;
+}
+void ins_suite_set_speed_delay_us(void* h, int32_t us)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    if (c) c->meas.speed_delay_us = us;
 }
 /* A known initial roll/pitch and/or yaw (e.g. the vehicle's heading at
    the start of the log, with no magnetometer/GNSS-course yaw aiding to

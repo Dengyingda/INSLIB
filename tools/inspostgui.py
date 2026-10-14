@@ -74,6 +74,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "python"))
 import replay  # noqa: E402  (loaders, DEFAULTS, build_config, Stat, ...)
 import replay_core  # noqa: E402  (the replay loop shared with replay.py)
+import ins_rts  # noqa: E402  (the offline RTS smoother)
+import ins_solution  # noqa: E402  (solution files: CSV, RTKLIB .pos)
 from INSLIB import ecef_to_llh  # noqa: E402
 from INSLIB._core import rpy_to_quat  # noqa: E402
 
@@ -116,14 +118,19 @@ CONFIG_SECTIONS = [
          "ground truth, none: no absolute position aiding (ARS/baro only)"),
         (("init",), "Init", CHOICE, ("auto", "ref"),
          "auto: ins auto-initialization, ref: known initial state from "
-         "the first truth epoch (KF-GINS protocol)"),
+         "the first epoch of the reference file"),
         (("automotive_mode",), "Automotive mode", BOOL, None,
          "Derives yaw from the GNSS course over ground. Only for road "
          "vehicles, not for aircraft."),
         (("automotive_min_speed_mps",), "Automotive min speed [m/s]", FLOAT,
-         None, "0 → default"),
+         None, "Minimum horizontal ground speed for the yaw-from-course "
+         "fusion. Below it the course over ground is noise-dominated "
+         "(parking, reversing) and not used. 0 → default"),
         (("automotive_min_yaw_stddev_deg",), "Automotive min yaw stddev "
-         "[°]", FLOAT, None, "0 → default"),
+         "[°]", FLOAT, None,
+         "Lower limit of the yaw uncertainty assigned to the course "
+         "measurement. Raise it to cap how much the course is trusted, "
+         "regardless of speed. 0 → default"),
         (("automotive_lateral_constraint",),
          "Lateral velocity constraint",
          BOOL, None,
@@ -178,6 +185,11 @@ CONFIG_SECTIONS = [
          BOOL, None,
          "Never give up coasting, however long the outage. The position "
          "drifts without bound."),
+        (("kalman_update_dt_sec",), "INS kalman_update_dt [s]", FLOAT, None,
+         "Covariance prediction period of the navigation filter, the "
+         "strapdown integration still runs at the full IMU rate. The IMU "
+         "sample period predicts at the IMU rate: more accurate in turns, "
+         "but costly on a microcontroller. 0 → default"),
     ]),
     ("IMU noise model (required)", [
         (("imu", "gyr_psd"), "gyr_psd [(rad/s)²/Hz]", FLOAT, None,
@@ -189,74 +201,6 @@ CONFIG_SECTIONS = [
          "Gyro bias random walk"),
         (("imu", "acc_bias_rw"), "acc_bias_rw [m/s²/√s]", FLOAT, None,
          "Accelerometer bias random walk"),
-    ]),
-    ("INS process noise margin (ins only, optional, 0 = ins.c default)", [
-        (("imu", "pos_pred_stddev_m_sqrts"),
-         "pos_pred_stddev [m/√s]",
-         FLOAT, None,
-         "Extra process noise on top of the one derived from the "
-         "accelerometer and gyro noise. 0 → default"),
-        (("imu", "vel_pred_stddev_mps_sqrts"),
-         "vel_pred_stddev [m/s/√s]",
-         FLOAT, None,
-         "Extra velocity process noise. 0 → default. Often dominates the "
-         "error growth when the IMU noise is set tightly, see \"process noise "
-         "growth rate\" in the summary."),
-        (("imu", "rpy_pred_stddev_rad_sqrts"),
-         "rpy_pred_stddev [rad/√s]",
-         FLOAT, None,
-         "Extra attitude process noise of the INS only. ARS/AHRS have their "
-         "own value under \"ARS/AHRS noise model\" below. 0 → default"),
-    ]),
-    ("Auto-ZUPT/ZARU - one set for ins, ARS/AHRS and baro_alt "
-     "(optional, 0 = default)", [
-        (("imu", "zero_vel_stddev_mps"), "Zero-vel stddev [m/s]", FLOAT, None,
-         "How much a detected standstill's zero velocity is trusted. Tighter "
-         "→ faster bias and attitude convergence while parked, but riskier "
-         "on a false stop. Also used by baro_alt. 0 → default"),
-        (("imu", "zero_rot_stddev_deg"), "Zero-rot stddev [°/s]", FLOAT, None,
-         "Same for the zero-rotation update, used by ins and both AHRS "
-         "instances. 0 → this tool's default, which differs from the "
-         "library's."),
-        (("imu", "auto_zupt_static_gyr_stddev_deg"),
-         "Window stddev gyro [°/s]",
-         FLOAT, None,
-         "Main stillness criterion: maximum per-axis noise of the raw gyro "
-         "over a short window. Independent of the gyro bias."),
-        (("imu", "auto_zupt_static_acc_stddev_mps2"),
-         "Window stddev accel [m/s²]",
-         FLOAT, None,
-         "Same for the accelerometer."),
-        (("imu", "auto_zupt_static_gyr_deg"),
-         "Bound |gyro| [°/s]",
-         FLOAT, None,
-         "Additional loose limit on the gyro magnitude."),
-        (("imu", "auto_zupt_static_acc_mps2"),
-         "Bound ||f|-g| [m/s²]",
-         FLOAT, None,
-         "Additional loose limit on the deviation of the specific force from "
-         "gravity."),
-        (("imu", "auto_zupt_max_vel_mps"), "Max |GNSS vel| [m/s]", FLOAT, None,
-         "A standstill is only accepted below this GNSS speed. Only used "
-         "while a recent, precise fix exists, never the filter's own "
-         "velocity. Not used by ARS/AHRS."),
-        (("imu", "auto_zupt_max_vel_stddev_mps"),
-         "Max GNSS vel 1σ [m/s]",
-         FLOAT, None,
-         "The GNSS velocity must report at least this accuracy to count as "
-         "evidence of a standstill."),
-        (("imu", "auto_zupt_dwell_sec"), "Dwell [s]", FLOAT, None,
-         "How long the platform must look still before a trigger"),
-        (("imu", "auto_zupt_min_interval_sec"), "Min interval [s]",
-         FLOAT, None, "Minimum time between auto-triggers"),
-        (("imu", "auto_zupt_disable"), "Disable everywhere (0/1)",
-         FLOAT, None, "1 → no stillness detection anywhere in the suite"),
-        (("imu", "auto_zupt_velocity_blind_disable"),
-         "Disable ARS/AHRS detector (0/1)",
-         FLOAT, None,
-         "1: switch off only the own detector of ARS/AHRS, which cannot tell "
-         "constant-velocity cruise from standing still. ins keeps deciding "
-         "for all filters."),
     ]),
     ("IMU calibration (optional)", [
         (("imu", "acc_misalignment"), "acc misalignment (3x3 col-major)",
@@ -271,19 +215,34 @@ CONFIG_SECTIONS = [
         (("imu", "gyr_fixed_bias"), "gyr fixed bias [rad/s]", VEC, 3,
          "Removed permanently, never estimated"),
     ]),
-    ("Free inertial start (IMU dead reckoning only)", [
-        (("free_inertial_start", "enable"), "Enable", BOOL, None,
-         "Offers the start position below as a one-time position fix, then "
-         "dead reckons. Also lifts the dead-reckoning limit and the "
-         "GNSS-quality 3D exit."),
-        (("free_inertial_start", "lat_deg"), "Latitude [°]", FLOAT, None,
-         "Start position, REQUIRED when enabled"),
-        (("free_inertial_start", "lon_deg"), "Longitude [°]", FLOAT, None,
-         "Start position, REQUIRED when enabled"),
-        (("free_inertial_start", "height_m"), "Height [m]", FLOAT, None,
-         "Ellipsoidal height of the start position"),
-        (("free_inertial_start", "stddev_m"), "Stddev [m]", FLOAT, None,
-         "1σ of the declared position, must pass the 3D entry gate"),
+    ("Magnetometer", [
+        (("mag", "enable"), "Enable (needs mag.csv)", BOOL, None, None),
+        (("mag", "stddev_ut"), "Stddev [µT]", FLOAT, None,
+         "0 → default. Yaw noise is about stddev / horizontal field, so a "
+         "large value makes the magnetometer a slow, long-term yaw anchor "
+         "instead of a per-epoch yaw sensor."),
+        (("mag", "min_delay_ms"), "Min fusion delay [ms]", INT, None,
+         "Minimum time between two fusions. 0 → default, negative → fuse "
+         "every sample"),
+        (("mag", "wmm_year"), "WMM year (e.g. 2024.5)", FLOAT, None,
+         "0: magnetic north. > 0: apply the WMM declination for this year → "
+         "true north"),
+        (("mag", "estimate_bias"),
+         "Estimate hard-iron bias (18-state)",
+         BOOL, None,
+         "Estimates the hard-iron bias online (18-state filter). Needs "
+         "attitude changes to converge."),
+        (("mag", "misalignment"), "Soft-iron (3x3 col-major)", VEC, 9,
+         "all-zero → identity"),
+        (("mag", "fixed_bias"), "Hard-iron fixed bias [µT]", VEC, 3,
+         "Hard-iron offset that is removed permanently, never estimated."),
+    ]),
+    ("Barometer", [
+        (("baro", "enable"), "Enable (needs baro.csv)", BOOL, None, None),
+        (("baro", "stddev_m"), "Stddev [m]", FLOAT, None,
+         "Raw sensor accuracy, used by baro_alt and by the local/GNSS height "
+         "offset check. See the Baro_Alt group for baro_alt's own process "
+         "noise. 0 → default"),
     ]),
     ("GNSS", [
         (("gnss", "enable"), "Fuse GNSS fixes", BOOL, None,
@@ -424,57 +383,6 @@ CONFIG_SECTIONS = [
         (("gnss", "min_delay_ms"), "Min time between fusions [ms]", INT, None,
          "Rate limit of the GNSS fusion. 0 → default"),
     ]),
-    ("Initial-state stddev overrides (0 = built-in)", [
-        (("init_stddev", "pos_init_stddev_m"), "Position [m]",
-         FLOAT, None, "Initial position std.-dev."),
-        (("init_stddev", "vel_init_stddev_mps"), "Velocity [m/s]",
-         FLOAT, None, "Initial velocity std.-dev."),
-        (("init_stddev", "rpy_init_stddev_rad_deg"), "Attitude [°]",
-         FLOAT, None, "Initial attitude std.-dev."),
-        (("init_stddev", "yaw_init_stddev_rad_deg"), "Yaw [°]", FLOAT, None,
-         "Initial yaw std.-dev. 0 → same as the attitude value"),
-        (("init_stddev", "acc_bias_init_stddev_mps2"), "Acc bias [m/s²]",
-         FLOAT, None, "Initial accelerometer bias std.-dev."),
-        (("init_stddev", "gyr_bias_init_stddev_rps_deg"), "Gyr bias [°/s]",
-         FLOAT, None, "Initial gyroscope bias std.-dev."),
-    ]),
-    ("Initial attitude hint (auto-init only, optional)", [
-        (("init_hint", "roll_deg"), "Roll [°]", FLOAT, None,
-         "Known initial roll, used together with the pitch (both stddevs "
-         "must be > 0). Usually not needed: gravity already levels the "
-         "filter."),
-        (("init_hint", "pitch_deg"), "Pitch [°]", FLOAT, None,
-         "Known initial pitch, see roll above"),
-        (("init_hint", "rpy_stddev_deg"), "Roll/pitch stddev [°]", FLOAT, None,
-         "0 → no roll/pitch hint, the filter levels itself from gravity."),
-        (("init_hint", "yaw_deg"), "Yaw [°]", FLOAT, None,
-         "Known initial yaw, e.g. a known launch heading, for starts without "
-         "magnetometer or GNSS-course aiding."),
-        (("init_hint", "yaw_stddev_deg"), "Yaw stddev [°]", FLOAT, None,
-         "0 → no yaw hint, yaw stays unobservable until aiding arrives."),
-    ]),
-    ("Magnetometer", [
-        (("mag", "enable"), "Enable (needs mag.csv)", BOOL, None, None),
-        (("mag", "stddev_ut"), "Stddev [µT]", FLOAT, None,
-         "0 → default. Yaw noise is about stddev / horizontal field, so a "
-         "large value makes the magnetometer a slow, long-term yaw anchor "
-         "instead of a per-epoch yaw sensor."),
-        (("mag", "min_delay_ms"), "Min fusion delay [ms]", INT, None,
-         "Minimum time between two fusions. 0 → default, negative → fuse "
-         "every sample"),
-        (("mag", "wmm_year"), "WMM year (e.g. 2024.5)", FLOAT, None,
-         "0: magnetic north. > 0: apply the WMM declination for this year → "
-         "true north"),
-        (("mag", "estimate_bias"),
-         "Estimate hard-iron bias (18-state)",
-         BOOL, None,
-         "Estimates the hard-iron bias online (18-state filter). Needs "
-         "attitude changes to converge."),
-        (("mag", "misalignment"), "Soft-iron (3x3 col-major)", VEC, 9,
-         "all-zero → identity"),
-        (("mag", "fixed_bias"), "Hard-iron fixed bias [µT]", VEC, 3,
-         "Hard-iron offset that is removed permanently, never estimated."),
-    ]),
     ("GNSS heading (dual antenna)", [
         (("heading", "enable"), "Enable (needs heading.csv)", BOOL, None,
          "Azimuth of a moving-base baseline, e.g. NAV-RELPOSNED from the "
@@ -491,13 +399,6 @@ CONFIG_SECTIONS = [
          "Applied after scaling, 0 → no floor"),
         (("heading", "delay_ms"), "Delay [ms]", INT, None,
          "Age of a row at its timestamp. Start from the GNSS delay."),
-    ]),
-    ("Barometer", [
-        (("baro", "enable"), "Enable (needs baro.csv)", BOOL, None, None),
-        (("baro", "stddev_m"), "Stddev [m]", FLOAT, None,
-         "Raw sensor accuracy, used by baro_alt and by the local/GNSS height "
-         "offset check. See the Baro_Alt group for baro_alt's own process "
-         "noise. 0 → default"),
     ]),
     ("Absolute speed", [
         (("speed", "enable"), "Enable (needs speed.csv)", BOOL, None, None),
@@ -535,6 +436,169 @@ CONFIG_SECTIONS = [
          "coasting window) once the horizontal 1σ in its worst direction is "
          "at or below this. 0 → default"),
     ]),
+    ("Auto-ZUPT/ZARU - one set for ins, ARS/AHRS and baro_alt "
+     "(optional, 0 = default)", [
+        (("imu", "zero_vel_stddev_mps"), "Zero-vel stddev [m/s]", FLOAT, None,
+         "How much a detected standstill's zero velocity is trusted. Tighter "
+         "→ faster bias and attitude convergence while parked, but riskier "
+         "on a false stop. Also used by baro_alt. 0 → default"),
+        (("imu", "zero_rot_stddev_deg"), "Zero-rot stddev [°/s]", FLOAT, None,
+         "Same for the zero-rotation update, used by ins and both AHRS "
+         "instances. 0 → this tool's default, which differs from the "
+         "library's."),
+        (("imu", "auto_zupt_static_gyr_stddev_deg"),
+         "Window stddev gyro [°/s]",
+         FLOAT, None,
+         "Main stillness criterion: maximum per-axis noise of the raw gyro "
+         "over a short window. Independent of the gyro bias."),
+        (("imu", "auto_zupt_static_acc_stddev_mps2"),
+         "Window stddev accel [m/s²]",
+         FLOAT, None,
+         "Same for the accelerometer."),
+        (("imu", "auto_zupt_static_gyr_deg"),
+         "Bound |gyro| [°/s]",
+         FLOAT, None,
+         "Additional loose limit on the gyro magnitude."),
+        (("imu", "auto_zupt_static_acc_mps2"),
+         "Bound ||f|-g| [m/s²]",
+         FLOAT, None,
+         "Additional loose limit on the deviation of the specific force from "
+         "gravity."),
+        (("imu", "auto_zupt_max_vel_mps"), "Max |GNSS vel| [m/s]", FLOAT, None,
+         "A standstill is only accepted below this GNSS speed. Only used "
+         "while a recent, precise fix exists, never the filter's own "
+         "velocity. Not used by ARS/AHRS."),
+        (("imu", "auto_zupt_max_vel_stddev_mps"),
+         "Max GNSS vel 1σ [m/s]",
+         FLOAT, None,
+         "The GNSS velocity must report at least this accuracy to count as "
+         "evidence of a standstill."),
+        (("imu", "auto_zupt_dwell_sec"), "Dwell [s]", FLOAT, None,
+         "How long the platform must look still before a trigger"),
+        (("imu", "auto_zupt_min_interval_sec"), "Min interval [s]",
+         FLOAT, None, "Minimum time between auto-triggers"),
+        (("imu", "auto_zupt_disable"), "Disable everywhere (0/1)",
+         FLOAT, None, "1 → no stillness detection anywhere in the suite"),
+        (("imu", "auto_zupt_velocity_blind_disable"),
+         "Disable ARS/AHRS detector (0/1)",
+         FLOAT, None,
+         "1: switch off only the own detector of ARS/AHRS, which cannot tell "
+         "constant-velocity cruise from standing still. ins keeps deciding "
+         "for all filters."),
+    ]),
+    ("Initial attitude hint (auto-init only, optional)", [
+        (("init_hint", "roll_deg"), "Roll [°]", FLOAT, None,
+         "Known initial roll, used together with the pitch (both stddevs "
+         "must be > 0). Usually not needed: gravity already levels the "
+         "filter."),
+        (("init_hint", "pitch_deg"), "Pitch [°]", FLOAT, None,
+         "Known initial pitch, see roll above"),
+        (("init_hint", "rpy_stddev_deg"), "Roll/pitch stddev [°]", FLOAT, None,
+         "0 → no roll/pitch hint, the filter levels itself from gravity."),
+        (("init_hint", "yaw_deg"), "Yaw [°]", FLOAT, None,
+         "Known initial yaw, e.g. a known launch heading, for starts without "
+         "magnetometer or GNSS-course aiding."),
+        (("init_hint", "yaw_stddev_deg"), "Yaw stddev [°]", FLOAT, None,
+         "0 → no yaw hint, yaw stays unobservable until aiding arrives."),
+    ]),
+    ("Initial-state stddev overrides (0 = built-in)", [
+        (("init_stddev", "pos_init_stddev_m"), "Position [m]",
+         FLOAT, None, "Initial position std.-dev."),
+        (("init_stddev", "vel_init_stddev_mps"), "Velocity [m/s]",
+         FLOAT, None, "Initial velocity std.-dev."),
+        (("init_stddev", "rpy_init_stddev_rad_deg"), "Attitude [°]",
+         FLOAT, None, "Initial attitude std.-dev."),
+        (("init_stddev", "yaw_init_stddev_rad_deg"), "Yaw [°]", FLOAT, None,
+         "Initial yaw std.-dev. 0 → same as the attitude value"),
+        (("init_stddev", "acc_bias_init_stddev_mps2"), "Acc bias [m/s²]",
+         FLOAT, None, "Initial accelerometer bias std.-dev."),
+        (("init_stddev", "gyr_bias_init_stddev_rps_deg"), "Gyr bias [°/s]",
+         FLOAT, None, "Initial gyroscope bias std.-dev."),
+    ]),
+    ("Free inertial start (IMU dead reckoning only)", [
+        (("free_inertial_start", "enable"), "Enable", BOOL, None,
+         "Offers the start position below as a one-time position fix, then "
+         "dead reckons. Also lifts the dead-reckoning limit and the "
+         "GNSS-quality 3D exit."),
+        (("free_inertial_start", "lat_deg"), "Latitude [°]", FLOAT, None,
+         "Start position, REQUIRED when enabled"),
+        (("free_inertial_start", "lon_deg"), "Longitude [°]", FLOAT, None,
+         "Start position, REQUIRED when enabled"),
+        (("free_inertial_start", "height_m"), "Height [m]", FLOAT, None,
+         "Ellipsoidal height of the start position"),
+        (("free_inertial_start", "stddev_m"), "Stddev [m]", FLOAT, None,
+         "1σ of the declared position, must pass the 3D entry gate"),
+    ]),
+    ("INS process noise margin (ins only, optional, 0 = ins.c default)", [
+        (("imu", "pos_pred_stddev_m_sqrts"),
+         "pos_pred_stddev [m/√s]",
+         FLOAT, None,
+         "Extra process noise on top of the one derived from the "
+         "accelerometer and gyro noise. 0 → default"),
+        (("imu", "vel_pred_stddev_mps_sqrts"),
+         "vel_pred_stddev [m/s/√s]",
+         FLOAT, None,
+         "Extra velocity process noise. 0 → default. Often dominates the "
+         "error growth when the IMU noise is set tightly, see \"process noise "
+         "growth rate\" in the summary."),
+        (("imu", "rpy_pred_stddev_rad_sqrts"),
+         "rpy_pred_stddev [rad/√s]",
+         FLOAT, None,
+         "Extra attitude process noise of the INS only. ARS/AHRS have their "
+         "own value under \"ARS/AHRS noise model\" below. 0 → default"),
+    ]),
+    ("ARS/AHRS noise model (optional, 0 = ahrs.c default)", [
+        (("ahrs", "gyr_noise_psd"), "gyr_noise_psd [rad/s/√Hz]", FLOAT, None,
+         "Shared by ARS and AHRS (same physical gyro). 0 → √(imu.gyr_psd)"),
+        (("ahrs", "gyr_bias_rw"), "gyr_bias_rw [rad/s²/√Hz]", FLOAT, None,
+         "Shared by ARS and AHRS. 0 → imu.gyr_bias_rw"),
+        (("ahrs", "rpy_pred_stddev_rad_sqrts"), "rpy_pred_stddev [rad/√s]",
+         FLOAT, None,
+         "Extra attitude process noise of ARS and AHRS only, independent of "
+         "the INS value under \"INS process noise margin\". Tuning knob for "
+         "model errors (scale factor, misalignment, mounting), needed when "
+         "imu: holds a good sensor's own figure. 0 → none"),
+        (("ahrs", "acc_noise_mps2"), "acc_noise [m/s²]", FLOAT, None,
+         "Shared by ARS and AHRS (same accelerometer, used for leveling). 0 "
+         "→ default"),
+        (("ahrs", "gyr_bias_init_stddev_rps_deg"),
+         "gyr_bias_init stddev [°/s]",
+         FLOAT, None,
+         "Initial gyro bias uncertainty of both filters. 0 → stddev of the "
+         "static-window seed (or the default if the window found nothing)"),
+    ]),
+    ("ARS/AHRS leveling and heading tuning (optional, 0 = ahrs.c default)", [
+        (("ahrs", "acc_freq_hz"), "acc_freq [Hz]", FLOAT, None,
+         "Max. rate of accelerometer leveling corrections of ARS and AHRS. "
+         "0 → default"),
+        (("ahrs", "acc_cutoff_freq_hz"), "acc_cutoff_freq [Hz]", FLOAT, None,
+         "Accelerometer low-pass cut-off: tolerance against vibration at the "
+         "cost of delay. 0 → default"),
+        (("ahrs", "gravity_diff_penalty"), "gravity_diff_penalty", FLOAT, None,
+         "Extra distrust of the leveling update per m/s² of |acc| − g "
+         "(higher = more resistant to acceleration phases). 0 → default, "
+         "< 0 → off"),
+        (("ahrs", "acc_reject_gravity_mps2"), "acc_reject_gravity [m/s²]",
+         FLOAT, None,
+         "Hard-reject the leveling update while the low-passed | |acc| − g | "
+         "exceeds this. 0 → default, < 0 → never reject"),
+        (("ahrs", "chi2_threshold"), "chi2_threshold", FLOAT, None,
+         "χ² outlier gate of the accelerometer update, per scalar row. "
+         "0 → default"),
+        (("ahrs", "kalman_update_dt_sec"), "kalman_update_dt [s]", FLOAT,
+         None,
+         "Covariance prediction period, the attitude integration still runs "
+         "at the full IMU rate. 0 → default"),
+        (("ahrs", "mag_yaw_stddev_deg"), "mag_yaw_stddev [°]", FLOAT, None,
+         "Stddev of the magnetometer heading measurement (AHRS only). "
+         "0 → default"),
+        (("ahrs", "mag_freq_hz"), "mag_freq [Hz]", FLOAT, None,
+         "Max. rate of magnetometer heading corrections (AHRS only). "
+         "0 → default"),
+        (("ahrs", "mag_chi2_threshold"), "mag_chi2_threshold", FLOAT, None,
+         "χ² outlier gate of the heading update (AHRS only). "
+         "0 → default"),
+    ]),
     ("Baro_Alt (process noise, optional, 0 = baro_alt.c default)", [
         (("baro", "acc_noise_mps2_sqrthz"),
          "acc_noise [m/s²/√Hz]",
@@ -568,26 +632,6 @@ CONFIG_SECTIONS = [
          FLOAT, None,
          "Inflation applied to both sides of the baro/GNSS pair before they "
          "are combined into the measurement variance. 0 → default"),
-    ]),
-    ("ARS/AHRS noise model (optional, 0 = ahrs.c default)", [
-        (("ahrs", "gyr_noise_psd"), "gyr_noise_psd [rad/s/√Hz]", FLOAT, None,
-         "Shared by ARS and AHRS (same physical gyro). 0 → √(imu.gyr_psd)"),
-        (("ahrs", "gyr_bias_rw"), "gyr_bias_rw [rad/s²/√Hz]", FLOAT, None,
-         "Shared by ARS and AHRS. 0 → imu.gyr_bias_rw"),
-        (("ahrs", "rpy_pred_stddev_rad_sqrts"), "rpy_pred_stddev [rad/√s]",
-         FLOAT, None,
-         "Extra attitude process noise of ARS and AHRS only, independent of "
-         "the INS value under \"INS process noise margin\". Tuning knob for "
-         "model errors (scale factor, misalignment, mounting), needed when "
-         "imu: holds a good sensor's own figure. 0 → none"),
-        (("ahrs", "acc_noise_mps2"), "acc_noise [m/s²]", FLOAT, None,
-         "Shared by ARS and AHRS (same accelerometer, used for leveling). 0 "
-         "→ default"),
-        (("ahrs", "gyr_bias_init_stddev_rps_deg"),
-         "gyr_bias_init stddev [°/s]",
-         FLOAT, None,
-         "Initial gyro bias uncertainty of both filters. 0 → stddev of the "
-         "static-window seed (or the default if the window found nothing)"),
     ]),
     ("Scoring (evaluation only, never touches the filter)", [
         (("score", "leverarm_frd"), "Scoring lever arm FRD [m]", VEC, 3,
@@ -660,6 +704,20 @@ def merge_spec(raw):
     return spec
 
 
+def _value_sigma_rows(label, vals, sigmas, dec, width, label_w=None):
+    """Values and, right under them, their 1-sigma as two monospace rows
+    with the same decimals and field width, so each decimal point sits
+    below its value's. `label` heads the values row inline when `label_w`
+    is given, else it is a line of its own. The second row starts with
+    the ± in the label's place."""
+    sigmas = sigmas or (math.nan,) * len(vals)
+    v_row = " ".join(f"{v:+{width}.{dec}f}" for v in vals)
+    s_row = " ".join(f"{x:{width}.{dec}f}" for x in sigmas)
+    if label_w is None:
+        return f"{label}\n {v_row}\n±{s_row}"
+    return f"{label:<{label_w}} {v_row}\n{'±':>{label_w}} {s_row}"
+
+
 def load_raw_config(path):
     """Load config.yaml WITHOUT the defaults merge (the editor needs the raw
     keys to preserve unknown ones). `path` may be a dataset directory or the
@@ -674,8 +732,22 @@ def load_raw_config(path):
     raw = {}
     if os.path.exists(cfg_path):
         with open(cfg_path, encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
+            raw = yaml.safe_load(f)
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            raise ValueError(f"{cfg_path} is not an INSLIB config (top "
+                             f"level is a {type(raw).__name__}, expected "
+                             "key: value sections)")
     return raw, cfg_path, data_dir
+
+
+def looks_like_config(raw):
+    """False for a YAML mapping that shares no top-level key with the
+    config schema (a docker-compose file, a CI workflow, ...). An empty
+    file is fine, it is a config yet to be written."""
+    known = set(replay.DEFAULTS) | set(replay.FOREIGN_SECTIONS)
+    return not raw or any(k in known for k in raw)
 
 
 def validate_spec(spec, data_dir):
@@ -784,9 +856,11 @@ class ReplayWorker(QtCore.QThread):
     sig_error = QtCore.pyqtSignal(str, str)        # summary, details
 
     def __init__(self, spec, data_dir, realtime=False, speed=1.0,
-                 rec_hz=10.0, gnss_outages=(), parent=None):
+                 rec_hz=10.0, gnss_outages=(), smooth=False, parent=None):
         super().__init__(parent)
         self.spec = spec
+        # Run the RTS smoother after the replay (see _smooth()).
+        self.smooth = smooth
         self.data_dir = data_dir
         self.realtime = realtime
         self.speed = max(speed, 1e-6)
@@ -844,8 +918,12 @@ class ReplayWorker(QtCore.QThread):
         # the KML/Map tab track at its --kml-hz default.
         track = replay_core.TrackRecorder(50.0)
         kml = replay_core.KmlRecorder(2.0)
+        filter_score = ins_rts.EpochScore() if self.smooth else None
+        # The filter's solution for Export solution.
+        solution = ins_solution.SolutionRecorder(SOLUTION_HZ)
         r = replay_core.Replay(spec, inp, nav, observers=(
-            self._recorder, track, kml, _LiveTap(self)))
+            self._recorder, track, kml, _LiveTap(self), solution)
+            + ((filter_score,) if filter_score is not None else ()))
         n_total = r.n_imu_total
         self.sig_status.emit(f"Replaying {spec['name'] or data_dir} "
                              f"({n_total} IMU samples) ...")
@@ -898,6 +976,12 @@ class ReplayWorker(QtCore.QThread):
         with self.lock:
             rec.update(extra)
 
+        rts = None
+        if self.smooth and not r.aborted:
+            last_pct[0] = -1
+            rts = self._smooth(spec, inp, r, filter_score, lines, progress,
+                               before_epoch)
+
         return {
             "text": "\n".join(lines),
             "rec": rec,
@@ -928,7 +1012,48 @@ class ReplayWorker(QtCore.QThread):
             "att_rms_deg": ((r.e_roll.rms(), r.e_pitch.rms(), r.e_yaw.rms())
                             if r.e_yaw.n else None),
             "scored_epochs": r.e_pos.n,
+            "rts": rts,
+            "solution": solution.solution(),
+            "gps_clock": inp.gps_clock,
         }
+
+    def _smooth(self, spec, inp, r, filter_score, lines, progress,
+                before_epoch):
+        """The RTS smoother over the replay just done (ins_rts.run_smoother:
+        its own forward pass without a coasting limit, then the backward
+        pass). Appends its summary to `lines`, adds the rts_* series to
+        self.rec (ins_rts.add_rec_series, plus rec["rts_lines"], the
+        summary lines, for the PDF) and returns the results entry: the 3D
+        trail (NED points + breaks), the KML/map track and the scores, or
+        None if it was stopped."""
+        self.sig_status.emit("RTS smoother: forward pass with unlimited "
+                             "dead reckoning ...")
+        t_start = time.perf_counter()
+        smr = ins_rts.run_smoother(spec, inp, progress=progress,
+                                   before_epoch=before_epoch)
+        if smr is None:
+            lines += ["", "RTS smoother: stopped by user, no smoothed solution"]
+            return None
+        self.sig_status.emit("RTS smoother: preparing the results ...")
+        rts = smr.rts
+        score_la = tuple(spec["score"].get("leverarm_frd") or (0.0, 0.0, 0.0))
+        f_score = ins_rts.score_filter(filter_score)
+        s_score = ins_rts.score_rts(smr.score, score_la)
+        lines.append("")
+        n_before = len(lines)
+        lines += ins_rts.score_lines(f_score, s_score, rts.n_cuts)
+        lines.append(f"  {time.perf_counter() - t_start:.1f} s, "
+                     f"{len(rts.k_epoch)} knots, {rts.memory_mb():.0f} MB recorded")
+
+        frame = (r.origin_ecef, r.origin_lat, r.origin_lon)
+        trail, breaks = ins_rts.trail(smr, *frame)
+        with self.lock:
+            ins_rts.add_rec_series(self.rec, smr, r.t0_us, *frame, score_la)
+            self.rec["rts_lines"] = lines[n_before:]
+        return {"trail": trail, "breaks": breaks,
+                "kml_est": ins_rts.kml_track(smr, r.t0_us),
+                "solution": ins_rts.solution(smr, SOLUTION_HZ),
+                "filter": f_score, "rts": s_score, "cuts": rts.n_cuts}
 
     def _update_live(self, nav, t, t0_us, duration, acc, gyr, run=None):
         rpy = nav.rpy()  # best available: ins, else AHRS, else ARS
@@ -1140,19 +1265,54 @@ def _rotate_ned_mesh(base_verts, R):
     return v
 
 
+def _break_segments(points_ned, breaks):
+    """'lines' vertex pairs (display frame x, -y, -z) for NED points with
+    append_trail()'s break flags, or None with nothing to draw."""
+    if len(points_ned) < 2:
+        return None
+    pts = np.array([(p[0], -p[1], -p[2]) for p in points_ned],
+                   dtype=np.float32)
+    end = np.nonzero(~np.array(breaks[1:], dtype=bool))[0] + 1
+    if not len(end):
+        return None
+    seg = np.empty((2 * len(end), 3), dtype=np.float32)
+    seg[0::2], seg[1::2] = pts[end - 1], pts[end]
+    return seg
+
+
+def _nice_spacing(raw):
+    """Smallest 1-2-5 step (1, 2, 5, 10, ...) that is >= raw."""
+    decade = 10.0 ** math.floor(math.log10(raw))
+    for mant in (1.0, 2.0, 5.0, 10.0):
+        if mant * decade >= raw:
+            return mant * decade
+    return 10.0 * decade
+
+
 class Position3DView(gl.GLViewWidget):
     manual_pan_requested = QtCore.pyqtSignal()
+    grid_spacing_changed = QtCore.pyqtSignal(float)  # [m] now on screen
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.opts['distance'] = 50
         self.opts['elevation'] = 35
         self.opts['azimuth'] = 170
+        self.orbit_label = QtWidgets.QLabel(self)
+        self.orbit_label.setAttribute(
+            QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.orbit_label.setStyleSheet(
+            MONO + " background: rgba(0, 0, 0, 140); color: #ddd;"
+            " padding: 2px 6px; border-radius: 3px;")
+        self.orbit_label.hide()
 
         self.grid = gl.GLGridItem()
-        self.grid.setSize(x=2000, y=2000)
-        self.grid.setSpacing(x=50, y=50)
+        self._grid_fixed = None  # user's spacing [m], None = automatic
+        self._grid_spacing = None
+        self._grid_cells = None
+        self._grid_origin = None
         self.addItem(self.grid)
+        self._update_grid()
         L = 20
         for end, col in (([L, 0, 0], (1, 0.3, 0.3, 1)),
                          ([0, -L, 0], (0.3, 0.8, 0.3, 1)),
@@ -1170,6 +1330,16 @@ class Position3DView(gl.GLViewWidget):
         self.addItem(self.ghost_item)
         self._ghost_wanted = True
         self._ghost_has_data = False
+
+        # The RTS smoother's solution of this run, drawn once the run is
+        # done (same 'lines' pairs as the trail).
+        self.rts_item = gl.GLLinePlotItem(
+            pos=np.zeros((2, 3), dtype=np.float32), width=1.5,
+            antialias=ANTIALIAS, mode='lines', glOptions=GL_BLEND)
+        self.rts_item.setVisible(False)
+        self.addItem(self.rts_item)
+        self._rts_wanted = True
+        self._rts_has_data = False
 
         self.trail_points = []      # display frame (x, -y, -z)
         self.trail_speeds = []
@@ -1246,6 +1416,42 @@ class Position3DView(gl.GLViewWidget):
         self.addItem(self.vehicle_item)
         theme.themed(self._restyle)
 
+    def set_grid_spacing(self, spacing):
+        """Fixed grid spacing [m], None for automatic (follows the zoom)."""
+        self._grid_fixed = spacing
+        self._update_grid()
+        self.update()
+
+    def grid_spacing(self):
+        return self._grid_spacing
+
+    def _update_grid(self):
+        """Size the grid to the zoom: spacing from the camera distance (or
+        the user's value), edge length a few distances, centred under the
+        view and snapped to the spacing so the lines stay put on pan."""
+        dist = max(float(self.opts['distance']), 1e-3)
+        sp = self._grid_fixed or _nice_spacing(dist / GRID_TARGET_CELLS)
+        cells = int(min(GRID_MAX_CELLS,
+                        math.ceil(GRID_SPAN_FACTOR * dist / sp)))
+        cells = max(2, cells + cells % 2)
+        c = self.opts['center']
+        origin = (round(c.x() / sp) * sp, round(c.y() / sp) * sp)
+        if (sp, cells) != (self._grid_spacing, self._grid_cells):
+            self.grid.setSize(x=cells * sp, y=cells * sp)
+            self.grid.setSpacing(x=sp, y=sp)
+            self._grid_cells = cells
+        if origin != self._grid_origin:
+            self.grid.resetTransform()
+            self.grid.translate(origin[0], origin[1], 0)
+            self._grid_origin = origin
+        if sp != self._grid_spacing:
+            self._grid_spacing = sp
+            self.grid_spacing_changed.emit(sp)
+
+    def paintGL(self, *args, **kwargs):
+        self._update_grid()
+        super().paintGL(*args, **kwargs)
+
     def _restyle(self):
         self.setBackgroundColor(theme.T["gl_bg"])
         grid = pg.mkColor(theme.T["gl_grid"])
@@ -1253,6 +1459,7 @@ class Position3DView(gl.GLViewWidget):
         self.grid.setColor(grid)
         self.ref_item.setData(color=theme.rgba("ref_trail", 0.6))
         self.ghost_item.setData(color=theme.rgba("ghost", 0.8))
+        self.rts_item.setData(color=theme.rgba("rts", 0.9))
         self.fix_item.setData(color=theme.rgba("fix", 0.9))
         self.zupt_item.setData(color=theme.rgba("zupt", 0.9))
         self.anchor_item.setData(color=theme.rgba("anchor", 1.0))
@@ -1426,18 +1633,27 @@ class Position3DView(gl.GLViewWidget):
     def set_ghost(self, points_ned, breaks):
         """Draw a previous run's trail, NED points with the same break
         flags as append_trail(). Empty clears it."""
-        seg = None
-        if len(points_ned) >= 2:
-            pts = np.array([(p[0], -p[1], -p[2]) for p in points_ned],
-                           dtype=np.float32)
-            end = np.nonzero(~np.array(breaks[1:], dtype=bool))[0] + 1
-            if len(end):
-                seg = np.empty((2 * len(end), 3), dtype=np.float32)
-                seg[0::2], seg[1::2] = pts[end - 1], pts[end]
+        seg = _break_segments(points_ned, breaks)
         self._ghost_has_data = seg is not None
         if seg is not None:
             self.ghost_item.setData(pos=seg, color=theme.rgba("ghost", 0.8))
         self.ghost_item.setVisible(self._ghost_wanted and self._ghost_has_data)
+
+    def set_rts(self, points_ned, breaks):
+        """Draw the RTS smoother's trail, NED points with the same break
+        flags as append_trail(). Empty clears it."""
+        seg = _break_segments(points_ned, breaks)
+        self._rts_has_data = seg is not None
+        if seg is not None:
+            self.rts_item.setData(pos=seg, color=theme.rgba("rts", 0.9))
+        self.rts_item.setVisible(self._rts_wanted and self._rts_has_data)
+
+    def has_rts(self):
+        return self._rts_has_data
+
+    def set_rts_visible(self, on):
+        self._rts_wanted = on
+        self.rts_item.setVisible(on and self._rts_has_data)
 
     def set_ghost_visible(self, on):
         self._ghost_wanted = on
@@ -1521,6 +1737,7 @@ class Position3DView(gl.GLViewWidget):
         self.trail_item.setData(pos=z2,
                                 color=np.zeros((2, 4), dtype=np.float32))
         self.ref_item.setData(pos=z2)
+        self.set_rts([], [])
 
     def mousePressEvent(self, ev):
         # Middle-button drag is GLViewWidget's own pan gesture: honour the
@@ -1529,6 +1746,51 @@ class Position3DView(gl.GLViewWidget):
         if ev.button() == QtCore.Qt.MouseButton.MiddleButton:
             self.manual_pan_requested.emit()
         super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        super().mouseMoveEvent(ev)
+        if (ev.buttons() == QtCore.Qt.MouseButton.LeftButton
+                and not ev.modifiers()
+                & QtCore.Qt.KeyboardModifier.ControlModifier):
+            self._show_orbit_readout()
+
+    def mouseReleaseEvent(self, ev):
+        self.orbit_label.hide()
+        super().mouseReleaseEvent(ev)
+
+    def _show_orbit_readout(self):
+        """Azimuth/elevation of the camera, only while orbiting."""
+        self.orbit_label.setText(
+            f"Azimuth: {self.opts['azimuth'] % 360.0:.0f}°   "
+            f"Elevation: {self.opts['elevation']:.0f}°")
+        self.orbit_label.adjustSize()
+        self._place_orbit_label()
+        self.orbit_label.show()
+
+    def _place_orbit_label(self):
+        lab = self.orbit_label
+        lab.move(self.width() - lab.width() - 8,
+                 self.height() - lab.height() - 8)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._place_orbit_label()
+
+    def pan(self, dx, dy, dz, relative='global'):
+        if relative != 'view-upright':
+            return super().pan(dx, dy, dz, relative)
+        # pyqtgraph derives the horizontal axes from cross(z, view), which
+        # is zero looking straight down or up (elevation +-90) and the pan
+        # dies there. The azimuth alone gives the same axes at any elevation.
+        cPos = self.cameraPosition()
+        dist = (self.opts['center'] - cPos).length()
+        scale = (dist * 2.0 * math.tan(0.5 * math.radians(self.opts['fov']))
+                 / self.width())
+        az = math.radians(self.opts['azimuth'])
+        c, s = math.cos(az), math.sin(az)
+        self.opts['center'] = self.opts['center'] + QtGui.QVector3D(
+            s * dx - c * dy, -c * dx - s * dy, dz) * scale
+        self.update()
 
 class AttitudeView(gl.GLViewWidget):
     def __init__(self, parent=None):
@@ -1560,20 +1822,40 @@ class AttitudeView(gl.GLViewWidget):
 
 
 class GBubbleWidget(QtWidgets.QWidget):
+    """Body x/y acceleration as a bubble. The outer ring is not a fixed
+    range: a car or a walking pedestrian moves the bubble by a few tenths
+    of a g, so the ring snaps to the smallest of SCALES_G that holds the
+    recent peak, widens at once and narrows again slowly."""
     FILTER_ALPHA = 0.15
+    SCALES_G = (0.2, 0.5, 1.0, 2.0, 4.0, 8.0)
+    HEADROOM = 1.15      # the peak sits below the ring
+    PEAK_DECAY = 0.995   # per update, so a few seconds
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(80, 80)
         self.acc_x = 0.0
         self.acc_y = 0.0
-        self.scale_g = 1.5
+        self.scale_g = self.SCALES_G[0]
+        self._peak_g = 0.0
         theme.themed(self.update)
+
+    def reset(self):
+        """Back to the centre, e.g. when the replay is over: the bubble
+        otherwise stays where the file happened to end."""
+        self.acc_x = self.acc_y = self._peak_g = 0.0
+        self.scale_g = self.SCALES_G[0]
+        self.update()
 
     def set_acceleration(self, ax_g, ay_g):
         a = self.FILTER_ALPHA
         self.acc_x += a * (ax_g - self.acc_x)
         self.acc_y += a * (ay_g - self.acc_y)
+        self._peak_g = max(math.hypot(self.acc_x, self.acc_y),
+                           self._peak_g * self.PEAK_DECAY)
+        need = self._peak_g * self.HEADROOM
+        self.scale_g = next((x for x in self.SCALES_G if x >= need),
+                            self.SCALES_G[-1])
         self.update()
 
     def paintEvent(self, _event):
@@ -1594,6 +1876,12 @@ class GBubbleWidget(QtWidgets.QWidget):
         fill.setAlpha(180)
         p.setBrush(QtGui.QBrush(fill))
         p.drawEllipse(QtCore.QPointF(bx, by), 5, 5)
+        # The outer ring's value, since it changes.
+        p.setPen(QtGui.QColor(theme.T["dim"]))
+        p.drawText(QtCore.QRectF(0, 0, w - 2, h),
+                   QtCore.Qt.AlignmentFlag.AlignRight
+                   | QtCore.Qt.AlignmentFlag.AlignBottom,
+                   f"{self.scale_g:g} g")
 
 
 class TrailLegend(QtWidgets.QWidget):
@@ -1604,6 +1892,7 @@ class TrailLegend(QtWidgets.QWidget):
     OVERLAYS = {
         "ref": ("Reference", "line", "ref_trail"),
         "ghost": ("Previous run", "line", "ghost"),
+        "rts": ("RTS smoother", "line", "rts"),
         "fix": ("GNSS fix", "dot", "fix"),
         "zupt": ("ZUPT/ZARU", "dot", "zupt"),
         "anchor": ("Anchor", "dot", "anchor"),
@@ -1645,6 +1934,26 @@ class TrailLegend(QtWidgets.QWidget):
             p.drawText(QtCore.QPointF(x, mid + fm.ascent() / 2 - 1), txt)
             x += w + 5
 
+        # The overlays sit on the left, the speed ramp is right-aligned so
+        # it ends up next to the "Red at" combo box that scales it.
+        range_txt = f"0 … {self._vmax:.1f} m/s"
+        for key in self._shown:
+            name, kind, pal = self.OVERLAYS[key]
+            col = QtGui.QColor(theme.T[pal])
+            if kind == "line":
+                p.setPen(QtGui.QPen(col, 2))
+                p.drawLine(QtCore.QPointF(x, mid), QtCore.QPointF(x + 14, mid))
+                x += 19
+            else:
+                p.setPen(QtCore.Qt.PenStyle.NoPen)
+                p.setBrush(col)
+                p.drawEllipse(QtCore.QPointF(x + 4, mid), 3, 3)
+                x += 12
+            label(name)
+            x += 10
+        speed_w = (fm.horizontalAdvance("Speed") + 5 + self.RAMP_W + 5
+                   + fm.horizontalAdvance(range_txt))
+        x = max(x, self.width() - speed_w - 4)
         label("Speed")
         ramp = QtCore.QRectF(x, mid - 4, self.RAMP_W, 8)
         grad = QtGui.QLinearGradient(ramp.left(), 0, ramp.right(), 0)
@@ -1657,21 +1966,7 @@ class TrailLegend(QtWidgets.QWidget):
         p.setBrush(QtGui.QBrush(grad))
         p.drawRoundedRect(ramp, 2, 2)
         x = ramp.right() + 5
-        label(f"0 … {self._vmax:.1f} m/s")
-        for key in self._shown:
-            name, kind, pal = self.OVERLAYS[key]
-            col = QtGui.QColor(theme.T[pal])
-            x += 10
-            if kind == "line":
-                p.setPen(QtGui.QPen(col, 2))
-                p.drawLine(QtCore.QPointF(x, mid), QtCore.QPointF(x + 14, mid))
-                x += 19
-            else:
-                p.setPen(QtCore.Qt.PenStyle.NoPen)
-                p.setBrush(col)
-                p.drawEllipse(QtCore.QPointF(x + 4, mid), 3, 3)
-                x += 12
-            label(name)
+        label(range_txt)
 
 
 # ============================================================================
@@ -1684,6 +1979,12 @@ class _NoWheelComboBox(QtWidgets.QComboBox):
 
     def wheelEvent(self, event):
         event.ignore()  # lets the enclosing scroll area handle it
+
+
+# Subtle tint behind the label of a field that differs from its default.
+# Translucent so it works on light and dark themes.
+NON_DEFAULT_STYLE = ("background-color: rgba(255, 170, 0, 55);"
+                     " border-radius: 3px; padding: 0 3px;")
 
 
 class ConfigEditor(QtWidgets.QScrollArea):
@@ -1699,6 +2000,7 @@ class ConfigEditor(QtWidgets.QScrollArea):
         self._raw = {}
         self._baseline = {}  # collect() right after the last load()
         self._widgets = {}  # path -> (kind, extra, widget)
+        self._labels = {}  # path -> QLabel
         body = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(body)
         for section, fields in CONFIG_SECTIONS:
@@ -1715,6 +2017,7 @@ class ConfigEditor(QtWidgets.QScrollArea):
                     lbl.setToolTip(tip)
                 form.addRow(lbl, w)
                 self._widgets[path] = (kind, extra, w)
+                self._labels[path] = lbl
                 # The user-only signals: load() sets values programmatically
                 # and must not count as an edit.
                 if kind == BOOL:
@@ -1726,6 +2029,7 @@ class ConfigEditor(QtWidgets.QScrollArea):
             lay.addWidget(box)
         lay.addStretch()
         self.setWidget(body)
+        self.changed.connect(self._update_marks)
         self.load({})  # schema defaults, and the baseline for is_dirty()
 
     @staticmethod
@@ -1768,6 +2072,47 @@ class ConfigEditor(QtWidgets.QScrollArea):
             else:
                 w.setText(self._fmt(val))
         self._baseline = self.collect()[0]
+        self._update_marks()
+
+    @staticmethod
+    def _parse(kind, extra, w):
+        """Widget content as a config value, ValueError if malformed."""
+        if kind == BOOL:
+            return 1 if w.isChecked() else 0
+        if kind == CHOICE:
+            return w.currentText()
+        txt = w.text().strip()
+        if kind == STR:
+            return txt
+        if kind == INT:
+            return int(float(txt)) if txt else 0
+        if kind == VEC:
+            parts = [p for p in w.text().replace(",", " ").split() if p]
+            val = [float(p) for p in parts] if parts else [0.0] * extra
+            if len(val) != extra:
+                raise ValueError(f"expected {extra} values")
+            return val
+        return float(txt) if txt else 0.0
+
+    @staticmethod
+    def _differs(path, kind, extra, val):
+        dflt = _schema_default(path, kind, extra)
+        if isinstance(dflt, (list, tuple)):
+            return list(val) != [float(x) for x in dflt]
+        if kind == BOOL:
+            return val != int(dflt)
+        return val != dflt
+
+    def _update_marks(self):
+        """Tint the label of every field that deviates from its default."""
+        for path, (kind, extra, w) in self._widgets.items():
+            try:
+                differs = self._differs(path, kind, extra,
+                                        self._parse(kind, extra, w))
+            except ValueError:
+                differs = True
+            lbl = self._labels[path]
+            lbl.setStyleSheet(NON_DEFAULT_STYLE if differs else "")
 
     def is_dirty(self):
         """Does the form differ from what load() put in?"""
@@ -1782,37 +2127,11 @@ class ConfigEditor(QtWidgets.QScrollArea):
         for path, (kind, extra, w) in self._widgets.items():
             name = ".".join(path)
             try:
-                if kind == BOOL:
-                    val = 1 if w.isChecked() else 0
-                elif kind == CHOICE:
-                    val = w.currentText()
-                elif kind == STR:
-                    val = w.text().strip()
-                elif kind == INT:
-                    txt = w.text().strip()
-                    val = int(float(txt)) if txt else 0
-                elif kind == VEC:
-                    parts = [p for p in
-                             w.text().replace(",", " ").split() if p]
-                    if not parts:
-                        val = [0.0] * extra
-                    else:
-                        val = [float(p) for p in parts]
-                    if len(val) != extra:
-                        raise ValueError(f"expected {extra} values")
-                else:
-                    txt = w.text().strip()
-                    val = float(txt) if txt else 0.0
+                val = self._parse(kind, extra, w)
             except ValueError as e:
                 errors.append(f"{name}: {e}")
                 continue
-            dflt = _schema_default(path, kind, extra)
-            if isinstance(dflt, (list, tuple)):
-                differs = list(val) != [float(x) for x in dflt]
-            elif kind == BOOL:
-                differs = val != int(dflt)
-            else:
-                differs = val != dflt
+            differs = self._differs(path, kind, extra, val)
             if differs or _get_path(self._raw, path) is not None:
                 _set_path(raw, path, val)
         return raw, errors
@@ -1835,6 +2154,7 @@ def populate_plots(glw, rec, warmup_end_sec, leverarm_comp=False):
     PEN_SIG = theme.pen("sigma", 1.0, theme.DOT)
     PEN_WARM = theme.pen("warm", 1.0, theme.DASH)
     PEN_EXTRA = theme.pen("extra", 1.5)
+    PEN_RTS = theme.pen("rts", 1.5)
     t = np.asarray(rec["t"], dtype=float)
     if t.size == 0:
         glw.addLabel("no recorded samples (filter never initialized?)")
@@ -1857,6 +2177,10 @@ def populate_plots(glw, rec, warmup_end_sec, leverarm_comp=False):
     acc_bias = arr("acc_bias")
     gyr_bias_sig = arr("gyr_bias_sigma")
     acc_bias_sig = arr("acc_bias_sigma")
+    # The RTS smoother's series (ReplayWorker._smooth), drawn next to the
+    # filter's where present.
+    has_rts = ("rts_pos" in rec and len(rec["rts_pos"]) == len(t)
+               and np.isfinite(arr("rts_pos")).any())
 
     time_plots = []
 
@@ -1876,9 +2200,14 @@ def populate_plots(glw, rec, warmup_end_sec, leverarm_comp=False):
     for i, (axis, pen) in enumerate((("N", PEN_N), ("E", PEN_E),
                                      ("D", PEN_D))):
         p = add_time_plot(f"pos error {axis} [m]", "m")
-        p.plot(t, pos_err[:, i], pen=pen, connect="finite")
+        if has_rts and i == 0:
+            p.addLegend(offset=(10, 10))
+        p.plot(t, pos_err[:, i], pen=pen, connect="finite", name="filter")
         p.plot(t, pos_sig[:, i], pen=PEN_SIG, connect="finite")
         p.plot(t, -pos_sig[:, i], pen=PEN_SIG, connect="finite")
+        if has_rts:
+            p.plot(t, arr("rts_pos_err_ned")[:, i], pen=PEN_RTS,
+                   connect="finite", name="RTS")
     glw.nextRow()
     # Row 2: attitude error + 1-sigma band
     for i, (axis, pen) in enumerate((("roll", PEN_N), ("pitch", PEN_E),
@@ -1887,6 +2216,9 @@ def populate_plots(glw, rec, warmup_end_sec, leverarm_comp=False):
         p.plot(t, rpy_err[:, i], pen=pen, connect="finite")
         p.plot(t, rpy_sig[:, i], pen=PEN_SIG, connect="finite")
         p.plot(t, -rpy_sig[:, i], pen=PEN_SIG, connect="finite")
+        if has_rts:
+            p.plot(t, arr("rts_rpy_err_deg")[:, i], pen=PEN_RTS,
+                   connect="finite")
     glw.nextRow()
 
     # Row 3: NE map, altitude profile, downweight counters
@@ -1899,6 +2231,10 @@ def populate_plots(glw, rec, warmup_end_sec, leverarm_comp=False):
                   connect="finite", name="truth")
     map_plot.plot(pos[:, 1], pos[:, 0], pen=PEN_N, connect="finite",
                   name="estimate")
+    if has_rts:
+        rts_pos = arr("rts_pos")
+        map_plot.plot(rts_pos[:, 1], rts_pos[:, 0], pen=PEN_RTS,
+                      connect="finite", name="RTS")
 
     alt = add_time_plot("altitude (-D) [m]", "m")
     alt.addLegend(offset=(10, 10))
@@ -1908,6 +2244,9 @@ def populate_plots(glw, rec, warmup_end_sec, leverarm_comp=False):
     alt.plot(t, alt_est + alt_sig, pen=PEN_SIG, connect="finite")
     alt.plot(t, alt_est - alt_sig, pen=PEN_SIG, connect="finite")
     alt.plot(t, -ref_pos[:, 2], pen=PEN_REF, connect="finite", name="truth")
+    if has_rts:
+        alt.plot(t, -arr("rts_pos")[:, 2], pen=PEN_RTS, connect="finite",
+                 name="RTS")
     baro_h = arr("baro_h_d")
     if np.isfinite(baro_h).any():
         alt.plot(t, -baro_h, pen=PEN_E, connect="finite", name="baro_alt")
@@ -1934,6 +2273,10 @@ def populate_plots(glw, rec, warmup_end_sec, leverarm_comp=False):
         gb.plot(t, center, pen=pen, connect="finite", name=axis)
         gb.plot(t, center + sigma, pen=PEN_SIG, connect="finite")
         gb.plot(t, center - sigma, pen=PEN_SIG, connect="finite")
+        if has_rts:
+            gb.plot(t, np.degrees(arr("rts_gyr_bias")[:, i]),
+                    pen=theme.pen("trace", 1.0, theme.DASH, index=i),
+                    connect="finite")
     ab = add_time_plot("ins accel bias [m/s²]", "m/s²")
     ab.addLegend(offset=(10, 10))
     for i, (axis, pen) in enumerate((("x", PEN_N), ("y", PEN_E),
@@ -1943,6 +2286,10 @@ def populate_plots(glw, rec, warmup_end_sec, leverarm_comp=False):
         ab.plot(t, center, pen=pen, connect="finite", name=axis)
         ab.plot(t, center + sigma, pen=PEN_SIG, connect="finite")
         ab.plot(t, center - sigma, pen=PEN_SIG, connect="finite")
+        if has_rts:
+            ab.plot(t, arr("rts_acc_bias")[:, i],
+                    pen=theme.pen("trace", 1.0, theme.DASH, index=i),
+                    connect="finite")
     vel = arr("vel")
     ref_vel = arr("ref_vel")
     sp = add_time_plot("horizontal speed [m/s]", "m/s")
@@ -1951,6 +2298,50 @@ def populate_plots(glw, rec, warmup_end_sec, leverarm_comp=False):
             connect="finite", name="ins")
     sp.plot(t, np.hypot(ref_vel[:, 0], ref_vel[:, 1]), pen=PEN_REF,
             connect="finite", name="truth")
+    if has_rts:
+        rts_vel = arr("rts_vel")
+        sp.plot(t, np.hypot(rts_vel[:, 0], rts_vel[:, 1]), pen=PEN_RTS,
+                connect="finite", name="RTS")
+
+    # Row 5: GNSS fix quality, transport latency, satellites and receiver
+    # integrity, where the data has them (gnss.csv's trailing columns,
+    # timesync.csv), see ins_plots._gnss_quality_page
+    q_t = np.asarray(rec.get("gnss_q_t") or [], dtype=float)
+    q = np.asarray(rec.get("gnss_q") or [], dtype=float)
+    lat_t = np.asarray(rec.get("gnss_lat_t") or [], dtype=float)
+    lat = np.asarray(rec.get("gnss_lat_ms") or [], dtype=float)
+    if (q.size or lat.size or rec.get("gnss_sv")
+            or any(any(v) for v in (rec.get("gnss_ind") or {}).values())):
+        glw.nextRow()
+    if q.size:
+        qp = add_time_plot("GNSS fix quality (1 fix, 2 float, 4 dgnss, 5 single)",
+                           "Q")
+        qp.plot(q_t, q, pen=None, symbol="o", symbolSize=3,
+                symbolPen=None, symbolBrush=theme.T["fix"])
+        qp.getViewBox().invertY(True)   # best (1) on top
+    if lat.size:
+        lp = add_time_plot("GNSS transport latency [ms]", "ms")
+        lp.plot(lat_t, lat, pen=None, symbol="o", symbolSize=3,
+                symbolPen=None, symbolBrush=theme.T["trace"][0])
+        delay = rec.get("gnss_delay_ms")
+        if delay is not None:
+            lp.addItem(pg.InfiniteLine(pos=delay, angle=0, pen=PEN_REF))
+    # Satellites used and the receiver's interference/authentication
+    # states (gnss.csv num_sv, jamming, spoofing, sig_auth, nav_auth)
+    sv_t = np.asarray(rec.get("gnss_sv_t") or [], dtype=float)
+    sv = np.asarray(rec.get("gnss_sv") or [], dtype=float)
+    ind = {k: v for k, v in (rec.get("gnss_ind") or {}).items() if any(v)}
+    if sv.size:
+        svp = add_time_plot("GNSS satellites used", "n")
+        svp.plot(sv_t, sv, pen=PEN_N)
+    if ind:
+        ip = add_time_plot("GNSS integrity (jamming/spoofing 1 none, 2 warning,"
+                           " 3 critical, auth 1 no, 2 yes, 3 failed)", "state")
+        ip.addLegend(offset=(10, 10))
+        ind_t = np.asarray(rec.get("gnss_ind_t") or [], dtype=float)
+        for i, (key, vals) in enumerate(ind.items()):
+            ip.plot(ind_t, np.asarray(vals, dtype=float), name=key,
+                    pen=theme.pen("trace", 1.0, index=i))
 
     for p in time_plots:
         p.setLabel('bottom', 't [s]')
@@ -1961,7 +2352,12 @@ def populate_plots(glw, rec, warmup_end_sec, leverarm_comp=False):
 # ============================================================================
 
 UI_UPDATE_HZ = 30
+SOLUTION_HZ = 25.0  # Export solution rate [Hz of sim time]
 SPEED_SCALE_PRESETS = (1, 2, 5, 10, 20, 40, 100)  # m/s, trail colour ramp
+GRID_SPACING_PRESETS = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000)  # m
+GRID_TARGET_CELLS = 8  # auto: cells between the camera and the centre
+GRID_SPAN_FACTOR = 6.0  # grid edge length in camera distances
+GRID_MAX_CELLS = 400  # per axis, bounds the line count at fine spacings
 # Time constant of the low-pass on the attitude shown (wall clock, so the
 # smoothing does not depend on how often the UI timer manages to fire).
 ATTITUDE_SMOOTH_TAU_S = 0.08
@@ -2018,6 +2414,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_dir = None
         self._run_cfg = None
         self._run_unsaved = False
+        # Replays stopped by opening another dataset, still winding down.
+        self._stale_workers = []
         self._smooth_t = None
         self._title_name = None
 
@@ -2050,7 +2448,8 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addWidget(browse)
         tb.addSeparator()
 
-        self.run_btn = QtWidgets.QPushButton("▶ Run")
+        self.run_btn = QtWidgets.QPushButton("▶  Run")
+        self.run_btn.setObjectName("primary")  # green, see ins_gui_theme
         self.run_btn.setToolTip("Replay the dataset (F5)")
         self.run_btn.clicked.connect(self._on_run)
         tb.addWidget(self.run_btn)
@@ -2099,6 +2498,20 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addWidget(self.outage_edit)
         tb.addSeparator()
 
+        self.chk_smooth = QtWidgets.QCheckBox("RTS smoother")
+        self.chk_smooth.setToolTip(
+            "After the replay, run the offline RTS smoother "
+            "(tools/ins_rts.py, like replay.py --smooth): a second forward "
+            "pass in which ins never stops dead reckoning, so the smoother "
+            "can bridge an outage the real-time filter gives up on, then "
+            "the backward pass. Shown as its own trail, in the plots and in "
+            "the summary. Its forward pass records every epoch and takes "
+            "several times as long as the replay itself.")
+        # Not remembered: it costs several times the replay, so every start
+        # begins with it off and a user has to ask for it.
+        tb.addWidget(self.chk_smooth)
+        tb.addSeparator()
+
         self.pdf_btn = QtWidgets.QPushButton("Export PDF")
         self.pdf_btn.setToolTip("Multi-page ins_plots PDF (same pages as "
                                 "replay.py --plot --plot-out)")
@@ -2111,6 +2524,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.kml_btn.setEnabled(False)
         self.kml_btn.clicked.connect(self._on_export_kml)
         tb.addWidget(self.kml_btn)
+        self.sol_btn = QtWidgets.QPushButton("Export solution")
+        self.sol_btn.setToolTip(
+            "The filter's solution as a file (like replay.py --dump-solution): "
+            "CSV in the ref.csv format plus 1-sigma columns, or an RTKLIB "
+            ".pos (GPS time from the dataset's timesync.csv, without one "
+            "guessed from the system clock, the file says so). "
+            "With the RTS smoother on, its solution goes next to it as "
+            "<name>_rts.")
+        self.sol_btn.setEnabled(False)
+        self.sol_btn.clicked.connect(self._on_export_solution)
+        tb.addWidget(self.sol_btn)
         tb.addSeparator()
 
         tb.addWidget(QtWidgets.QLabel(" Theme: "))
@@ -2121,6 +2545,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.theme_combo.findData(theme.name()))
         self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
         tb.addWidget(self.theme_combo)
+        tb.addSeparator()
+        help_btn = QtWidgets.QPushButton("?")
+        help_btn.setToolTip("Keyboard and mouse shortcuts (F1)")
+        help_btn.setFixedWidth(28)
+        help_btn.clicked.connect(self._on_help)
+        tb.addWidget(help_btn)
 
     def _build_central(self):
         self.tabs = QtWidgets.QTabWidget()
@@ -2157,7 +2587,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scale_combo.lineEdit().editingFinished.connect(
             self._on_speed_scale_edited)
         legend_row.addWidget(self.scale_combo)
+        legend_row.addWidget(QtWidgets.QLabel("Grid:"))
+        self.grid_combo = QtWidgets.QComboBox()
+        self.grid_combo.setToolTip(
+            "Spacing of the 3D view's ground grid. auto: follows the zoom "
+            "in 1-2-5 steps. A fixed value keeps the lines at that "
+            "distance, e.g. to measure by eye.")
+        self.grid_combo.addItems(
+            ["auto"] + [f"{v:g} m" for v in GRID_SPACING_PRESETS])
+        self.grid_combo.activated.connect(self._on_grid_spacing_selected)
+        legend_row.addWidget(self.grid_combo)
+        self.lbl_grid = QtWidgets.QLabel("")
+        self.lbl_grid.setMinimumWidth(60)
+        self.pos_view.grid_spacing_changed.connect(
+            lambda sp: self.lbl_grid.setText(f"{sp:g} m"))
+        legend_row.addWidget(self.lbl_grid)
         left.addLayout(legend_row)
+        saved_grid = self.settings.value("grid_spacing", "auto")
+        self.grid_combo.setCurrentText(
+            saved_grid if self.grid_combo.findText(saved_grid) >= 0
+            else "auto")
+        self._on_grid_spacing_selected()
         saved = self.settings.value("speed_scale", "auto")
         self.scale_combo.setCurrentText(
             saved if self._parse_speed_scale(saved) is not None
@@ -2173,20 +2623,24 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: self.chk_follow.setChecked(False))
         self.chk_ref = QtWidgets.QCheckBox("Reference")
         self.chk_ref.setToolTip("ref.csv (or inputs: ref) as the green "
-                                "line: the ground truth the score uses")
+                                "line: the ground truth the score uses. Also on the Map tab.")
         self.chk_ghost = QtWidgets.QCheckBox("Previous run")
         self.chk_ghost.setToolTip("The previous run of this dataset as a "
                                   "grey trail, to compare a config change "
                                   "against")
+        self.chk_rts = QtWidgets.QCheckBox("RTS")
+        self.chk_rts.setToolTip("The RTS smoother's solution of this run "
+                                "(toolbar: RTS smoother) as its own trail, "
+                                "here and on the Map tab")
         self.chk_fix = QtWidgets.QCheckBox("GNSS fixes")
         self.chk_fix.setToolTip("gnss.csv (or inputs: gnss) as yellow dots, "
                                 "one per fix, whether the filter fused it "
                                 "or not. With aiding: ref these are the "
-                                "fixes synthesized from the reference.")
+                                "fixes synthesized from the reference. Also on the Map tab.")
         self.chk_zupt = QtWidgets.QCheckBox("ZUPT/ZARU")
         self.chk_zupt.setToolTip("Dots on the trail wherever a zero-velocity "
                                  "or zero-angular-rate update was applied "
-                                 "(ins auto-ZUPT, baro_alt vertical ZUPT, "
+                                 "(INS auto-ZUPT, baro_alt vertical ZUPT, "
                                  "ARS/AHRS ZARU). A standstill shows as a "
                                  "cluster. Needs the 3D solution, the trail "
                                  "is the ins position.")
@@ -2200,15 +2654,17 @@ class MainWindow(QtWidgets.QMainWindow):
         # changed does not carry over.
         for chk, key, default, apply in (
                 (self.chk_ref, "show_ref", True,
-                 self.pos_view.set_ref_visible),
+                 self._set_ref_visible),
                 (self.chk_fix, "show_fix", True,
-                 self.pos_view.set_fix_visible),
+                 self._set_fix_visible),
                 (self.chk_zupt, "show_zupt", False,
                  self.pos_view.set_zupt_visible),
                 (self.chk_anchor, "show_anchors", True,
                  self.pos_view.set_anchor_visible),
                 (self.chk_ghost, "show_previous_run", False,
-                 self._set_ghost_visible)):
+                 self._set_ghost_visible),
+                (self.chk_rts, "show_rts", True,
+                 self._set_rts_visible)):
             on = self.settings.value(key, default, type=bool)
             chk.setChecked(on)
             apply(on)
@@ -2303,7 +2759,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # --- Map tab ---
         self.map_view = MapView()
+        self.map_view.set_ref_visible(self.chk_ref.isChecked())
+        self.map_view.set_fix_visible(self.chk_fix.isChecked())
         self.map_view.set_ghost_visible(self.chk_ghost.isChecked())
+        self.map_view.set_rts_visible(self.chk_rts.isChecked())
         self.tabs.addTab(self.map_view, "Map")
 
         # --- Summary tab ---
@@ -2355,29 +2814,44 @@ class MainWindow(QtWidgets.QMainWindow):
         theme.themed(self._style_findings)
         self.result_frame.setVisible(False)
 
-        v, _ = frame("Attitude (± 1σ)")
+        v, _ = frame("Attitude / Bias (± 1σ)")
         h = QtWidgets.QHBoxLayout()
         num = QtWidgets.QVBoxLayout()
         self.lbl_roll = QtWidgets.QLabel()
         self.lbl_pitch = QtWidgets.QLabel()
         self.lbl_yaw = QtWidgets.QLabel()
+        self.lbl_gyr_bias = QtWidgets.QLabel()
+        self.lbl_acc_bias = QtWidgets.QLabel()
         for lbl in (self.lbl_roll, self.lbl_pitch, self.lbl_yaw):
             lbl.setStyleSheet(MONO)
             num.addWidget(lbl)
-        num.addStretch()
-        h.addLayout(num, 1)
-        self.attitude_view = AttitudeView()
-        self.attitude_view.setMinimumSize(160, 160)
-        h.addWidget(self.attitude_view, 1)
-        v.addLayout(h)
-
-        v, _ = frame("Bias estimates (± 1σ)")
-        self.lbl_gyr_bias = QtWidgets.QLabel()
-        self.lbl_acc_bias = QtWidgets.QLabel()
+        num.addSpacing(6)
         for lbl in (self.lbl_gyr_bias, self.lbl_acc_bias):
             lbl.setStyleSheet(MONO)
-            lbl.setWordWrap(True)
-            v.addWidget(lbl)
+            num.addWidget(lbl)
+        num.addStretch()
+        h.addLayout(num, 0)
+        # Reserve the size of the filled-in text up front: empty labels
+        # would let the 3D view start large and shrink on the first tick,
+        # and "n/a" would shrink it again. The placeholder is measured,
+        # then cleared, so no NaNs show before the first result.
+        nan = math.nan
+        placeholder = {
+            self.lbl_roll: f"Roll:  {nan:+7.1f}° ± {nan:5.2f}°",
+            self.lbl_gyr_bias: _value_sigma_rows(
+                "Gyro [°/s]", (nan,) * 3, None, 3, 6),
+            self.lbl_acc_bias: _value_sigma_rows(
+                "Accel [m/s²]", (nan,) * 3, None, 3, 6)}
+        for lbl, text in placeholder.items():
+            lbl.setText(text)
+            lbl.setMinimumSize(lbl.sizeHint())
+            lbl.setText("")
+        for lbl in (self.lbl_pitch, self.lbl_yaw):
+            lbl.setMinimumSize(self.lbl_roll.minimumSize())
+        self.attitude_view = AttitudeView()
+        self.attitude_view.setMinimumSize(140, 160)
+        h.addWidget(self.attitude_view, 1)
+        v.addLayout(h)
 
         v, _ = frame("Position / Velocity (± 1σ)")
         self.lbl_pos = QtWidgets.QLabel()
@@ -2410,6 +2884,19 @@ class MainWindow(QtWidgets.QMainWindow):
         for lbl in (self.lbl_acc, self.lbl_dw):
             lbl.setStyleSheet(MONO)
             col.addWidget(lbl)
+        self.chk_dynacc = QtWidgets.QCheckBox("Gravity removed")
+        self.chk_dynacc.setToolTip(
+            "On: the motion's acceleration, the specific force with the "
+            "gravity the attitude estimate predicts taken out and the "
+            "accelerometer bias corrected. Level and unaccelerated it "
+            "reads zero. Off: the raw accelerometer, which also shows the "
+            "tilt (1 g times sin of pitch or roll) and reads 1 g at rest.")
+        self.chk_dynacc.setChecked(
+            self.settings.value("bubble_dynamic", True, type=bool))
+        self.chk_dynacc.toggled.connect(
+            lambda c: self.settings.setValue("bubble_dynamic", c))
+        self.chk_dynacc.toggled.connect(lambda _c: self.g_bubble.reset())
+        col.addWidget(self.chk_dynacc)
         col.addStretch()
         h.addLayout(col, 1)
         self.g_bubble = GBubbleWidget()
@@ -2436,8 +2923,84 @@ class MainWindow(QtWidgets.QMainWindow):
         add("Ctrl+O", self._on_browse)
         add("Ctrl+S", self._on_cfg_save)
         add("Ctrl+Shift+S", self._on_cfg_save_as)
+        add("F1", self._on_help)
         for i in range(self.tabs.count()):
             add(f"Ctrl+{i + 1}", lambda i=i: self.tabs.setCurrentIndex(i))
+
+    @staticmethod
+    def _motion_acc(f, rpy, bias):
+        """Body acceleration without gravity from the accelerometer's
+        specific force f: a = f - bias + g_body, where g_body is gravity
+        (down in NED) rotated into the body frame by the estimated roll and
+        pitch. None without an attitude."""
+        if rpy is None:
+            return None
+        sr, cr = math.sin(rpy[0]), math.cos(rpy[0])
+        sp, cp = math.sin(rpy[1]), math.cos(rpy[1])
+        b = bias or (0.0, 0.0, 0.0)
+        return (f[0] - b[0] - GRAVITY * sp,
+                f[1] - b[1] + GRAVITY * sr * cp,
+                f[2] - b[2] + GRAVITY * cr * cp)
+
+    def _on_help(self):
+        """Keyboard and mouse cheat sheet."""
+        tab_rows = tuple((f"Ctrl+{i + 1}", f"Tab {self.tabs.tabText(i)}")
+                         for i in range(self.tabs.count()))
+
+        def table(title, rows):
+            body = "".join(f"<tr><td style='padding-right:18px'>"
+                           f"<b>{k}</b></td><td>{d}</td></tr>"
+                           for k, d in rows)
+            return f"<h4>{title}</h4><table>{body}</table>"
+
+        html = (
+            table("Keyboard", (
+                ("F5", "Run the replay"),
+                ("Space", "Pause / resume"),
+                ("Esc", "Stop, keeps the partial results"),
+                ("Ctrl+O", "Open a config"),
+                ("Ctrl+S / Ctrl+Shift+S", "Save the config / save as"),
+                ) + tab_rows + (("F1", "This help"),)) +
+            table("3D view (Replay tab)", (
+                ("Left drag", "Orbit, azimuth and elevation show while "
+                              "dragging"),
+                ("Ctrl + left drag", "Pan in the screen plane"),
+                ("Middle drag", "Pan over the ground (switches Follow off)"),
+                ("Ctrl + middle drag", "Pan horizontally and up/down"),
+                ("Wheel", "Zoom"),
+                ("Ctrl + wheel", "Field of view"))) +
+            table("Map and plots", (
+                ("Left drag", "Pan"),
+                ("Wheel", "Zoom"),
+                ("Right drag", "Zoom each axis separately"),
+                ("Right click", "Plot menu, e.g. export the plot"),
+                ("A (button, lower left)", "Auto-range, show everything"))))
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Shortcuts")
+        lay = QtWidgets.QVBoxLayout(dlg)
+        head = QtWidgets.QHBoxLayout()
+        logo = QtGui.QPixmap(LOGO)
+        if not logo.isNull():
+            pic = QtWidgets.QLabel()
+            pic.setPixmap(logo.scaledToHeight(
+                72, QtCore.Qt.TransformationMode.SmoothTransformation))
+            head.addWidget(pic)
+        about = QtWidgets.QLabel(
+            "<h2 style='margin:0'>INSLIB</h2>Jan Zwiener<br>"
+            "<a href='https://github.com/jnz/INSLIB'>"
+            "github.com/jnz/INSLIB</a>")
+        about.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        about.setOpenExternalLinks(True)
+        head.addWidget(about)
+        head.addStretch()
+        lay.addLayout(head)
+        lbl = QtWidgets.QLabel(html)
+        lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        lay.addWidget(lbl)
+        close = QtWidgets.QPushButton("Close")
+        close.clicked.connect(dlg.accept)
+        lay.addWidget(close, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        dlg.exec()
 
     def _on_space(self):
         # The shortcut swallows the key everywhere, so hand it on to what
@@ -2465,6 +3028,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         return v if math.isfinite(v) and v > 0.0 else None
 
+    def _on_grid_spacing_selected(self, *_):
+        text = self.grid_combo.currentText()
+        self.settings.setValue("grid_spacing", text)
+        self.pos_view.set_grid_spacing(
+            None if text == "auto" else float(text.replace("m", "")))
+        self.lbl_grid.setText(f"{self.pos_view.grid_spacing():g} m")
+
     def _on_speed_scale_edited(self, *_):
         text = self.scale_combo.currentText().strip()
         vmax = self._parse_speed_scale(text)
@@ -2481,11 +3051,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_legend(self, *_):
         shown = [key for key, chk in (("ref", self.chk_ref),
                                       ("ghost", self.chk_ghost),
+                                      ("rts", self.chk_rts),
                                       ("fix", self.chk_fix),
                                       ("zupt", self.chk_zupt),
                                       ("anchor", self.chk_anchor))
                  if chk.isChecked()
-                 and (key != "anchor" or self.pos_view.anchor_points)]
+                 and (key != "anchor" or self.pos_view.anchor_points)
+                 and (key != "rts" or self.pos_view.has_rts())]
         self.legend.set_overlays(shown)
 
     def _style_findings(self):
@@ -2545,6 +3117,23 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Error",
                                            f"Could not load config:\n{e}")
             return False
+        if not looks_like_config(raw):
+            keys = ", ".join(str(k) for k in list(raw)[:6])
+            if QtWidgets.QMessageBox.question(
+                    self, "Not an INSLIB config?",
+                    f"{cfg_path}\nhas none of the config sections "
+                    f"(top-level keys: {keys}).\nOpen it anyway?",
+                    QtWidgets.QMessageBox.StandardButton.Yes
+                    | QtWidgets.QMessageBox.StandardButton.No,
+                    QtWidgets.QMessageBox.StandardButton.No
+                    ) != QtWidgets.QMessageBox.StandardButton.Yes:
+                return False
+        # Another config of the same dataset keeps the run on screen: it
+        # becomes the ghost the next run is compared against.
+        if (self.data_dir is not None
+                and os.path.normpath(data_dir)
+                != os.path.normpath(self.data_dir)):
+            self._clear_for_other_dataset()
         self.data_dir = data_dir
         self.cfg_path = cfg_path
         self.editor.load(raw)
@@ -2648,6 +3237,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Empty the 3D view (ghost aside) and the altitude profile, a
         running replay keeps drawing from the next sample on."""
         self.pos_view.reset_trail()
+        self._update_legend()
         self.legend.set_scale(self.pos_view.speed_scale())
         self._shown_from = self._drained
         self._fix_shown_from = self._fix_drained
@@ -2804,6 +3394,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._run_unsaved = self.editor.is_dirty()
         self._keep_ghost()
+        self._reset_run_view()
+
+        self.worker = ReplayWorker(spec, self.data_dir,
+                                   realtime=self.chk_realtime.isChecked(),
+                                   speed=self.speed_combo.currentData(),
+                                   gnss_outages=outages,
+                                   smooth=self.chk_smooth.isChecked())
+        self.worker.sig_status.connect(self.statusBar().showMessage)
+        self.worker.sig_progress.connect(self.progress.setValue)
+        self.worker.sig_finished.connect(self._on_finished)
+        self.worker.sig_error.connect(self._on_worker_error)
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.setChecked(False)
+        self.worker.start()
+
+    def _reset_run_view(self):
+        """Empty everything a run draws (the ghost aside, see _keep_ghost):
+        3D trail, anchors, altitude profile, plots, summary, exports."""
         self.results = None
         self._drained = 0
         self._fix_drained = 0
@@ -2817,6 +3427,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._smooth_t = None
         self.pos_view.reset_trail()
         self.pos_view.clear_anchors()
+        self._update_legend()
         self.legend.set_scale(self.pos_view.speed_scale())
         self.plots_widget.clear()
         self.summary_text.setPlainText("")
@@ -2824,21 +3435,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.setTabText(self.TAB_SUMMARY, "Summary")
         self.pdf_btn.setEnabled(False)
         self.kml_btn.setEnabled(False)
+        self.sol_btn.setEnabled(False)
         self.progress.setValue(0)
 
-        self.worker = ReplayWorker(spec, self.data_dir,
-                                   realtime=self.chk_realtime.isChecked(),
-                                   speed=self.speed_combo.currentData(),
-                                   gnss_outages=outages)
-        self.worker.sig_status.connect(self.statusBar().showMessage)
-        self.worker.sig_progress.connect(self.progress.setValue)
-        self.worker.sig_finished.connect(self._on_finished)
-        self.worker.sig_error.connect(self._on_worker_error)
-        self.run_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.pause_btn.setEnabled(True)
-        self.pause_btn.setChecked(False)
-        self.worker.start()
+    def _clear_for_other_dataset(self):
+        """A different dataset was opened: nothing on screen belongs to it.
+        A replay still running is stopped and cut loose, else it would go
+        on drawing the old dataset into the emptied views."""
+        w = self.worker
+        if w is not None and w.isRunning():
+            w.stop()
+            for sig in (w.sig_status, w.sig_progress, w.sig_finished,
+                        w.sig_error):
+                sig.disconnect()
+            self._stale_workers = [x for x in self._stale_workers
+                                   if x.isRunning()] + [w]
+            self._run_ended()
+            self.progress.setValue(0)
+        self.worker = None
+        self._ghost = None
+        self._run_dir = None
+        self.pos_view.set_ghost([], [])
+        self._reset_run_view()
+        self.alt_curve_est.clear()
+        self.alt_curve_ref.clear()
+        self.map_view.clear()
 
     def _keep_ghost(self):
         """Turn the run on screen into the ghost of the one about to start.
@@ -2879,6 +3500,21 @@ class MainWindow(QtWidgets.QMainWindow):
         g["origin"] = tuple(origin_ecef)
         self.pos_view.set_ghost(g["points"], g["breaks"])
 
+    def _set_ref_visible(self, on):
+        self.pos_view.set_ref_visible(on)
+        if hasattr(self, "map_view"):  # built after the Replay tab
+            self.map_view.set_ref_visible(on)
+
+    def _set_fix_visible(self, on):
+        self.pos_view.set_fix_visible(on)
+        if hasattr(self, "map_view"):  # built after the Replay tab
+            self.map_view.set_fix_visible(on)
+
+    def _set_rts_visible(self, on):
+        self.pos_view.set_rts_visible(on)
+        if hasattr(self, "map_view"):  # built after the Replay tab
+            self.map_view.set_rts_visible(on)
+
     def _set_ghost_visible(self, on):
         self.pos_view.set_ghost_visible(on)
         if hasattr(self, "map_view"):  # built after the Replay tab
@@ -2902,13 +3538,20 @@ class MainWindow(QtWidgets.QMainWindow):
         populate_plots(self.plots_widget, results["rec"],
                        results.get("warmup_end_sec", 0.0),
                        self.chk_leverarm.isChecked())
+        rts = results.get("rts")
         self.map_view.set_tracks(
             [(row[1], row[2]) for row in results["kml_est"]],
             [(row[0], row[1]) for row in results["kml_ref"]],
             results["fix_latlon"],
-            self._ghost["est_latlon"] if self._ghost else ())
+            self._ghost["est_latlon"] if self._ghost else (),
+            [(row[1], row[2]) for row in rts["kml_est"]] if rts is not None else ())
+        rts = results.get("rts")
+        if rts is not None:
+            self.pos_view.set_rts(rts["trail"], rts["breaks"])
+            self._update_legend()
         self.pdf_btn.setEnabled(True)
         self.kml_btn.setEnabled(bool(results["kml_est"]))
+        self.sol_btn.setEnabled(len(results["solution"]) > 0)
         rms = results["pos_rms_m"]
         prev = self._ghost["rms"] if self._ghost else None
         worst, digest = findings_digest(results["findings"])
@@ -2919,6 +3562,8 @@ class MainWindow(QtWidgets.QMainWindow):
                   + (f" ({os.path.basename(self._ghost['cfg'])})"
                      if self._ghost["cfg"] != self.cfg_path else "")
                   if prev is not None else "")
+               + (f", RTS pos rms {rts['rts']['pos_rms']:.2f} m"
+                  if rts is not None and rts["rts"].get("n") else "")
                + (f", findings: {digest}" if worst > replay.SEV_OK else "")
                + (" [STOPPED]" if results["aborted"] else ""))
         self.statusBar().showMessage(msg)
@@ -2940,6 +3585,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 lines.append(f"att rms r/p/y {r:.2f} / {p:.2f} / {y:.2f}\u00b0")
         else:
             lines.append("no scored epochs (no reference)")
+        rts = results.get("rts")
+        if rts is not None and rts["rts"].get("n"):
+            s = rts["rts"]
+            lines.append(f"RTS pos rms {s['pos_rms']:.2f} m   "
+                         f"max {s['pos_max']:.2f} m   ({s['n']} epochs)")
+            r, p, y = (math.hypot(*s[k][:2]) for k in ("roll", "pitch", "yaw"))
+            lines.append(f"RTS att rms r/p/y {r:.2f} / {p:.2f} / {y:.2f}°")
         if prev is not None and results["scored_epochs"]:
             delta = results["pos_rms_m"] - prev
             other = (f" ({os.path.basename(self._ghost['cfg'])})"
@@ -2972,6 +3624,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_btn.setEnabled(False)
         self.pause_btn.setEnabled(False)
         self.progress.setValue(100)
+        self.g_bubble.reset()
 
     # --- exports ---------------------------------------------------------
     def _on_export_pdf(self):
@@ -3013,8 +3666,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             from ins_kml import write_kml
+            rts = self.results.get("rts")
             write_kml(path, self.results["kml_est"], self.results["kml_ref"],
-                      self.results["kml_fix"], self.results["name"])
+                      self.results["kml_fix"], self.results["name"],
+                      rts_track=rts["kml_est"] if rts is not None else ())
             self.statusBar().showMessage(f"wrote {path}")
         except ImportError:
             QtWidgets.QMessageBox.warning(
@@ -3022,6 +3677,51 @@ class MainWindow(QtWidgets.QMainWindow):
                 "KML export needs simplekml: pip install simplekml")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "KML export failed", str(e))
+
+    def _on_export_solution(self):
+        if not self.results:
+            return
+        default = os.path.join(self.data_dir or ".",
+                               f"{self.results['name']}_solution.csv")
+        path, chosen = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export solution", default,
+            "CSV, ref.csv format + 1-sigma (*.csv);;RTKLIB solution (*.pos)")
+        if not path:
+            return
+        # The filter picks the format when the name has no extension of
+        # its own.
+        if not os.path.splitext(path)[1]:
+            path += ".pos" if "*.pos" in chosen else ".csv"
+        try:
+            written = self.write_solution(path)
+            self.statusBar().showMessage("wrote " + ", ".join(written))
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Solution export failed", str(e))
+
+    def write_solution(self, path):
+        """Write the last run's solution to `path` (format by extension,
+        ins_solution.write), and the RTS smoother's next to it as
+        <name>_rts when it ran. Returns the paths written."""
+        res = self.results
+        clock = res.get("gps_clock")
+        rts = res.get("rts")
+        if clock is None:
+            # The same guess for both files, so they stay comparable, from
+            # whichever of the two has an epoch.
+            firsts = [sol.t_us[0] for sol in (res["solution"],
+                                               rts["solution"] if rts else None)
+                      if sol is not None and len(sol)]
+            if firsts:
+                clock = ins_solution.guessed_clock(min(firsts))
+        ins_solution.write(path, res["solution"], clock,
+                           comment="INSLIB nav_suite solution, inspostgui.py")
+        written = [path]
+        if rts is not None:
+            rts_path = ins_solution.companion_path(path, "_rts")
+            ins_solution.write(rts_path, rts["solution"], clock,
+                               comment="INSLIB RTS smoother solution, inspostgui.py")
+            written.append(rts_path)
+        return written
 
     def _on_theme_changed(self):
         name = self.theme_combo.currentData()
@@ -3141,36 +3841,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_yaw.setText(f"Yaw:   {math.degrees(rpy[2]):+7.1f}° "
                                  f"± {math.degrees(rs[2]):5.2f}°")
         gyr_bias = live.get("gyr_bias")
-        gyr_bias_sigma = live.get("gyr_bias_sigma")
         if gyr_bias is not None:
-            gs = gyr_bias_sigma or (math.nan, math.nan, math.nan)
-            self.lbl_gyr_bias.setText(
-                f"Gyro [°/s]:\n"
-                f"  ({math.degrees(gyr_bias[0]):+6.3f}, "
-                f"{math.degrees(gyr_bias[1]):+6.3f}, "
-                f"{math.degrees(gyr_bias[2]):+6.3f})\n"
-                f"± ({math.degrees(gs[0]):.3f}, {math.degrees(gs[1]):.3f}, "
-                f"{math.degrees(gs[2]):.3f})")
+            self.lbl_gyr_bias.setText(_value_sigma_rows(
+                "Gyro [°/s]", [math.degrees(x) for x in gyr_bias],
+                [math.degrees(x) for x in live.get("gyr_bias_sigma") or ()],
+                3, 6))
         else:
             self.lbl_gyr_bias.setText("Gyro: n/a")
         acc_bias = live.get("acc_bias")
-        acc_bias_sigma = live.get("acc_bias_sigma")
         if acc_bias is not None:
-            accs = acc_bias_sigma or (math.nan, math.nan, math.nan)
-            self.lbl_acc_bias.setText(
-                f"Accel [m/s²]:\n"
-                f"  ({acc_bias[0]:+6.3f}, {acc_bias[1]:+6.3f}, "
-                f"{acc_bias[2]:+6.3f})\n"
-                f"± ({accs[0]:.3f}, {accs[1]:.3f}, {accs[2]:.3f})")
+            self.lbl_acc_bias.setText(_value_sigma_rows(
+                "Accel [m/s²]", acc_bias, live.get("acc_bias_sigma"), 3, 6))
         else:
             self.lbl_acc_bias.setText("Accel: n/a")
         pos, vel, llh = live.get("pos"), live.get("vel"), live.get("llh")
-        pos_sigma, vel_sigma = live.get("pos_sigma"), live.get("vel_sigma")
         if pos is not None:
-            ps = pos_sigma or (math.nan, math.nan, math.nan)
-            self.lbl_pos.setText(f"NED: ({pos[0]:+9.1f}, {pos[1]:+9.1f}, "
-                                 f"{pos[2]:+7.1f}) m\n"
-                                 f"± ({ps[0]:.2f}, {ps[1]:.2f}, {ps[2]:.2f}) m")
+            self.lbl_pos.setText(_value_sigma_rows(
+                "NED [m]", pos, live.get("pos_sigma"), 2, 9, label_w=9))
         if llh is not None:
             self.lbl_llh.setText(f"Lat {llh[0]:11.7f}°  Lon {llh[1]:11.7f}°"
                                  f"  Alt {llh[2]:7.1f} m")
@@ -3178,30 +3865,34 @@ class MainWindow(QtWidgets.QMainWindow):
         baro_h_sigma = live.get("baro_h_sigma")
         gnss_off = live.get("local_gnss_offset")
         gnss_off_sigma = live.get("local_gnss_offset_sigma")
-        if baro_h is not None:
-            baro_txt = f"{baro_h:7.1f} ± {baro_h_sigma:.2f} m"
-        else:
-            baro_txt = "N/A"
-        if gnss_off is not None:
-            offset_txt = f"{gnss_off:+6.2f} ± {gnss_off_sigma:.2f} m"
-        else:
-            offset_txt = "N/A"
-        self.lbl_baro.setText(f"Baro alt: {baro_txt}\n"
-                              f"GNSS offset: {offset_txt}")
+        # Ellipsoid height of the datum origin against the local height
+        # reference: the barometer, else ins under local position aiding.
+        # nav_suite runs no offset filter under GNSS alone (N/A then).
+        off_label = "Baro→ell." if baro_h is not None else "Local→ell."
+        rows = []
+        for label, val, sig in (("Baro alt", baro_h, baro_h_sigma),
+                                (off_label, gnss_off, gnss_off_sigma)):
+            if val is None:
+                rows.append(f"{label + ':':<13}N/A")
+            else:
+                rows.append(f"{label + ':':<13}{val:+8.2f} ± {sig:.2f} m")
+        self.lbl_baro.setText("\n".join(rows))
         if vel is not None:
             speed = math.sqrt(sum(x * x for x in vel))
-            vs = vel_sigma or (math.nan, math.nan, math.nan)
-            self.lbl_vel.setText(f"Vel NED: ({vel[0]:+6.2f}, {vel[1]:+6.2f},"
-                                 f" {vel[2]:+6.2f}) m/s "
-                                 f"± ({vs[0]:.2f}, {vs[1]:.2f}, {vs[2]:.2f})\n"
-                                 f"|v| = {speed:5.2f} m/s  "
-                                 f"({speed * 3.6:5.1f} km/h)")
+            self.lbl_vel.setText(
+                _value_sigma_rows("Vel [m/s]", vel, live.get("vel_sigma"),
+                                  2, 7, label_w=9) + "\n"
+                f"|v| = {speed:5.2f} m/s  ({speed * 3.6:5.1f} km/h)")
         acc = live.get("acc")
         if acc is not None:
-            g = math.sqrt(sum(x * x for x in acc)) / GRAVITY
-            self.lbl_acc.setText(f"|a| = {g:5.2f} g")
-            self.g_bubble.set_acceleration(acc[0] / GRAVITY,
-                                           acc[1] / GRAVITY)
+            if self.chk_dynacc.isChecked():
+                acc = self._motion_acc(acc, live.get("rpy"),
+                                       live.get("acc_bias"))
+            if acc is not None:
+                g = math.sqrt(sum(x * x for x in acc)) / GRAVITY
+                self.lbl_acc.setText(f"|a| = {g:5.2f} g")
+                self.g_bubble.set_acceleration(acc[0] / GRAVITY,
+                                               acc[1] / GRAVITY)
         dw = live.get("dw")
         if dw:
             self.lbl_dw.setText(f"downweighted: ins {dw['full3d']}, "
@@ -3231,13 +3922,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("replay_splitter",
                                self.replay_split.saveState())
-        if self.worker is not None and self.worker.isRunning():
-            self.worker.stop()
-            # The dataset load has no stop check. Destroying a QThread that
-            # still runs aborts the process, so as a last resort cut it off.
-            if not self.worker.wait(3000):
-                self.worker.terminate()
-                self.worker.wait(1000)
+        for w in [self.worker] + self._stale_workers:
+            if w is not None and w.isRunning():
+                w.stop()
+                # The dataset load has no stop check. Destroying a QThread
+                # that still runs aborts the process, so as a last resort cut
+                # it off.
+                if not w.wait(3000):
+                    w.terminate()
+                    w.wait(1000)
         self.map_view.shutdown()
         super().closeEvent(event)
 

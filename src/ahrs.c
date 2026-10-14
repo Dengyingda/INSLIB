@@ -85,12 +85,11 @@
 
 /* Don't integrate the attitude over longer time periods. */
 
-/* Config defaults. Gyro terms are shared with ins.c (sensor_defaults.h,
- * "low-cost consumer MEMS IMU" defaults): ins and the AHRS filters run against
- * the same physical gyro in nav_suite, so their "unknown sensor" fallback must
- * agree. */
-#define AHRS_DEFAULT_GYR_NOISE_PSD INS_DEFAULT_GYR_ARW_RPS_SQRTHZ
-#define AHRS_DEFAULT_GYR_BIAS_RW   INS_DEFAULT_GYR_BIAS_RW_RPS_SQRTS
+/* Config defaults. The gyro bias term is shared with ins.c (sensor_defaults.h,
+ * "low-cost consumer MEMS IMU" defaults). The attitude noise is split like in
+ * ins (gyro noise plus extra term) but with its own, smaller values, see
+ * sensor_defaults.h. */
+#define AHRS_DEFAULT_GYR_BIAS_RW INS_DEFAULT_GYR_BIAS_RW_RPS_SQRTS
 /* Deliberately NOT the ins VRW density: ahrs.c fuses the accelerometer as a
  * discrete leveling correction (not a continuous strapdown input), and this
  * stddev doubles as the maneuver/vibration-rejection margin. Lowering it to
@@ -169,17 +168,14 @@ static void ahrs_resolve_config(const ahrs_config_t* in, ahrs_config_t* out)
     }
     if (out->kalman_update_dt_sec <= 0.0f)
         out->kalman_update_dt_sec = AHRS_DEFAULT_COVAR_UPDATE_SEC;
-    if (out->gyr_noise_psd <= 0.0f) out->gyr_noise_psd = AHRS_DEFAULT_GYR_NOISE_PSD;
+    if (out->gyr_noise_psd <= 0.0f) out->gyr_noise_psd = AHRS_DEFAULT_GYR_NOISE_PSD_RPS_SQRTHZ;
     /* Negative is clamped to 0 first, so the value is guaranteed >= 0 here.
        "<= 0.0f" is equivalent to "== 0.0f" but keeps the file -Wfloat-equal
        clean, per coding_style.md. */
     if (out->gyr_bias_rw < 0.0f) out->gyr_bias_rw = 0.0f;
     if (out->gyr_bias_rw <= 0.0f) out->gyr_bias_rw = AHRS_DEFAULT_GYR_BIAS_RW;
-    /* No default extra attitude noise: the generic gyro noise default above
-       already carries the margin a typical MEMS IMU needs (the filter was
-       tuned on it alone). The term is for a caller who enters a good
-       sensor's own, much smaller figure in gyr_noise_psd. */
-    if (out->rpy_pred_stddev_rad_sqrts < 0.0f) out->rpy_pred_stddev_rad_sqrts = 0.0f;
+    if (out->rpy_pred_stddev_rad_sqrts <= 0.0f)
+        out->rpy_pred_stddev_rad_sqrts = AHRS_DEFAULT_RPY_PRED_STDDEV_RPS_SQRTS;
     if (out->acc_noise_mps2 <= 0.0f) out->acc_noise_mps2 = AHRS_DEFAULT_ACC_NOISE_MPS2;
     if (out->acc_freq_hz <= 0.0f) out->acc_freq_hz = AHRS_DEFAULT_ACC_FREQ_HZ;
     if (out->gravity_diff_penalty < 0.0f)
@@ -366,6 +362,9 @@ int ahrs_init(ahrs_t* a, const ahrs_config_t* cfg, ahrs_time_us_t t)
     /* Overconfidence watchdog running-min starts "unseen" (REQ-AHRS-020);
        memset zeroed it, which would pin the minimum at 0 forever. */
     a->min_att_stddev_deg = INFINITY;
+    /* Both branches only log, so they are identical once LOG_INFO is compiled
+       out by the LOG_LEVEL. */
+    /* NOLINTNEXTLINE(bugprone-branch-clone) */
     if (a->cfg.mode == AHRS_MODE_AHRS)
     {
         LOG_INFO("ahrs: AHRS filter started, rpy=[%.1f %.1f %.1f] deg, rpy stddev=[%.2f %.2f "

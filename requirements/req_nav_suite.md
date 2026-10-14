@@ -160,9 +160,14 @@ and the reported height does not step when the 3D solution returns.
 
 The wrapper shall define a local height reference: the height above
 the NED origin from the source that survives a GNSS outage -- baro_alt
-if it is running, else the ins local height (which is then driven by
-local position aiding, or by GNSS itself when there is no other
-source). The reference shall be used both to feed the offset filter
+if it is running, else the ins local height once a local position
+sample has been seen (an external system then drives it). Under GNSS
+alone there shall be no reference: ins's height is then itself a GNSS
+height, so the offset would only re-estimate the datum origin's
+ellipsoid height, which ins knows exactly, and add the offset filter's
+noise to the absolute height during an outage. The offset filter stays
+idle (reports no offset) and a coasting ins provides the absolute
+height. The reference shall be used both to feed the offset filter
 and to evaluate the absolute height, so that offset and height always
 refer to the same source.
 
@@ -172,7 +177,7 @@ GNSS ellipsoid height from the fix, vertical standard deviation from
 its NED covariance (pairs without a positive vertical variance are
 skipped), and the local height reference -- extrapolated to the GNSS
 time of validity with the estimated climb rate when the measurement is
-delayed (gnss_delay_ms). The fix's height shall first be moved from the
+delayed (gnss_delay_ms plus gnss_delay_us). The fix's height shall first be moved from the
 antenna to the IMU point, the point both ins and a barometer on the
 sensor board report, by the down component of the measurement's GNSS
 lever arm rotated with the suite's best available attitude
@@ -607,11 +612,13 @@ nav_suite_predict_step() was never called.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-001
-- **Verification:** Test: tests/test_ahrs.c:scenario_suite_yaw_carry
+- **Verification:** Test: tests/test_ahrs.c:scenario_suite_yaw_carry; Test: tests/test_ahrs.c:scenario_suite_yaw_carry_reacquire
 
 On every epoch where ins is ready and its own yaw 1-sigma is at most 15
 degrees, the wrapper shall latch that heading together with the ARS yaw
-of the same epoch. While ins is NOT initialized and REQ-SUITE-016's
+of the same epoch. While ins is not ready (not initialized, or
+initialized with its coasting window expired, REQ-NAV-022, so that the
+next usable fix re-acquires, REQ-NAV-023) and REQ-SUITE-016's
 resolved hint carries no absolute yaw (the case without a magnetometer
 AHRS), the wrapper shall supply as the hint yaw the latched heading
 advanced by the yaw the ARS has integrated since the latch, at a 1-sigma
@@ -642,6 +649,14 @@ needs: the last 3D heading plus that change is a real prior. The two
 gates keep it one: nothing is carried unless ins had genuinely resolved
 its heading, and the carry retires itself once the accumulated drift has
 eaten the information, falling back to the honest "unknown".
+
+A re-acquisition after an expired coasting window is the same situation
+with ins still initialized: its state was frozen for the rest of the
+outage, so the vehicle may have turned by any amount, and without a
+hinted heading the re-acquisition resets the yaw to "unknown"
+(REQ-NAV-059). With a position-only receiver nothing brings it back
+quickly, least of all at standstill. The ARS tracked the turn, so the
+carried heading applies there as well.
 
 ## REQ-SUITE-023 — ins/AHRS heading cross-check
 

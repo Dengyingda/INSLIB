@@ -414,8 +414,12 @@ static void nav_suite_align_vertical_datum(nav_suite_t* s)
  * baro_alt comes first even when ins is running and better right now: the
  * offset has to absorb the barometer's drift against the ellipsoid while GNSS
  * is up, because the barometer is what remains when GNSS drops. Without a
- * barometer the ins local height is the reference, and the offset degenerates
- * to the datum's ellipsoid height. */
+ * barometer the ins local height is the reference, but only while an external
+ * local position source drives it. Under GNSS alone ins's height IS a GNSS
+ * height: the offset would merely re-estimate the datum origin's ellipsoid
+ * height, which ins already knows exactly, and add that filter's noise to
+ * every absolute height during an outage. There is then no reference, the
+ * offset filter stays idle and a coasting ins reports the absolute height. */
 typedef struct
 {
     float h_m;      /**< height above the NED origin [m], positive up */
@@ -440,7 +444,8 @@ static bool nav_suite_local_ref(const nav_suite_t* s, float baro_stddev_m, nav_s
     }
 
     float pos_ned[3];
-    if (ins_is_ready(&s->ins) && ins_get_position_local(&s->ins, pos_ned))
+    if (s->local_frame_external && ins_is_ready(&s->ins) &&
+        ins_get_position_local(&s->ins, pos_ned))
     {
         r->h_m = -pos_ned[2];
         /* stddev_m stays 0 -> the offset filter's configured default. ins's
@@ -506,11 +511,10 @@ static void nav_suite_update_local_gnss(nav_suite_t* s, const ins_measurements_t
     /* If the GNSS measurement is delayed, evaluate the local height at
        the GNSS time of validity using the reference's climb rate: both
        sides of the pair must refer to the same instant. */
-    float h_local = ref.h_m;
-    if (m->gnss_delay_ms > 0 && ref.has_v)
-    {
-        h_local -= ref.v_up_mps * (float)m->gnss_delay_ms * 0.001f;
-    }
+    float         h_local = ref.h_m;
+    const int64_t age_us  = ((m->gnss_delay_ms > 0) ? (int64_t)m->gnss_delay_ms * 1000 : 0) +
+                           ((m->gnss_delay_us > 0) ? (int64_t)m->gnss_delay_us : 0);
+    if (age_us > 0 && ref.has_v) { h_local -= ref.v_up_mps * (float)age_us * 1e-6f; }
 
     if (!s->local_gnss.is_initialized)
     {
@@ -686,7 +690,10 @@ static bool nav_suite_carried_yaw(const nav_suite_t* s, ins_time_us_t t, float* 
  * While ins is not initialized, two further fallbacks fill in what the live
  * filters cannot offer: the caller's static initial hint (REQ-SUITE-017) and,
  * for a filter that has run before, its own last converged heading advanced by
- * the ARS (REQ-SUITE-022). Both only ever ADD to the resolved hint.
+ * the ARS (REQ-SUITE-022). The latter also applies while an initialized ins is
+ * not ready (its coasting window expired, the state frozen), where the next
+ * usable fix re-acquires with this hint. Both only ever ADD to the resolved
+ * hint.
  *
  * @satisfies REQ-SUITE-016 */
 static void nav_suite_build_att_hint(const nav_suite_t* s, ins_time_us_t t,
@@ -747,20 +754,22 @@ static void nav_suite_build_att_hint(const nav_suite_t* s, ins_time_us_t t,
             hint->stddev_roll_rad  = s->init_att_hint.stddev_roll_rad;
             hint->stddev_pitch_rad = s->init_att_hint.stddev_pitch_rad;
         }
+    }
 
-        /* Carried-over heading (REQ-SUITE-022): ins ran before, held a
-           converged 3D heading, and was shut down. Restore it, advanced by the
-           ARS's tracked yaw change. Last in line because a magnetometer AHRS
-           measures the heading while this only reconstructs it. */
-        if (hint->stddev_yaw_rad <= 0.0f)
+    /* Carried-over heading (REQ-SUITE-022): ins held a converged 3D heading
+       and was then shut down, or froze once its coasting window expired, which
+       the re-acquisition answers with "heading unknown" unless the hint
+       carries one (REQ-NAV-059). Restore it, advanced by the ARS's tracked yaw
+       change. Last in line because a magnetometer AHRS measures the heading
+       while this only reconstructs it. */
+    if (hint->stddev_yaw_rad <= 0.0f && !ins_is_ready(&s->ins))
+    {
+        float carried_yaw, carried_sd;
+        if (nav_suite_carried_yaw(s, t, &carried_yaw, &carried_sd))
         {
-            float carried_yaw, carried_sd;
-            if (nav_suite_carried_yaw(s, t, &carried_yaw, &carried_sd))
-            {
-                hint->is_valid       = true;
-                hint->yaw_rad        = carried_yaw;
-                hint->stddev_yaw_rad = carried_sd;
-            }
+            hint->is_valid       = true;
+            hint->yaw_rad        = carried_yaw;
+            hint->stddev_yaw_rad = carried_sd;
         }
     }
 }
@@ -866,6 +875,18 @@ void nav_suite_correct_step(nav_suite_t* s)
                  (double)RAD2DEG(s->yaw_carry.stddev_rad));
     }
     s->log_state.last_ins_initialized = s->ins.is_initialized;
+    {
+        const bool ins_ready = ins_is_ready(&s->ins);
+        if (s->log_state.last_ins_ready && !ins_ready && s->ins.is_initialized &&
+            s->yaw_carry.valid)
+        {
+            LOG_INFO("nav_suite: ins not ready, heading carry-over armed at %.0f deg "
+                     "(stddev %.1f deg) for its re-acquisition, tracked by the ARS from here",
+                     (double)RAD2DEG(s->yaw_carry.yaw_ins_rad),
+                     (double)RAD2DEG(s->yaw_carry.stddev_rad));
+        }
+        s->log_state.last_ins_ready = ins_ready;
+    }
 
     /* Freeze the local-frame offset once ins has locked the datum at its
        bootstrap: from now on it is the fixed frame relation, not a moving

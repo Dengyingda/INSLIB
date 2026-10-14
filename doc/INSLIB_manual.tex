@@ -59,6 +59,7 @@
   morekeywords={name,aiding,init,automotive_mode,automotive_min_speed_mps,
     automotive_min_yaw_stddev_deg,chi2_disable,chi2_reject_alpha,
     allow_unlimited_deadreckoning,max_deadreckoning_sec,baro_height_disable,
+    kalman_update_dt_sec,
     gyro_bias_window_sec,auto_init_window_sec,
     imu,gnss,init_stddev,init_hint,mag,baro,ahrs,score,origin,crazyflie,
     free_inertial_start,
@@ -91,6 +92,9 @@
     roll_deg,pitch_deg,rpy_stddev_deg,yaw_deg,yaw_stddev_deg,
     heading,baseline_frd,require_fixed,stddev_scale,stddev_min_deg,
     ranges,stddev_min_m,height_with_baro,aiding_max_hpos_stddev_m,
+    acc_freq_hz,acc_cutoff_freq_hz,gravity_diff_penalty,acc_reject_gravity_mps2,
+    chi2_threshold,kalman_update_dt_sec,mag_yaw_stddev_deg,mag_freq_hz,
+    mag_chi2_threshold,
     enable,stddev_ut,min_delay_ms,wmm_year,estimate_bias,bias_init_ut,bias_rw_ut_sqrts,
     fixed_bias,misalignment,stddev_m,acc_bias_rw,
     h_process_noise,acc_bias_init_mps2,acc_noise_mps2_sqrthz,gyr_noise_psd,acc_noise_mps2,
@@ -127,7 +131,7 @@
        \large Software Documentation and Mathematical Models\\[1cm]
        \includegraphics[width=0.33\textwidth]{figures/inslib_logo.pdf}
 }
-\newcommand{\inslibversion}{1.2.1}
+\newcommand{\inslibversion}{1.3.0}
 \author{Jan Zwiener \\ \texttt{jan@zwiener.org}}
 \date{Version \inslibversion\\[2mm] \today}
 
@@ -230,6 +234,15 @@ KFCore     & submodule               & \code{linalg} (column-major matrix functi
         $\vect{g}^\nframe$ the local gravity (including the centrifugal term)
         and $\vect{m}^\nframe$ the magnetic reference field.
 \end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{figures/body_frame_frd.pdf}
+\caption{Body frame FRD with the positive rotation directions of roll, pitch
+  and yaw. All sensor inputs must be rotated into this frame before they are
+  passed to the library.}
+\label{fig:body_frame_frd}
+\end{figure}
 
 Throughout the document SI units are used: \si{\metre},
 \si{\metre\per\second}, \si{\radian}, \si{\radian\per\second},
@@ -399,6 +412,12 @@ like every ARS-derived hint value). Above \SI{30}{\degree} the carried heading
 is withheld and the ``unknown'' prior applies again. If the ARS itself
 re-bootstraps, the carry-over is dropped, because its yaw restarted from the
 config seed.
+
+The same hint is offered while an initialised \code{ins} is not ready because
+its coasting window expired. Its state is then frozen for the rest of the
+outage, and the re-acquisition on the next usable fix would otherwise reset
+the yaw to ``heading unknown'' (\S\ref{sec:readiness}), with nothing but position
+fixes to recover it.
 
 \code{nav\_\allowbreak{}suite\_\allowbreak{}get\_\allowbreak{}rpy()} reports
 the same reconstruction for yaw whenever it falls back to the ARS. This way the
@@ -1590,6 +1609,33 @@ moved on current state. A measurement that cannot
 be anchored (no history entry within \SI{50}{\milli\second} of the requested
 time) is skipped and counted.
 
+The age is the sum of a whole-millisecond part
+(\code{gnss\_\allowbreak{}delay\_\allowbreak{}ms},
+\code{local\_\allowbreak{}pos\_\allowbreak{}delay\_\allowbreak{}ms}) and a
+microsecond part (\code{gnss\_\allowbreak{}delay\_\allowbreak{}us},
+\code{local\_\allowbreak{}pos\_\allowbreak{}delay\_\allowbreak{}us}).
+A fix is handed over with the first IMU epoch at or after its time of
+validity, so even a receiver without latency delivers it up to one IMU period
+old, far below the \SI{20}{\milli\second} history grid. Yaw and speed take
+the same two parts (\code{yaw\_\allowbreak{}delay\_\allowbreak{}us},
+\code{speed\_\allowbreak{}delay\_\allowbreak{}us}). The state at the time of
+validity $t_v$ is interpolated between the two states around it at
+$t_a \le t_v < t_b$, two history entries or the newest entry and the current
+state, with $w = (t_v - t_a)/(t_b - t_a)$: position, velocity and body rate
+linearly, the attitude by normalized linear quaternion interpolation (shorter
+arc). A fix \SI{24}{\milli\second} old is thus placed \SI{4}{\milli\second}
+past the \SI{20}{\milli\second} entry, not on it. Only if no pair closer than
+\SI{100}{\milli\second} brackets $t_v$ (a gap after a time jump) does the
+nearer state stand in, its position carried over the remaining
+$\Delta t = t_v - t_a$ at first order:
+\begin{equation}
+  \hat{\vect{p}}(t_v) \approx \hat{\vect{p}}(t_a) + \hat{\vect{v}}(t_a)\,\Delta t ,
+\end{equation}
+with $\Delta t\,\mat{I}_3$ in the velocity block of the position Jacobian.
+Fused as current instead, a fix leaves a bias of speed times age along the
+track: \SI{2.5}{\milli\second} at \SI{10}{\metre\per\second} is
+\SI{2.5}{\centi\metre}, the size of an RTK error budget.
+
 \subsection{Auto-initialisation}
 \label{sec:auto-init}
 
@@ -1885,6 +1931,10 @@ The \emph{first usable fix re-acquires} instead of fusing. The re-acquisition:
         the outage), rotated with the attitude that the filter will hold after an
         attitude hint is applied. Without a heading in that hint the yaw is
         unknown (next item) and only the vertical components are applied.
+  \item Without a measured velocity (a GNSS fix without one, any local
+        position fix) keeps the frozen velocity only as a value: it dates
+        from the start of the outage, so its variance is reset to an
+        unknown-velocity prior and the following fixes determine it.
   \item \emph{Keeps attitude and IMU biases}: frozen, unchanged since
         the window expired. Re-leveling would need a static phase, which a
         vehicle does not have at a tunnel exit
@@ -2498,13 +2548,19 @@ together keep a single pair from nudging the offset around.
 
 \paragraph{Which local height to feed it with.} The suite feeds the filter from
 the source that \emph{survives a GNSS outage} (the barometer if it is running,
-otherwise the \code{ins} local height) and \emph{not} from the momentarily
+otherwise the \code{ins} local height once an external local position source
+drives it) and \emph{not} from the momentarily
 most accurate one. While GNSS is up the \code{ins} local height is by far the
 better estimate, but pairing it against GNSS would yield a drift-free $o$ that
 is useless the moment it is needed, because the height it would then be added to
 (the one of the barometer) carries a weather drift that $o$ never learned to
 absorb. The same reference evaluates Equation~\eqref{eq:hell}, so offset and
-height always refer to one source.
+height always refer to one source. Under GNSS alone, without barometer and
+local position aiding, there is no such source: the \code{ins} height is then
+itself a GNSS height, and $o$ would only re-estimate the ellipsoid height of
+the datum origin, which \code{ins} knows exactly, at the metre-grade
+$\sigma_o$ of the random walk tuned for the barometer. The filter therefore
+stays idle and a coasting \code{ins} reports the absolute height.
 
 \paragraph{Correcting the datum drift.} Under the barometric height source the
 absolute height of \code{ins} is only as good as its vertical \emph{datum}. That
@@ -2836,7 +2892,8 @@ one place. The detailed context is in the sections above.
 
 A dataset directory carries the neutral CSV streams
 (\code{imu.csv} and optionally \code{ref.csv} (without it nothing is scored; only \code{aiding: ref} and \code{init: ref} need it), \code{gnss.csv}, \code{mag.csv},
-\code{baro.csv}, \code{speed.csv}, \code{heading.csv}, \code{ranges.csv}, the column contract lives in
+\code{baro.csv}, \code{speed.csv}, \code{heading.csv}, \code{ranges.csv},
+\code{timesync.csv}, the column contract lives in
 \code{datasets/replay\_\allowbreak{}format.py})
 plus one \code{config.yaml} that tells the harness \emph{how} to run the filter:
 aiding source, initialisation mode, the sensor noise model, sensor calibration
@@ -2886,6 +2943,12 @@ chi2_disable: 0             # 1: disable outlier downweighting (diagnostics)
 chi2_reject_alpha: 0.0      # 0 -> outlier gate, e.g. 0.05 -> 95% global
 allow_unlimited_deadreckoning: 0  # 1: never expire the IMU-only coasting window
 max_deadreckoning_sec: 0.0  # IMU-only coasting budget [s], 0 -> default 10 s
+kalman_update_dt_sec: 0.0   # ins covariance-prediction period [s], 0 -> ins
+                            #    default (20 Hz). The strapdown runs at the
+                            #    IMU rate regardless. The IMU sample period
+                            #    predicts at the IMU rate: measurably better
+                            #    yaw in a turning car, at a CPU cost that
+                            #    matters on a microcontroller (REQ-VER-049)
 baro_height_disable: 0      # 1: never select the barometric height source,
                             #    keep GNSS position's vertical row. For a
                             #    gnss_pos stream that is not satellite GNSS
@@ -3196,11 +3259,24 @@ ahrs:                       # SHARED ARS/AHRS noise override (0 -> derived
   gyr_noise_psd: 0.0        # [rad/s/sqrt(Hz)], 0 -> sqrt(imu.gyr_psd)
   gyr_bias_rw: 0.0          # [rad/s^2/sqrt(Hz)], 0 -> imu.gyr_bias_rw
   rpy_pred_stddev_rad_sqrts: 0.0  # [rad/sqrt(s)] extra attitude noise
-                             # on top of the gyro noise, 0 -> none
+                             # on top of the gyro noise, 0 -> default
   acc_noise_mps2: 0.0       # [m/s^2], 0 -> default
   gyr_bias_init_stddev_rps_deg: 0.0  # [deg/s], 0 -> unchanged (the
                              # gyro_bias_window_sec seed's own stddev, or
                              # ahrs.c's default if that seed never ran)
+  # Leveling and magnetometer tuning, the ahrs_config_t fields of the same
+  # names (ahrs.h), applied to the ARS and the AHRS. 0 -> ahrs's default.
+  acc_freq_hz: 0.0          # [Hz] max. rate of accelerometer corrections
+  acc_cutoff_freq_hz: 0.0   # [Hz] accelerometer low-pass cut-off
+  gravity_diff_penalty: 0.0 # extra distrust per m/s^2 of |acc| - g,
+                             # < 0 -> off
+  acc_reject_gravity_mps2: 0.0  # [m/s^2] hard-reject above this
+                             # | |acc| - g |, < 0 -> never reject
+  chi2_threshold: 0.0       # chi2 gate of the accelerometer update
+  kalman_update_dt_sec: 0.0 # [s] covariance prediction period
+  mag_yaw_stddev_deg: 0.0   # [deg] heading measurement noise (AHRS)
+  mag_freq_hz: 0.0          # [Hz] max. rate of magnetometer corrections
+  mag_chi2_threshold: 0.0   # chi2 gate of the heading update
 
 score:                      # scoring/plots + regression gates ONLY (not filter)
   warmup_sec: 60.0
@@ -3411,7 +3487,11 @@ configures the ARS/AHRS gates separately any more.
   \item[\code{leverarm\_\allowbreak{}frd}] \emph{3-list, m, body FRD, default 0.} IMU-to-antenna
     lever arm.
   \item[\code{delay\_\allowbreak{}ms}] \emph{ms, default 0.} Assumed fixed processing/telemetry
-    latency, applied uniformly to every fix.
+    latency, applied uniformly to every fix, counted from the fix's
+    timestamp. The harness adds the fix's age relative to the IMU epoch it is
+    attached to on top (\code{gnss\_\allowbreak{}delay\_\allowbreak{}us},
+    \S\ref{sec:delayed}), and scores the position estimate at each reference
+    row's own timestamp, carried back with the filter velocity.
   \item[\code{max\_\{horizontal,vertical\}\_\{pos,vel\}\_stddev}]
     \emph{} Shutdown gates: a fix whose reported
     stddev exceeds the limit is ignored.
@@ -3475,7 +3555,9 @@ The standalone ARS/AHRS attitude filters (\S\ref{sec:suite}) are
 physically separate filter instances from \code{ins} and are tuned by default from
 the same \code{imu:} noise model above. \code{ahrs:} overrides that per
 dataset instead. One call sets the template of both sub-filters, since they
-consume the same physical gyro/accelerometer.
+consume the same physical gyro/accelerometer. The live receiver
+\code{tools/insrcv.c} reads the whole section as well, with the same
+fallbacks as the replay harnesses.
 \begin{description}\setlength\itemsep{0pt}
   \item[\code{gyr\_\allowbreak{}noise\_\allowbreak{}psd}] \emph{rad/s/$\sqrt{\text{Hz}}$,
     default 0 $\to$ $\sqrt{\code{imu: gyr\_psd}}$.} Shared gyro noise density.
@@ -3496,6 +3578,34 @@ consume the same physical gyro/accelerometer.
     default.} Shared accelerometer noise stddev (leveling).
   \item[\code{gyr\_\allowbreak{}bias\_\allowbreak{}init\_\allowbreak{}stddev\_\allowbreak{}rps\_\allowbreak{}deg}] \emph{deg/s, default 0 $\to$
     unchanged.} Initial gyro-bias uncertainty for both sub-filters.
+\end{description}
+The remaining keys are the leveling and magnetometer tuning fields of
+\code{ahrs\_config\_t} with the same names (\code{ahrs.h}), applied to both
+sub-filters (the \code{mag\_*} keys only matter to the AHRS). 0 keeps
+\code{ahrs}'s own default.
+\begin{description}\setlength\itemsep{0pt}
+  \item[\code{acc\_\allowbreak{}freq\_\allowbreak{}hz}] \emph{Hz.} Maximum rate of
+    accelerometer leveling corrections.
+  \item[\code{acc\_\allowbreak{}cutoff\_\allowbreak{}freq\_\allowbreak{}hz}] \emph{Hz.} Accelerometer
+    low-pass cut-off, tolerance against vibration at the cost of delay.
+  \item[\code{gravity\_\allowbreak{}diff\_\allowbreak{}penalty}] \emph{stddev per m/s\textsuperscript{2},
+    negative $\to$ off.} Downweights a leveling update by how far
+    $|\mathbf{f}|$ differs from $g$, higher is more resistant to
+    acceleration phases.
+  \item[\code{acc\_\allowbreak{}reject\_\allowbreak{}gravity\_\allowbreak{}mps2}] \emph{m/s\textsuperscript{2},
+    negative $\to$ never reject.} Hard-rejects the leveling update while the
+    low-passed $\big||\mathbf{f}| - g\big|$ exceeds this.
+  \item[\code{chi2\_\allowbreak{}threshold}] $\chi^2$ outlier gate of the accelerometer
+    update, per scalar row.
+  \item[\code{kalman\_\allowbreak{}update\_\allowbreak{}dt\_\allowbreak{}sec}] \emph{s.} Covariance
+    prediction period, the attitude integration still runs at the full IMU
+    rate.
+  \item[\code{mag\_\allowbreak{}yaw\_\allowbreak{}stddev\_\allowbreak{}deg}] \emph{deg.} Stddev of the
+    magnetometer heading measurement (\code{ahrs\_config\_t} holds it in rad).
+  \item[\code{mag\_\allowbreak{}freq\_\allowbreak{}hz}] \emph{Hz.} Maximum rate of magnetometer
+    heading corrections.
+  \item[\code{mag\_\allowbreak{}chi2\_\allowbreak{}threshold}] $\chi^2$ outlier gate of the
+    heading update.
 \end{description}
 
 \paragraph{\code{mag:} and \code{baro:}, optional sensors.}
@@ -3885,6 +3995,9 @@ starts.
 \code{gyr\_\allowbreak{}bias\_\allowbreak{}rw}        & \code{ahrs\_\allowbreak{}config\_\allowbreak{}t.gyr\_\allowbreak{}bias\_\allowbreak{}rw} (\code{ahrs.h}) \\
 \code{acc\_\allowbreak{}noise\_\allowbreak{}mps2}     & \code{ahrs\_\allowbreak{}config\_\allowbreak{}t.acc\_\allowbreak{}noise\_\allowbreak{}mps2} (\code{ahrs.h}) \\
 \code{gyr\_\allowbreak{}bias\_\allowbreak{}init\_\allowbreak{}stddev\_\allowbreak{}rps\_\allowbreak{}deg} & \code{ahrs\_\allowbreak{}config\_\allowbreak{}t.gyr\_\allowbreak{}bias\_\allowbreak{}init\_\allowbreak{}stddev\_\allowbreak{}rps[3]} (\code{ahrs.h}) \\
+\code{acc\_\allowbreak{}freq\_\allowbreak{}hz}, \code{acc\_\allowbreak{}cutoff\_\allowbreak{}freq\_\allowbreak{}hz}, \code{gravity\_\allowbreak{}diff\_\allowbreak{}penalty}, \code{acc\_\allowbreak{}reject\_\allowbreak{}gravity\_\allowbreak{}mps2}, \code{chi2\_\allowbreak{}threshold}, \code{kalman\_\allowbreak{}update\_\allowbreak{}dt\_\allowbreak{}sec} & \code{ahrs\_\allowbreak{}config\_\allowbreak{}t} fields of the same names (\code{ahrs.h}) \\
+\code{mag\_\allowbreak{}freq\_\allowbreak{}hz}, \code{mag\_\allowbreak{}chi2\_\allowbreak{}threshold} & \code{ahrs\_\allowbreak{}config\_\allowbreak{}t} fields of the same names (\code{ahrs.h}) \\
+\code{mag\_\allowbreak{}yaw\_\allowbreak{}stddev\_\allowbreak{}deg} & \code{ahrs\_\allowbreak{}config\_\allowbreak{}t.mag\_\allowbreak{}yaw\_\allowbreak{}stddev\_\allowbreak{}rad} (\code{ahrs.h}), converted from deg \\
 \addlinespace
 \multicolumn{2}{l}{\textbf{\code{score:} and \code{inputs:}, evaluation only}} \\
 \code{score:*}              & harness-only (scoring, plots, regression gates, never reaches the filter) \\
@@ -4128,6 +4241,39 @@ first line of each file is a \code{\#} header, the column layouts are:
     means ``unknown'' and is replaced at replay time by the \code{gnss:}
     fallback stddev (\S\ref{sec:configyaml}). \code{vel\_\allowbreak{}ok} (0/1) flags whether
     the velocity data is usable.
+  \item[GNSS quality and time] Optional trailing columns of
+    \code{gnss.csv}: \code{quality}, the fix type in RTKLIB's solution
+    numbering (1 RTK fixed, 2 RTK float, 3 SBAS, 4 DGNSS, 5 single point,
+    6 PPP, 0 unknown), \code{gps\_\allowbreak{}week}/\code{gps\_\allowbreak{}tow\_\allowbreak{}s},
+    the receiver's own GPS time of the fix (its time of validity, 0/0
+    unknown), \code{num\_\allowbreak{}sv}, the satellites used in the fix
+    (0 unknown), \code{jamming} and \code{spoofing}, the receiver's
+    interference monitor (1 none, 2 warning or indicated, 3 critical or
+    confirmed, the numbering of u-blox' \code{UBX-SEC-SIG}), and
+    \code{sig\_\allowbreak{}auth}/\code{nav\_\allowbreak{}auth}, whether
+    the signals (ranging codes) and the navigation message (Galileo OSNMA,
+    for example) of the fix were authenticated (1 not authenticated,
+    2 authenticated, 3 authentication failed). 0 always means unknown or
+    not monitored, a producer writes 0 where it has nothing, and the
+    columns may stop after any of them. The row's \code{t\_us} is when the
+    fix reached the recorder, the receiver's latency included. The filter
+    does not read these columns, a \code{gnss.csv} without them stays
+    valid. The quality and the satellite count are the \code{Q} and
+    \code{ns} of a \code{.pos} solution file (\S\ref{sec:replaycli}).
+    The replay reports the share of each quality and, with a
+    \code{timesync.csv}, the transport latency of the fixes (arrival
+    minus the fix's own GPS time, median and 5/95 percentile) in the data
+    quality summary, as Dr.~INS findings, on a page of the
+    \code{-{}-plot} PDF and on the GUI's \emph{Plots} tab. The configured
+    \code{gnss: delay\_\allowbreak{}ms} may exceed the measured latency
+    (the receiver's own filter lag adds to it) but not undercut it by
+    more than 20\,ms, that is a warning. A median outside
+    $-50$\,ms\,..\,2\,s is reported as two clocks that do not belong
+    together, typically a capture whose receiver had its time pulse on
+    the UTC grid. The satellite count (median, minimum) and the share of
+    each known jamming, spoofing and authentication state are reported
+    the same way, any jamming or spoofing indication and any failed
+    authentication as a warning.
   \item[Header/comment lines] Any line beginning with \code{\#} is skipped, so
     the header row is informational. Rows with fewer than the required number of
     columns are ignored.
@@ -4198,7 +4344,109 @@ that change what is evaluated or reported are:
     resolution follows the scale of the view (millimetres on a 2\,m track,
     metres on a 10\,km one) at nearly constant page size. \code{0} makes
     the map reuse the \code{-{}-plot-hz} samples.
+  \item[\code{-{}-dump-solution FILE}, \code{-{}-dump-solution-hz HZ}] Write
+    the filter's solution to \code{FILE} at \code{HZ} of sim time
+    (\code{0}: every IMU epoch), independent of the reference and the
+    warmup. The extension picks the format
+    (\code{tools/\allowbreak{}ins\_\allowbreak{}solution.py}):
+    \code{.pos} is the RTKLIB solution format, so RTKPLOT shows it next to
+    an RTKLIB solution, anything else is a CSV in the \code{ref.csv}
+    layout plus the 1-sigma of position, velocity and attitude as
+    trailing columns. Both harnesses read only the first ten columns of a
+    \code{ref.csv}, so the CSV serves as another run's reference as it is,
+    the smoothed solution of a dataset without ground truth in
+    particular. With \code{-{}-smooth} the smoothed solution is written
+    next to it as \code{FILE\_rts}. In the \code{.pos} the RTKLIB fields
+    are used as follows: while the position is aided (at most 1\,s since
+    the last absolute position aiding) \code{Q} is the quality of the last
+    GNSS fix (the \code{quality} column of \code{gnss.csv}, RTKLIB's
+    numbering, 1 where it is unknown), \code{Q}~5 while dead
+    reckoning, \code{age} the seconds since that aiding, \code{ns} the
+    satellites of that fix while aided (the \code{num\_\allowbreak{}sv}
+    column, 0 where it is unknown and while dead reckoning),
+    \code{ratio} 0, the position and velocity 1-sigma and covariances in
+    ENU as RTKLIB writes them (signed square roots), velocity in the
+    columns of the RTKLIB demo5 output. The time is GPST from the
+    dataset's \code{timesync.csv}, the recorder's time sync log: pairs of
+    the \code{t\_us} of a pulse-per-second edge and the GNSS time of that
+    edge, with the flags word of the board's time sync frame. A
+    \code{TP\_SUSPECT} pair is left out. The time has to be GPS time: a
+    capture whose receiver had its time pulse on the UTC grid
+    (\code{UTC\_BASE}, the u-blox default before
+    \code{tools/\allowbreak{}ublox\_*\_config.py} set GPS) is off by the
+    leap seconds, which the \code{.pos} header only warns about. Offset and rate of the recording
+    clock are fitted to the pairs (a crystal is tens of ppm off, tens of
+    milliseconds over a quarter of an hour), one pair gives the offset
+    alone. Without the file the time is a guess: the first epoch is put at
+    the system clock of the export. \code{inspostgui.py}
+    writes the same files with its \emph{Export solution} button.
+  \item[\code{-{}-smooth}] After the replay, run the offline
+    Rauch--Tung--Striebel smoother (\code{tools/\allowbreak{}ins\_\allowbreak{}rts.py},
+    see below) and print its accuracy next to the filter's: position RMS and
+    maximum, velocity RMS and maximum, roll/pitch/yaw error std and mean.
+    The filter run and every number it reports stay exactly what they are
+    without the flag. With \code{-{}-summary-json} both columns are added
+    under the key \code{rts}. With \code{-{}-plot} the PDF gets four pages
+    of the smoother after the filter's bias page: the North-East track of
+    filter, smoother and reference next to the accuracy table, the state
+    history, the error against the reference and the IMU biases, each
+    with the smoother's own 1-sigma band and the filter as a thin grey
+    line. With \code{-{}-kml} the smoothed track is its own path in the
+    KMZ.
+  \item[\code{-{}-smooth-att-sd-max DEG}] Cut the smoother's chain wherever
+    the filter's own attitude 1-sigma is above \code{DEG}. Off unless given.
 \end{description}
+
+\paragraph{Offline RTS smoother.}
+The smoother turns the error-state filter into a fixed-interval smoother
+\cite{rauch1965} without touching the C library. Its forward pass is a second replay of its
+own, in which every epoch runs as \code{predict()} and \code{correct()}
+instead of \code{update()}, so the covariance can be read before and after
+the correction, and \code{predict()} hands over the transition matrix
+$\Phi$ the covariance was propagated with. That second pass runs with
+\code{allow\_\allowbreak{}unlimited\_\allowbreak{}deadreckoning}: a real-time filter that
+gives up dead reckoning after the coasting window and re-acquires leaves
+nothing to smooth across the outage, run through, its drift (however large)
+is what the backward pass removes by tying the outage to the fixes on both
+ends. The backward pass is the textbook recursion
+\cite{rauch1965,groves2013} in the filter's error
+convention ($\delta x$ = nominal $-$ truth, attitude as
+$R_\text{nominal} = (I + [\psi\times])\,R_\text{true}$):
+\[
+  C_k = P_{k|k}\,\Phi_{k+1}^T P_{k+1|k}^{-1},\quad
+  \delta x^s_k = C_k\,\bigl(\delta x^-_{k+1} + \delta x^s_{k+1}\bigr),\quad
+  P^s_k = P_{k|k} + C_k\,(P^s_{k+1} - P_{k+1|k})\,C_k^T,
+\]
+where $\delta x^-_{k+1}$ is the correction the filter applied at epoch $k+1$
+(the nominal state before minus after it). The smoothed state is the
+filtered nominal state with $\delta x^s$ removed, the attitude through the
+full rotation. Between two epochs that moved the covariance the error is
+interpolated linearly, so the smoothed solution has the full IMU rate. The
+chain is cut where the filter is no plain Kalman filter: ins not ready, a
+new local origin, or a correction that grows a variance by more than
+5\,\% (re-initialization, re-acquisition, covariance inflation, while
+float32 round-off of a large update stays at a few $10^{-3}$). The epoch
+before a cut keeps its filtered value.
+
+The backward pass reuses the forward pass's linearization. Where the filter
+re-acquires with an unknown heading during strong dynamics, attitude
+corrections of tens of degrees can make the first seconds worse than the
+filter. On a slow vehicle the same situation recovers the heading back to
+the re-acquisition epoch, which is why \code{-{}-smooth-att-sd-max} is not
+on by default. The recorder keeps three $n\times n$ float32 matrices per
+epoch that moved the covariance and about 25 doubles per IMU epoch, an
+hour of 200\,Hz IMU data takes about 400\,MB.
+
+\code{inspostgui.py} has the same smoother as its \emph{RTS smoother}
+toolbar checkbox (off by default, its forward pass records every epoch
+and takes several times as long as the plain replay): the
+smoothed solution appears as its own trail in the 3D view and on the
+\emph{Map} tab (\emph{RTS} checkbox), next to the filter in the error,
+map, altitude, speed and bias plots of the \emph{Plots} tab, in the
+\emph{Last run} panel and in the summary text, and \emph{Export PDF} and
+\emph{Export KML} carry the same pages and path as \code{replay.py}. \code{python/\allowbreak{}tests/\allowbreak{}test\_\allowbreak{}ins\_\allowbreak{}rts.py}
+checks the backward pass against the textbook RTS of a linear filter and
+the whole chain on a simulated flight with a GNSS outage.
 
 \code{replay.py} and \code{inspostgui.py} run the same replay core
 (\code{tools/\allowbreak{}replay\_\allowbreak{}core.py}): input loading, feed
@@ -4284,6 +4532,11 @@ judging criterion,''
 P.~D.~Groves,
 \emph{Principles of GNSS, Inertial, and Multisensor Integrated
 Navigation Systems}, 2nd ed., Artech House, 2013.
+
+\bibitem{rauch1965}
+H.~E.~Rauch, F.~Tung and C.~T.~Striebel,
+``Maximum likelihood estimates of linear dynamic systems,''
+\emph{AIAA Journal}, vol.~3, no.~8, pp.~1445--1450, 1965.
 
 \bibitem{carpenter2018}
 J.~R.~Carpenter and C.~N.~D'Souza,

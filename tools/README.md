@@ -156,9 +156,9 @@ same rates, plus `GPS_RAW_INT`:
 | message | rate | carries |
 |---|---|---|
 | `HEARTBEAT` | 1 Hz | so a GCS keeps the system on screen |
-| `ATTITUDE`, `ATTITUDE_QUATERNION` | 50 Hz | the arbitrated attitude, both spellings |
-| `LOCAL_POSITION_NED` | 50 Hz | position and velocity in the filter's own NED frame |
-| `GLOBAL_POSITION_INT` | 20 Hz | lat/lon/height |
+| `ATTITUDE`, `ATTITUDE_QUATERNION` | 60 Hz | the arbitrated attitude, both spellings |
+| `LOCAL_POSITION_NED` | 60 Hz | position and velocity in the filter's own NED frame |
+| `GLOBAL_POSITION_INT` | 10 Hz | lat/lon/height |
 | `GPS_RAW_INT` | 5 Hz | the receiver's own fix: satellite count, fix type, accuracies |
 | `ALTITUDE` | 20 Hz | the vertical channel on its own |
 | `HIGHRES_IMU` | 50 Hz | the nav-frame acceleration and the body rates |
@@ -170,7 +170,12 @@ same rates, plus `GPS_RAW_INT`:
 ./build/insrcv --mavlink                              # udp:14550 on this host
 ./build/insrcv --mavlink --mav-ip 192.168.1.20        # a GCS on another machine
 ./build/insrcv --mavlink --mav-subfilter-hz 1         # thin out NAMED_VALUE_FLOAT
+./build/insrcv --mavlink --mav-pose-hz 30             # attitude and local position slower
 ```
+
+`--mav-pose-hz` sets `ATTITUDE`, `ATTITUDE_QUATERNION` and
+`LOCAL_POSITION_NED` (default 60 Hz) and lifts `--pub-hz` to match when that
+is lower, since MAVLink is sent from the publish round.
 
 `ALTITUDE` is the one that makes a baro-only run visible: the two
 position messages need a horizontal solution, so in `ATTITUDE_ONLY` mode

@@ -43,6 +43,8 @@ Usage:
     --config PATH   config.yaml to compare against (shows current -> suggested)
     --plot PATH     write the Allan-deviation plot (PNG/PDF, needs matplotlib)
     --skip-start S  discard the first S seconds, --skip-end S the last S
+                    (defaults 30 s / 60 s: handling when starting/stopping)
+    --min-duration M  refuse a record shorter than M minutes after trimming
 
 A MEMS gyro's thermal warm-up is a slow deterministic drift that the Allan
 variance cannot distinguish from a random walk, so it inflates the RRW --
@@ -58,6 +60,7 @@ Needs numpy. The IMU CSV is the replay format (datasets/replay_format.py):
 """
 
 import argparse
+import datetime
 import math
 import os
 import sys
@@ -125,6 +128,51 @@ BIAS_TRACE_MIN_WINDOW_SEC = 30.0
 BIAS_TRACE_MIN_POINTS = 20
 
 
+# The start of a bench recording is usually handling: the sensor is still
+# being touched, or keys are typed to start the logger. Dropped by default,
+# and likewise the end, where someone walks up to stop the logging.
+DEFAULT_SKIP_START_SEC = 30.0
+DEFAULT_SKIP_END_SEC = 60.0
+# Below this much (trimmed) data the run is refused: the Allan curve does not
+# even reach the bias-instability floor of a MEMS part, so nothing useful
+# comes out. Override with --min-duration.
+DEFAULT_MIN_DURATION_SEC = 30.0 * 60.0
+# Below this the run goes ahead but warns: the random-walk branch of a MEMS
+# IMU rarely emerges in less.
+RECOMMENDED_DURATION_SEC = 2.0 * 3600.0
+
+# Rough grade of an IMU from its gyro bias instability, worst axis [deg/h].
+# Loosely after the usual industry classes (e.g. Groves, Principles of GNSS,
+# Inertial and Multisensor Integrated Navigation Systems), where the exact
+# edges differ between sources. Upper edge first, ascending. A heuristic:
+# scale factor, temperature stability and g-sensitivity matter as well.
+_GRADES_DPH = (
+    (0.01, "navigation grade"),
+    (0.1, "high-end tactical grade"),
+    (1.0, "tactical grade"),
+    (10.0, "industrial MEMS"),
+    (math.inf, "consumer MEMS"),
+)
+
+
+# Plausibility ranges (SI, low and high) of the fitted values, to catch a
+# unit mix-up (g or deg/s read as SI), a recording that is not an IMU at
+# rest or a broken axis. Deliberately wide, from consumer MEMS up to
+# tactical grade, so only a clear outlier trips them.
+_PLAUSIBLE_SI = {
+    # white noise density [rad/s/sqrt(Hz)] resp. [m/s^2/sqrt(Hz)]
+    ("gyr", "arw"): (math.radians(1e-3), math.radians(0.5), "gyro noise density"),
+    ("acc", "arw"): (1e-6 * _G * 5.0, 1e-6 * _G * 5000.0, "accel noise density"),
+    # bias instability [rad/s] resp. [m/s^2]
+    ("gyr", "bi"): (math.radians(0.01 / 3600.0), math.radians(1000.0 / 3600.0),
+                    "gyro bias instability"),
+    ("acc", "bi"): (1e-6 * _G * 1.0, 1e-6 * _G * 10000.0, "accel bias instability"),
+}
+# The three axes of one sensor measure the same kind of noise: a noise
+# coefficient this many times apart between axes points to a broken axis
+# or a misaligned/vibrating setup rather than to physics.
+AXIS_SPREAD_WARN = 3.0
+
 _QUIET = False
 
 
@@ -166,7 +214,23 @@ def read_imu(path):
     data = np.loadtxt(path, delimiter=",", comments="#")
     if data.ndim != 2 or data.shape[1] < 7:
         sys.exit(f"{path}: expected at least 7 columns (t_us, gyr xyz, acc xyz)")
-    return data[:, 0], data[:, 1:4], data[:, 4:7]
+    return data[:, 0], data[:, 1:4], data[:, 4:7], _temp_column(data)
+
+
+def _temp_column(data):
+    """The optional 8th column (IMU die temperature [degC]) with dropouts
+    bridged by interpolation, or None if the file has none or it is mostly
+    not finite."""
+    if data.shape[1] < 8:
+        return None
+    temp = data[:, 7].astype(float)
+    ok = np.isfinite(temp)
+    if np.count_nonzero(ok) < 0.5 * len(temp):
+        return None
+    if not np.all(ok):
+        idx = np.arange(len(temp))
+        temp = np.interp(idx, idx[ok], temp[ok])
+    return temp
 
 
 def allan_deviation(x, tau0, taus):
@@ -297,6 +361,49 @@ def _bias_instability(taus, adev, tau_max):
             bool(i_min != idx[-1]))
 
 
+def _imu_grade(bi_gyr_rps):
+    """(grade name, bias instability [deg/h]) of the worst gyro axis, or
+    (None, None) if no axis gave a value. An unresolved minimum is only an
+    upper bound, so the true grade can only be better than the one named
+    (the caller says so)."""
+    vals = [b for b in bi_gyr_rps if b is not None]
+    if not vals:
+        return None, None
+    dph = max(vals) * _DEG * 3600.0
+    for edge, name in _GRADES_DPH:
+        if dph < edge:
+            return name, dph
+    return None, dph
+
+
+def _plausibility_warnings(result):
+    """Warnings for fitted values outside the expected range of a real IMU
+    (see _PLAUSIBLE_SI) and for axes of one sensor that disagree by more
+    than AXIS_SPREAD_WARN. A coarse sanity net, not a statistical test."""
+    out = []
+    for (name, kind), (lo, hi, label) in _PLAUSIBLE_SI.items():
+        vals = [v for v in result[kind][name] if v is not None]
+        if not vals:
+            continue
+        bad = [v for v in vals if not lo <= v <= hi]
+        if not bad:
+            continue
+        if name == "gyr":
+            scale, unit = (_DEG, "deg/s/sqrt(Hz)") if kind == "arw" else (_DEG * 3600.0, "deg/h")
+        else:
+            scale, unit = 1e6 / _G, ("ug/sqrt(Hz)" if kind == "arw" else "ug")
+        out.append(f"implausible {label}: {bad[0] * scale:.3g} {unit} (expected"
+                   f" {lo * scale:.2g} - {hi * scale:.2g} for MEMS up to tactical grade)"
+                   " - check units and that the IMU is at rest")
+    for name in ("gyr", "acc"):
+        for kind, label in (("arw", "white noise"), ("bi", "bias instability")):
+            vals = [v for v in result[kind][name] if v is not None]
+            if len(vals) == 3 and min(vals) > 0 and max(vals) / min(vals) > AXIS_SPREAD_WARN:
+                out.append(f"{name} {label} differs by x{max(vals) / min(vals):.1f} between"
+                           " the axes - one axis may be faulty or disturbed")
+    return out
+
+
 def _tau_grid(tau0, duration, n=60):
     """Log-spaced averaging times from a few samples up to ~1/4 of the
     record (beyond that too few clusters remain), always including the RRW
@@ -359,7 +466,7 @@ def _bias_trace_window_sec(duration):
     return min(win, max(1.0, duration / BIAS_TRACE_MIN_POINTS))
 
 
-def _bias_trace(gyr, acc, fs, duration):
+def _bias_trace(gyr, acc, fs, duration, temp=None):
     """Per-axis MEAN gyr/acc over long windows -- with the white noise
     averaged down, what is left IS the bias wander (random walk plus any
     thermal transient), plotted directly as a time series. Deliberately a
@@ -370,12 +477,17 @@ def _bias_trace(gyr, acc, fs, duration):
     if view is None:
         return None
     gyr_w, acc_w, t_center = view
-    return {
+    out = {
         "t_center_s": t_center,
         "window_sec": win_sec,
         "gyr_mean": gyr_w.mean(axis=1),
         "acc_mean": acc_w.mean(axis=1),
+        "temp_mean": None,
     }
+    if temp is not None:
+        win_n = gyr_w.shape[1]
+        out["temp_mean"] = temp[:gyr_w.shape[0] * win_n].reshape(-1, win_n).mean(axis=1)
+    return out
 
 
 def _motion_segments(diag, gyr_thresh_dps=MOTION_GYR_THRESH_DPS,
@@ -403,7 +515,8 @@ def _motion_segments(diag, gyr_thresh_dps=MOTION_GYR_THRESH_DPS,
     } for a, b in bounds]
 
 
-def analyze(imu_path, skip_start_sec=0.0, skip_end_sec=0.0):
+def analyze(imu_path, skip_start_sec=0.0, skip_end_sec=0.0,
+            min_duration_sec=0.0):
     """Full analysis of one static IMU recording. Returns a dict with the
     per-axis RRW (bias_rw) and ARW estimates, suggested scalar config
     values, the Allan curves (for plotting) and any data-quality warnings.
@@ -413,9 +526,13 @@ def analyze(imu_path, skip_start_sec=0.0, skip_end_sec=0.0):
     warm-up drift is a slow deterministic ramp, which the Allan variance
     cannot tell from a random walk and which therefore inflates the RRW.
     The bias-trace page of -plot is what shows whether a given recording
-    has one (and how long it lasts)."""
+    has one (and how long it lasts).
+
+    min_duration_sec: refuse (SystemExit) a record shorter than this after
+    trimming. The library default 0 never refuses, the command line sets
+    DEFAULT_MIN_DURATION_SEC."""
     tau = RRW_TAU_S
-    t_us, gyr, acc = read_imu(imu_path)
+    t_us, gyr, acc, temp = read_imu(imu_path)
     t_first_us = int(t_us[0])   # untrimmed start, the reference for "into the recording"
     if skip_start_sec > 0.0 or skip_end_sec > 0.0:
         t_rel = (t_us - t_us[0]) / 1e6
@@ -424,6 +541,7 @@ def analyze(imu_path, skip_start_sec=0.0, skip_end_sec=0.0):
         if int(np.count_nonzero(keep)) < 100:
             sys.exit(f"{imu_path}: trimming left {int(np.count_nonzero(keep))} samples")
         t_us, gyr, acc = t_us[keep], gyr[keep], acc[keep]
+        temp = temp[keep] if temp is not None else None
     n = len(t_us)
     if n < 100:
         sys.exit(f"{imu_path}: only {n} samples - need a long static record")
@@ -431,6 +549,12 @@ def analyze(imu_path, skip_start_sec=0.0, skip_end_sec=0.0):
     tau0 = float(np.median(dt))
     duration = float((t_us[-1] - t_us[0]) / 1e6)
     fs = 1.0 / tau0 if tau0 > 0 else 0.0
+    if duration < min_duration_sec:
+        sys.exit(f"{imu_path}: only {_fmt_hms(duration)} of data left (after"
+                 f" --skip-start/--skip-end), at least {_fmt_hms(min_duration_sec)}"
+                 " are required for a meaningful"
+                 " Allan analysis (--min-duration 0 overrides, the result is then"
+                 " mostly noise)")
 
     taus = _tau_grid(tau0, duration)
     trimmed = (" (trimmed)" if skip_start_sec > 0.0 or skip_end_sec > 0.0 else "")
@@ -443,9 +567,10 @@ def analyze(imu_path, skip_start_sec=0.0, skip_end_sec=0.0):
     # The +1/2 branch only emerges well past the bias-instability floor, so
     # a usable RRW wants hours, not minutes (see the per-axis "not resolved"
     # warning below for whether THIS record actually got there).
-    if duration < 100.0:
-        warnings.append(f"record is only {duration:.0f} s - RRW at tau={tau:g} s "
-                        "wants several minutes of static data for a stable estimate")
+    if duration < RECOMMENDED_DURATION_SEC:
+        warnings.append(f"record is only {_fmt_hms(duration)} - the bias random walk"
+                        " of a MEMS IMU usually needs several hours of static data"
+                        " to emerge, expect upper bounds instead of measurements")
     # Static sanity: a moving platform makes the RRW slope meaningless
     # (real dynamics masquerade as drift). Gyro should sit near zero rate.
     gyr_span = float(np.max(np.std(gyr, axis=0)))
@@ -482,7 +607,7 @@ def analyze(imu_path, skip_start_sec=0.0, skip_end_sec=0.0):
     # PEAK gyro/accel stands out (see _windowed_diagnostics/_motion_segments).
     _progress("stillness check (windowed peaks)")
     diag = _windowed_diagnostics(gyr, acc, fs)
-    bias_trace = _bias_trace(gyr, acc, fs, duration)
+    bias_trace = _bias_trace(gyr, acc, fs, duration, temp)
     motion_segments = _motion_segments(diag) if diag is not None else []
     for seg in motion_segments[:5]:
         warnings.append(
@@ -495,6 +620,10 @@ def analyze(imu_path, skip_start_sec=0.0, skip_end_sec=0.0):
     result = {
         "n": n, "duration": duration, "fs": fs, "tau0": tau0,
         "trimmed": bool(trimmed), "n_gaps": n_gaps, "gap_worst": gap_worst,
+        "source": os.path.abspath(imu_path), "analysed": datetime.datetime.now(),
+        "skip_start_sec": skip_start_sec, "skip_end_sec": skip_end_sec,
+        "temp_range": ((float(np.min(temp)), float(np.max(temp)))
+                       if temp is not None else None),
         "tau_rrw": tau, "warnings": warnings, "curves": {},
         "rrw": {}, "arw": {}, "diag": diag, "bias_trace": bias_trace,
         "motion_segments": motion_segments,
@@ -564,6 +693,11 @@ def analyze(imu_path, skip_start_sec=0.0, skip_end_sec=0.0):
         result[f"{name}_bias_rw_resolved"] = result["rrw_resolved"][name][i_worst]
         arw_ok = [v for v in result["arw"][name] if v is not None]
         result[f"{name}_psd"] = float(np.mean(np.square(arw_ok))) if arw_ok else 0.0
+    warnings.extend(_plausibility_warnings(result))
+    result["grade"], result["grade_bi_dph"] = _imu_grade(result["bi"]["gyr"])
+    result["grade_bound"] = not all(
+        ok for ok, b in zip(result["bi_resolved"]["gyr"], result["bi"]["gyr"])
+        if b is not None)
     _progress_done(f"done, {len(warnings)} warning(s)\n")
     return result
 
@@ -600,15 +734,15 @@ _DEG = 180.0 / math.pi
 # not encode the symbols, unicode for the PDF.
 _COEFF_UNITS = {
     ("gyr", "arw"): [
-        ("rad/s/sqrt(Hz)", "rad/s/√Hz", 1.0, ""),
+        ("rad/s/sqrt(Hz)", "rad/s/√Hz", 1.0, "noise density"),
         ("deg/s/sqrt(Hz)", "°/s/√Hz", _DEG, "noise density"),
-        ("deg/sqrt(h)", "°/√h", _DEG * 60.0, "angle random walk"),
+        ("deg/sqrt(h)", "°/√h", _DEG * 60.0, "angle random walk (ARW)"),
     ],
     ("acc", "arw"): [
         ("m/s^2/sqrt(Hz)", "m/s²/√Hz", 1.0, "noise density"),
         ("(mm/s^2)/sqrt(Hz)", "(mm/s²)/√Hz", 1000.0, "noise density"),
-        ("m/s/sqrt(h)", "m/s/√h", 60.0, "velocity random walk"),
-        ("(mm/s)/sqrt(h)", "(mm/s)/√h", 60000.0, "velocity random walk"),
+        ("m/s/sqrt(h)", "m/s/√h", 60.0, "velocity random walk (VRW)"),
+        ("(mm/s)/sqrt(h)", "(mm/s)/√h", 60000.0, "velocity random walk (VRW)"),
     ],
     ("gyr", "rrw"): [
         ("rad/s/sqrt(s)", "rad/s/√s", 1.0, ""),
@@ -621,12 +755,12 @@ _COEFF_UNITS = {
     ],
     # scale None: the averaging time of the minimum instead of the value.
     ("gyr", "bi"): [
-        ("rad/s", "rad/s", 1.0, ""),
+        ("rad/s", "rad/s", 1.0, "bias instability"),
         ("deg/h", "°/h", _DEG * 3600.0, "bias instability"),
         ("s", "s", None, "at averaging time tau"),
     ],
     ("acc", "bi"): [
-        ("m/s^2", "m/s²", 1.0, ""),
+        ("m/s^2", "m/s²", 1.0, "bias instability"),
         ("mm/s^2", "mm/s²", 1000.0, "bias instability"),
         ("s", "s", None, "at averaging time tau"),
     ],
@@ -678,21 +812,60 @@ def _fmt_sig2(v):
     return f"{v:.{max(0, 1 - math.floor(math.log10(a)))}f}"
 
 
+def _ceil_sig1(v):
+    """Round up to one significant digit. The bias_rw estimate is only good
+    to roughly a factor of two (it is read off a slowly converging +1/2
+    asymptote of the worst axis), so one digit is all it supports, and
+    rounding up errs on the side of a filter that trusts the bias less."""
+    if v <= 0.0 or not math.isfinite(v):
+        return v
+    e = math.floor(math.log10(v))
+    m = math.ceil(round(v / 10.0 ** e, 9))
+    return m * 10.0 ** e
+
+
 def _config_lines(result, config_imu, unicode=False):
-    """(key, value, unit, remark) of the suggested config.yaml imu: values."""
+    """(key, value text, unit, remark) of the suggested config.yaml imu:
+    values. bias_rw is rounded up to one digit and flagged as a rough
+    estimate, the psd values keep two."""
     sq = "²" if unicode else "^2"
     rt = "√s" if unicode else "sqrt(s)"
     rows = []
     for key, unit in (("gyr_psd", f"(rad/s){sq}/Hz"), ("acc_psd", f"(m/s{sq}){sq}/Hz"),
                       ("gyr_bias_rw", f"rad/s/{rt}"), ("acc_bias_rw", f"m/s{sq}/{rt}")):
         val = result[key]
+        is_rw = key.endswith("bias_rw")
+        if is_rw:
+            val = _ceil_sig1(val)
         remark = _fmt_now(config_imu.get(key), val).strip()
         if unicode:
             remark = remark.replace(", x", ", ×")
-        if key.endswith("bias_rw") and not result[f"{key[:3]}_bias_rw_resolved"]:
-            remark += "  UPPER BOUND (not resolved)"
-        rows.append((key, val, unit, remark))
+        if is_rw:
+            remark += "  rounded up, accuracy ~ factor 2"
+            if not result[f"{key[:3]}_bias_rw_resolved"]:
+                remark += ", UPPER BOUND (not resolved)"
+        rows.append((key, f"{val:.0e}" if is_rw else f"{val:.1e}", unit, remark))
     return rows
+
+
+def _fmt_temp_range(r, unicode=False):
+    """'24.1 - 27.9 degC' of the recording, or None without a temperature."""
+    if r.get("temp_range") is None:
+        return None
+    lo, hi = r["temp_range"]
+    return f"{lo:.1f} - {hi:.1f} " + ("°C" if unicode else "degC")
+
+
+def _fmt_grade(r, unicode=False):
+    """One-line grade estimate, or None if there is no bias instability."""
+    if not r.get("grade"):
+        return None
+    # An unresolved minimum is only an upper bound on B, so the unit is
+    # at least this good.
+    lead = ("≤ " if unicode else "<= ") if r["grade_bound"] else ""
+    unit = "°/h" if unicode else "deg/h"
+    return (f"{'at least ' if r['grade_bound'] else ''}{r['grade']}"
+            f" (gyro bias instability {lead}{r['grade_bi_dph']:.2g} {unit})")
 
 
 def format_report(result, config_imu=None):
@@ -702,6 +875,13 @@ def format_report(result, config_imu=None):
     out = []
     out.append(f"Allan-variance IMU noise analysis "
                f"(n={r['n']}, {r['duration']:.0f} s @ {r['fs']:.0f} Hz)")
+    out.append(f"  analysed {r['analysed']:%Y-%m-%d %H:%M}")
+    temp_txt = _fmt_temp_range(r)
+    if temp_txt:
+        out.append(f"  temperature range: {temp_txt}")
+    grade_txt = _fmt_grade(r)
+    if grade_txt:
+        out.append(f"  rough IMU class: {grade_txt}")
     for w in r["warnings"]:
         out.append(f"  WARNING: {w}")
 
@@ -719,7 +899,7 @@ def format_report(result, config_imu=None):
     out.append("  suggested config.yaml `imu:` values (psd = (Nx^2 + Ny^2 + Nz^2)/3,"
                " N = noise density; bias_rw = worst axis):")
     for key, val, unit, remark in _config_lines(r, config_imu):
-        out.append(f"    {key + ':':<13}{val:.1e}   # {unit:<16}{remark}")
+        out.append(f"    {key + ':':<13}{val}   # {unit:<16}{remark}")
     return "\n".join(out)
 
 
@@ -807,13 +987,22 @@ def _report_page(result, config_imu):
                f"{r['n_gaps']}, worst {gap['len_s'] * 1e3:.0f} ms after t_us={gap['t_us']}"
                f" ({_fmt_hms(gap['t_rel_s'])} into the recording)")
     stats = [
+        ("analysed", f"{r['analysed']:%Y-%m-%d %H:%M}"),
+        ("file", os.path.basename(r["source"])),
         ("samples", f"{r['n']}"),
         ("duration", f"{_fmt_hms(r['duration'])}  ({r['duration']:.0f} s)"
-                     + ("  trimmed" if r.get("trimmed") else "")),
+                     + (f"  trimmed: first {r['skip_start_sec']:g} s,"
+                        f" last {r['skip_end_sec']:g} s" if r.get("trimmed") else "")),
         ("sample rate", f"{r['fs']:.0f} Hz"),
         ("sample period", f"{r['tau0'] * 1000:.3f} ms"),
         ("sampling gaps", gap_txt),
     ]
+    temp_txt = _fmt_temp_range(r, unicode=True)
+    if temp_txt:
+        stats.append(("temperature", temp_txt))
+    grade_txt = _fmt_grade(r, unicode=True)
+    if grade_txt:
+        stats.append(("IMU class", grade_txt))
     y = _place_text(fig, x0 + 0.01, y, "\n".join(f"{k:<15}{v}" for k, v in stats),
                     fontsize=8.5, family="monospace", linespacing=1.45) - 0.015
 
@@ -824,24 +1013,12 @@ def _report_page(result, config_imu):
         # Without --config there is nothing to compare against, and a
         # "(not set)" on every line would only be noise in the box.
         remark = remark.replace("(not set)", "").strip()
-        cfg.append(f"  {key + ':':<13}{val:.1e}    # {unit:<13}{remark}".rstrip())
+        cfg.append(f"  {key + ':':<13}{val}    # {unit:<13}{remark}".rstrip())
     y = _place_text(fig, x0 + 0.012, y - 0.008, "\n".join(cfg), fontsize=8.5,
-                    family="monospace", linespacing=1.5, bbox=_BOX_STYLE) - 0.025
-    y = note(y, ["psd = (Nx² + Ny² + Nz²)/3, N = noise density. bias_rw = worst axis.",
-             "Static values are a floor: in motion, vibration and model errors add"
-             " to them."]) - 0.018
-
-    # --- warnings ----------------------------------------------------------
-    if r["warnings"]:
-        y = heading(y, f"Warnings ({len(r['warnings'])})")
-        lines = []
-        for w in r["warnings"]:
-            wrapped = _wrap_to_width(fig, w.replace("<=", "≤").replace("tau", "τ"),
-                                     8.0, (x1 - x0) - 0.06)
-            lines.append("•  " + wrapped[0])
-            lines.extend("    " + ln for ln in wrapped[1:])
-        y = _place_text(fig, x0 + 0.012, y - 0.008, "\n".join(lines), fontsize=8.0,
-                        linespacing=1.35, bbox=_BOX_STYLE) - 0.02
+                    family="monospace", linespacing=1.5, bbox=_BOX_STYLE) - 0.016
+    y = note(y, ["psd = (Nx² + Ny² + Nz²) / 3, N = noise density. bias_rw = worst axis.",
+             "Static values are a floor: motion, vibration and model errors add"
+             " to them."]) - 0.008
 
     # --- coefficient table ---------------------------------------------------
     y = heading(y, "Noise coefficients (per axis)")
@@ -853,7 +1030,7 @@ def _report_page(result, config_imu):
             cells = _coeff_cells(r, name, kind, scale, unicode=True)
             rows.append([f"    {term.replace('tau', 'τ')}" if term else "", unit] + cells)
             row_kind.append("value")
-    row_h = 0.0148
+    row_h = 0.0134
     h = row_h * (len(rows) + 1)
     ax = fig.add_axes([x0, y - h, x1 - x0, h])
     ax.axis("off")
@@ -888,13 +1065,43 @@ def _report_page(result, config_imu):
             tbl[ri, 0].get_text().set_text("")
     y = y - h - 0.012
     y = note(y, ["Noise density and angle/velocity random walk are the same number:"
-                 " rad/s/√Hz = rad/√s, and ×60 turns 1/√s into 1/√h.",
+                 " rad/s/√Hz = rad/√s, and 1/√s ×60 is 1/√h.",
                  "Bias instability B: flicker noise leaves a flat Allan floor at"
                  " σ = √(2 ln2/π)·B = 0.664·B, hence minimum / 0.664 (IEEE Std 952).",
                  "≤ marks an upper bound: for the random walk the record is too short"
                  " for the +1/2 branch, for the bias instability the curve is still"
-                 " falling at the longest trustworthy τ."]) - 0.025
+                 " falling at the longest trustworthy τ.",
+                 "IMU class: rough heuristic from the worst gyro axis' bias"
+                 " instability (> 10 °/h consumer, 1-10 industrial, 0.1-1 tactical,"
+                 " 0.01-0.1 high-end tactical, < 0.01 navigation). Scale factor,"
+                 " temperature stability and g-sensitivity count as well."]) - 0.025
 
+    # --- warnings: own page, a pointer here
+    if r["warnings"]:
+        _place_text(fig, x0, y, f"{len(r['warnings'])} warning(s), see the next page.",
+                    fontsize=9, weight="bold", color="#8a1c1c")
+
+    return fig
+
+
+def _warnings_page(result):
+    """Own PDF page for the warnings, so none is cut off. None without any."""
+    import matplotlib.pyplot as plt
+    if not result["warnings"]:
+        return None
+    fig = plt.figure(figsize=(8.5, 11))
+    x0, x1 = 0.07, 0.93
+    fig.text(0.5, 0.965, f"Allan-variance IMU noise analysis - warnings"
+             f" ({len(result['warnings'])})", ha="center", fontsize=14, weight="bold")
+    lines = []
+    for w in result["warnings"]:
+        wrapped = _wrap_to_width(fig, w.replace("<=", "≤").replace("tau", "τ"),
+                                 8.5, (x1 - x0) - 0.06)
+        lines.append("•  " + wrapped[0])
+        lines.extend("    " + ln for ln in wrapped[1:])
+        lines.append("")
+    _place_text(fig, x0 + 0.012, 0.92, "\n".join(lines).rstrip(), fontsize=8.5,
+                linespacing=1.4, bbox=_BOX_STYLE)
     return fig
 
 
@@ -999,7 +1206,7 @@ def _formulas_page():
         ("m", r"$\sigma_{min} = \sqrt{2\ln 2/\pi}\ B \approx 0.664\,B"
               r" \ \Rightarrow\ B = \sigma_{min}/0.664$"),
         ("gap", ""),
-        ("p", r"$K$ is exactly the process-noise density the filter's bias_rw"
+        ("p", r"$K$ is the process-noise density the filter's bias_rw"
               r" parameter expects (units $[\mathrm{unit}/\sqrt{s}]$). Per Kalman"
               r" predict step, and over an unaided coast of $T$ seconds:"),
         ("m", r"$\mathrm{Var}(\Delta t) = K^2\,\Delta t \qquad \sigma(T) = K\sqrt{T}$"),
@@ -1060,7 +1267,8 @@ def _formulas_page():
 
 
 def _bias_motion_page(result):
-    """4-panel page. Top row is the long-window MEAN gyro/accel trace over
+    """4-panel page (plus a full-width temperature panel on top if the CSV
+    has an IMU temperature column). Top row is the long-window MEAN gyro/accel trace over
     the whole recording - with the white noise averaged down, what's left IS
     essentially the bias wander, visualized directly as a time series (as
     opposed to the Allan-deviation summary statistic on page 1), which is
@@ -1076,7 +1284,18 @@ def _bias_motion_page(result):
     trace = result.get("bias_trace")
     if diag is None or trace is None:
         return None
-    fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
+    temp = trace.get("temp_mean")
+    if temp is None:
+        fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
+        ax_temp = None
+    else:
+        # Temperature on top, full width and short: the bias traces below
+        # share its time axis, so a drift can be read against it.
+        fig = plt.figure(figsize=(11, 8.5))
+        gs = fig.add_gridspec(3, 2, height_ratios=[0.7, 1, 1])
+        ax_temp = fig.add_subplot(gs[0, :])
+        axes = np.array([[fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1])],
+                         [fig.add_subplot(gs[2, 0]), fig.add_subplot(gs[2, 1])]])
     t_h = diag["t_center_s"] / 3600.0
     t_h_trace = trace["t_center_s"] / 3600.0
     trace_win = trace["window_sec"]
@@ -1123,13 +1342,20 @@ def _bias_motion_page(result):
     axes[1, 1].set_title("accel peak deviation from rest (stillness check)")
     axes[1, 1].set_ylabel("peak |accel − median| [m/s²]")
 
+    if ax_temp is not None:
+        ax_temp.plot(t_h_trace, temp, lw=0.9, color="tab:orange",
+                     label=f"{temp.min():.1f} - {temp.max():.1f} °C")
+        ax_temp.set_title(f"IMU temperature ({_win_txt(trace_win)} mean)")
+        ax_temp.set_ylabel("temperature [°C]")
+
+    panels = list(axes.flat) + ([ax_temp] if ax_temp is not None else [])
     segments = result.get("motion_segments") or []
     for seg in segments:
         t0, t1 = seg["t_start_s"] / 3600.0, seg["t_end_s"] / 3600.0
-        for axp in axes.flat:
+        for axp in panels:
             axp.axvspan(t0, t1, color="tab:red", alpha=0.15)
 
-    for axp in axes.flat:
+    for axp in panels:
         axp.set_xlabel("time [h]")
         axp.grid(alpha=0.3)
         axp.legend(fontsize=7)
@@ -1143,8 +1369,9 @@ def _bias_motion_page(result):
 
 def plot_curves(result, out_path, config_imu=None):
     """Write the per-axis Allan-deviation log-log plot (needs matplotlib).
-    A .pdf gets 3 extra pages: the console report, a formula reference, and
-    a bias-trace/stillness-check time series; any other extension (e.g.
+    A .pdf gets extra pages: the console report, the warnings (if any), a
+    bias-trace/stillness-check
+    time series and, last, a formula reference; any other extension (e.g.
     .png) only supports the single plot page."""
     try:
         import matplotlib
@@ -1152,6 +1379,7 @@ def plot_curves(result, out_path, config_imu=None):
         import matplotlib.pyplot as plt
     except ImportError:
         sys.exit("--plot needs matplotlib (pip install matplotlib)")
+    config_imu = config_imu or {}
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
     tau_rrw = result["tau_rrw"]
     tau_fit_max = result["tau_fit_max"]
@@ -1190,6 +1418,16 @@ def plot_curves(result, out_path, config_imu=None):
         axp.plot(ARW_TAU_S, n_arw, "o", color="tab:blue", ms=5)
         axp.axvline(ARW_TAU_S, color="tab:blue", ls=":", lw=0.7, alpha=0.5)
 
+        # Bias instability: a small hollow marker at each axis' Allan minimum
+        # in that axis' own colour, kept faint so it stays in the background.
+        for ax, line in enumerate(axp.get_lines()[:3]):
+            b = result["bi"][name][ax]
+            if b is None:
+                continue
+            axp.plot(result["bi_tau"][name][ax], b * BIAS_INSTABILITY_FACTOR, "v",
+                     color=line.get_color(), ms=5, mfc="none", mew=0.9, alpha=0.7,
+                     label="bias instability (minimum)" if ax == 0 else None)
+
         # Past this tau too few clusters remain for the estimate to be
         # trustworthy - shown, but never fitted.
         if tau_fit_max < x_right:
@@ -1212,8 +1450,9 @@ def plot_curves(result, out_path, config_imu=None):
         from matplotlib.backends.backend_pdf import PdfPages
         pages = [("Allan-deviation curves", lambda: fig),
                  ("report", lambda: _report_page(result, config_imu)),
-                 ("formulas", _formulas_page),
-                 ("bias trace / stillness", lambda: _bias_motion_page(result))]
+                 ("warnings", lambda: _warnings_page(result)),
+                 ("bias trace / stillness", lambda: _bias_motion_page(result)),
+                 ("formulas", _formulas_page)]
         with PdfPages(out_path) as pdf:
             for i, (label, build) in enumerate(pages):
                 _progress(f"rendering page: {label}", i, len(pages))
@@ -1229,17 +1468,27 @@ def plot_curves(result, out_path, config_imu=None):
 def main():
     ap = argparse.ArgumentParser(
         description="Estimate IMU bias random walk (config imu.*_bias_rw) "
-                    "from a long static recording via Allan variance.")
-    ap.add_argument("imu", help="imu.csv or a dataset directory")
+                    "from a long static recording via Allan variance.",
+        epilog="example: allan_variance.py imu.csv --plot allan.pdf")
+    ap.add_argument("imu", metavar="IMU_CSV_OR_DATASET_DIR",
+                    help="imu.csv or a dataset directory containing imu.csv")
     ap.add_argument("--config", help="config.yaml to compare current values against")
     ap.add_argument("--plot", help="write the Allan-deviation plot to this PNG/PDF"
                     " (.pdf also gets the report, formulas and bias-trace pages)")
-    ap.add_argument("--skip-start", type=float, default=0.0, metavar="SEC",
-                    help="discard the first SEC seconds - gyro thermal warm-up"
-                         " drift is a deterministic ramp that inflates the RRW,"
-                         " and the start is also where handling shows up")
-    ap.add_argument("--skip-end", type=float, default=0.0, metavar="SEC",
-                    help="discard the last SEC seconds (handling when stopping)")
+    ap.add_argument("--skip-start", type=float, default=DEFAULT_SKIP_START_SEC,
+                    metavar="SEC",
+                    help="discard the first SEC seconds (default: %(default)g) - the"
+                         " start is where handling shows up. Longer values also cut"
+                         " the gyro thermal warm-up drift, a deterministic ramp"
+                         " that inflates the RRW")
+    ap.add_argument("--skip-end", type=float, default=DEFAULT_SKIP_END_SEC,
+                    metavar="SEC",
+                    help="discard the last SEC seconds (default: %(default)g),"
+                         " handling when stopping the logger")
+    ap.add_argument("--min-duration", type=float,
+                    default=DEFAULT_MIN_DURATION_SEC / 60.0, metavar="MIN",
+                    help="refuse a record shorter than MIN minutes after trimming"
+                         " (default: %(default)g, 0 = never refuse)")
     ap.add_argument("--quiet", action="store_true",
                     help="suppress the progress output on stderr")
     args = ap.parse_args()
@@ -1247,7 +1496,8 @@ def main():
     global _QUIET
     _QUIET = args.quiet
     result = analyze(args.imu, skip_start_sec=args.skip_start,
-                     skip_end_sec=args.skip_end)
+                     skip_end_sec=args.skip_end,
+                     min_duration_sec=args.min_duration * 60.0)
     config_imu = _load_config_imu(args.config) if args.config else {}
     print(format_report(result, config_imu))
     if args.plot:

@@ -95,6 +95,7 @@ from INSLIB.telemetry import (isa_pressure_to_altitude,        # noqa: E402
 # first, otherwise the core would load a second copy of it.
 sys.modules.setdefault("replay", sys.modules[__name__])
 import replay_core   # noqa: E402
+import ins_solution  # noqa: E402  (solution files: CSV, RTKLIB .pos)
 
 US_PER_SEC = 1_000_000
 
@@ -127,6 +128,11 @@ DEFAULTS = {
     "max_deadreckoning_sec": 0.0,  # IMU-only coasting budget before
                         # is_ready() degrades; 0 -> C default.
                         # Ignored when allow_unlimited_deadreckoning is set
+    "kalman_update_dt_sec": 0.0,  # REQ-VER-049: ins covariance-prediction
+                        # period [s] (ins_options_t field of the same name),
+                        # 0 -> C default. The IMU sample period predicts at
+                        # the IMU rate, at a CPU cost that matters on a
+                        # microcontroller
     "baro_height_disable": 0,  # REQ-NAV-053: 1 -> never select barometric
                         # height at bootstrap, even with a barometer present.
                         # Set this for a GNSS-labelled source that is not
@@ -365,10 +371,21 @@ DEFAULTS = {
     # ahrs.c's own xy/z default stays in effect.
     # rpy_pred_stddev_rad_sqrts [rad/sqrt(s)]: extra attitude process noise
     # on top of the gyro noise (REQ-AHRS-027), the ARS/AHRS tuning knob next
-    # to the sensor figure, 0 -> none (the generic gyro default carries the
-    # margin, set it when imu: holds a good sensor's own figure).
+    # to the sensor figure, 0 -> ahrs.c's default.
+    #
+    # The remaining keys are ahrs_config_t's accelerometer-leveling and
+    # magnetometer tuning fields of the same names (units and meaning in
+    # ahrs.h), applied to both sub-filters; 0 -> ahrs's own default.
+    # gravity_diff_penalty and acc_reject_gravity_mps2 take a negative value
+    # (penalty -> 0, reject -> disabled). mag_yaw_stddev_deg is the heading
+    # measurement's stddev in degrees (AHRS only, like the other mag_* keys).
     "ahrs": {"gyr_noise_psd": 0.0, "gyr_bias_rw": 0.0, "acc_noise_mps2": 0.0,
-             "gyr_bias_init_stddev_rps_deg": 0.0, "rpy_pred_stddev_rad_sqrts": 0.0},
+             "gyr_bias_init_stddev_rps_deg": 0.0, "rpy_pred_stddev_rad_sqrts": 0.0,
+             "acc_freq_hz": 0.0, "acc_cutoff_freq_hz": 0.0,
+             "gravity_diff_penalty": 0.0, "acc_reject_gravity_mps2": 0.0,
+             "chi2_threshold": 0.0, "kalman_update_dt_sec": 0.0,
+             "mag_yaw_stddev_deg": 0.0, "mag_freq_hz": 0.0,
+             "mag_chi2_threshold": 0.0},
     # score: this harness scores on leverarm_frd/warmup_sec only. The pass/fail
     # limits below are consumed by tools/replay.c, which is the gating
     # harness (make datasets), and lim_groves_pos_rms_factor by
@@ -640,8 +657,16 @@ def load_config(path):
         data_dir = os.path.dirname(path) or "."
     if not os.path.exists(cfg_path):
         sys.exit(f"{cfg_path} missing")
-    with open(cfg_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+    except (yaml.YAMLError, UnicodeDecodeError) as e:
+        sys.exit(f"{cfg_path}: not a readable YAML file: {e}")
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        sys.exit(f"{cfg_path}: not an INSLIB config (top level is a "
+                 f"{type(cfg).__name__}, expected key: value sections)")
 
     # An unknown key is an error, never a silently ignored one: a mistyped
     # or renamed tuning parameter is otherwise indistinguishable from a
@@ -650,6 +675,10 @@ def load_config(path):
     # tools/replay.c's parser (REQ-VER-025).
     unknown = [k for k in cfg if k not in DEFAULTS and k not in FOREIGN_SECTIONS]
     for key, dflt in DEFAULTS.items():
+        if isinstance(dflt, dict) and key in cfg and not isinstance(
+                cfg[key], dict) and cfg[key] is not None:
+            sys.exit(f"{cfg_path}: section '{key}' must be a mapping, "
+                     f"got {type(cfg[key]).__name__}")
         if isinstance(dflt, dict) and isinstance(cfg.get(key), dict):
             unknown += [f"{key}.{k}" for k in cfg[key] if k not in dflt]
     if unknown:
@@ -683,17 +712,26 @@ def load_config(path):
     return spec, data_dir
 
 
-def pos_error_ecef(nav, ref_now, score_leverarm_frd):
+def pos_error_ecef(nav, ref_now, score_leverarm_frd, t_us=None):
     """Estimate-minus-reference position error in ECEF [m]. The scoring
     lever arm maps the filter position onto the ground-truth point
-    (zero when the truth refers to the IMU center). Returns the
-    3-vector, or None if the estimate is unavailable."""
+    (zero when the truth refers to the IMU center). With ``t_us``, the
+    epoch the estimate is valid at, the estimate is carried back to the
+    row's timestamp with the filter's own velocity first (REQ-VER-047):
+    the row is up to one IMU period older than the epoch it is scored at,
+    and not every ref.csv carries a velocity. Returns the 3-vector, or
+    None if the estimate is unavailable."""
     fecef = nav.position_ecef()
     rbn = nav.rotmat_b_to_n()
     if not (fecef and rbn):
         return None
     recef = llh_to_ecef(ref_now["lat_rad"], ref_now["lon_rad"], ref_now["h_m"])
-    la_n = _matvec_cm(rbn, score_leverarm_frd)
+    la_n = list(_matvec_cm(rbn, score_leverarm_frd))
+    v_est = nav.velocity_ned() if t_us is not None else None
+    if v_est:
+        dt = (t_us - ref_now["t_us"]) / 1e6
+        for i in range(3):
+            la_n[i] -= v_est[i] * dt
     la_e = _matvec_rm(ned_to_ecef_rot(ref_now["lat_rad"], ref_now["lon_rad"]),
                       la_n)
     return [fecef[i] - recef[i] + la_e[i] for i in range(3)]
@@ -1092,15 +1130,15 @@ def ahrs_growth_rate(ahrs_cfg, horizon_sec=GROWTH_HORIZON_SEC):
     position/velocity state to report (ars/ahrs carry only attitude + gyro
     bias).
 
-    Returns None if ahrs: gyr_noise_psd or gyr_bias_rw is left at 0 in
-    `ahrs_cfg` (after effective_ahrs_cfg()) - see
-    process_noise_growth_rate()'s docstring for why this deliberately does
-    not fall back to a hardcoded copy of ahrs.c's own default.
-    rpy_pred_stddev_rad_sqrts has no default to guess: 0 is none."""
+    Returns None if ahrs: gyr_noise_psd, gyr_bias_rw or
+    rpy_pred_stddev_rad_sqrts is left at 0 in `ahrs_cfg` (after
+    effective_ahrs_cfg()) - see process_noise_growth_rate()'s docstring for
+    why this deliberately does not fall back to a hardcoded copy of ahrs.c's
+    own default."""
     gyr_noise = ahrs_cfg.get("gyr_noise_psd", 0.0)
     bias_rw = ahrs_cfg.get("gyr_bias_rw", 0.0)
     rpy_pred = ahrs_cfg.get("rpy_pred_stddev_rad_sqrts", 0.0)
-    if not (gyr_noise and bias_rw):
+    if not (gyr_noise and bias_rw and rpy_pred):
         return None
 
     T = horizon_sec
@@ -1205,7 +1243,10 @@ def last_fix_accuracy_lines(last_fix):
 def load_gnss(path):
     """gnss.csv (datasets/replay_format.py): t_us, lat/lon/h, full NED
     position covariance (6 unique elements), NED velocity, full NED
-    velocity covariance, vel_ok."""
+    velocity covariance, vel_ok and, where present, quality (RTKLIB
+    numbering), the receiver's GPS week/time of week, the satellites
+    used, the jamming/spoofing indications and the signal/navigation
+    message authentication, each 0 when unknown or absent."""
     fixes = []
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -1224,6 +1265,14 @@ def load_gnss(path):
                 "vel_ned": (v[10], v[11], v[12]),
                 "cov_vel": v[13:19],
                 "vel_ok": int(v[19]) != 0,
+                "quality": int(v[20]) if len(v) > 20 else 0,
+                "gps_week": int(v[21]) if len(v) > 21 else 0,
+                "gps_tow_s": v[22] if len(v) > 22 else 0.0,
+                "num_sv": int(v[23]) if len(v) > 23 else 0,
+                "jamming": int(v[24]) if len(v) > 24 else 0,
+                "spoofing": int(v[25]) if len(v) > 25 else 0,
+                "sig_auth": int(v[26]) if len(v) > 26 else 0,
+                "nav_auth": int(v[27]) if len(v) > 27 else 0,
             })
     return fixes
 
@@ -1495,7 +1544,7 @@ def build_config(spec, ref0, t0_us, lat0, lon0, h0, gyr_bias):
         auto_zupt_velocity_blind_disable=bool(
             int(noise["auto_zupt_velocity_blind_disable"])),
         gyr_bias_init_rps=gyr_bias if have_bias else (0.0, 0.0, 0.0),
-        # kalman_update_dt_sec left at 0 -> default
+        kalman_update_dt_sec=float(spec["kalman_update_dt_sec"]),
         max_prediction_time_sec=0.5,
         gnss_max_horizontal_pos_stddev_m=gnss["max_horizontal_pos_stddev_m"],
         gnss_max_vertical_pos_stddev_m=gnss["max_vertical_pos_stddev_m"],
@@ -1899,6 +1948,112 @@ def print_gnss_standstill_accuracy(phases, out=print):
           "< => too pessimistic)")
 
 
+# gnss.csv quality (RTKLIB solution status numbering) -> name.
+GNSS_QUALITY_NAMES = {1: "fix", 2: "float", 3: "sbas", 4: "dgnss",
+                      5: "single", 6: "ppp"}
+# A configured gnss: delay_ms this far below the measured transport latency
+# is a finding: the filter would fuse every fix as newer than it is.
+GNSS_LATENCY_TOL_MS = 20.0
+# Outside this window [ms] a measured latency is no latency but two clocks
+# that do not belong together (timesync.csv of another recording, a
+# capture on the receiver's UTC grid).
+GNSS_LATENCY_PLAUSIBLE_MS = (-50.0, 2000.0)
+
+
+def gnss_quality_stats(fixes):
+    """{quality: count} over the fixes that carry a quality (gnss.csv's
+    optional quality column, RTKLIB numbering), None when none does."""
+    counts = {}
+    for fx in fixes:
+        q = fx.get("quality", 0)
+        if q:
+            counts[q] = counts.get(q, 0) + 1
+    return counts or None
+
+
+def gnss_quality_text(counts):
+    """'fix 81.2%, float 10.3%, single 8.5% (n=12345)' of
+    gnss_quality_stats()."""
+    n = sum(counts.values())
+    parts = [f"{GNSS_QUALITY_NAMES.get(q, 'q%d' % q)} {100.0 * c / n:.1f}%"
+             for q, c in sorted(counts.items())]
+    return ", ".join(parts) + f" (n={n})"
+
+
+# gnss.csv jamming/spoofing (u-blox UBX-SEC-SIG numbering) and
+# sig_auth/nav_auth -> name, 0 (unknown) is left out of every count.
+GNSS_IND_NAMES = {1: "none", 2: "warning", 3: "critical"}
+GNSS_AUTH_NAMES = {1: "not authenticated", 2: "authenticated", 3: "failed"}
+GNSS_IND_WARNING, GNSS_AUTH_FAILED = 2, 3
+
+
+def gnss_integrity_stats(fixes):
+    """Satellite count, interference and authentication of the fixes
+    (gnss.csv's optional num_sv, jamming, spoofing, sig_auth, nav_auth).
+    Dict with num_sv ({median, min, n} over the fixes that carry a count,
+    or None) and per indication a {state: count} of the known states (0
+    unknown left out), None where no fix carries it. None when the data
+    carries none of them."""
+    sv = sorted(fx["num_sv"] for fx in fixes if fx.get("num_sv", 0) > 0)
+    out = {"num_sv": ({"median": sv[len(sv) // 2], "min": sv[0], "n": len(sv)}
+                      if sv else None)}
+    for key in ("jamming", "spoofing", "sig_auth", "nav_auth"):
+        counts = {}
+        for fx in fixes:
+            v = fx.get(key, 0)
+            if v:
+                counts[v] = counts.get(v, 0) + 1
+        out[key] = counts or None
+    return out if any(v is not None for v in out.values()) else None
+
+
+def gnss_state_text(counts, names):
+    """'none 99.0%, warning 1.0% (n=1234)' of a {state: count}."""
+    n = sum(counts.values())
+    parts = [f"{names.get(k, 's%d' % k)} {100.0 * c / n:.1f}%"
+             for k, c in sorted(counts.items())]
+    return ", ".join(parts) + f" (n={n})"
+
+
+def gnss_integrity_lines(st):
+    """Report lines ('satellites used: ...') of gnss_integrity_stats()."""
+    lines = []
+    if st["num_sv"]:
+        sv = st["num_sv"]
+        lines.append(f"satellites used: median {sv['median']}, min {sv['min']}"
+                     f" (n={sv['n']})")
+    for key, label, names in (("jamming", "jamming", GNSS_IND_NAMES),
+                              ("spoofing", "spoofing", GNSS_IND_NAMES),
+                              ("sig_auth", "signal authentication", GNSS_AUTH_NAMES),
+                              ("nav_auth", "nav message authentication",
+                               GNSS_AUTH_NAMES)):
+        if st[key]:
+            lines.append(f"{label}: {gnss_state_text(st[key], names)}")
+    return lines
+
+
+def gnss_latency_stats(fixes, clock):
+    """Transport latency of the GNSS fixes [ms]: each row's t_us (when the
+    fix reached the recorder) minus the recorder's t_us of the fix's own
+    GPS time (gps_week/gps_tow_s, the receiver's time of validity), mapped
+    with `clock` (ins_solution.GpsClock from timesync.csv). Dict t_us,
+    latency_ms (per fix), median, p5, p95, n, or None without a clock or
+    a fix that carries its GPS time."""
+    if clock is None:
+        return None
+    rows = [(fx["t_us"], fx["gps_week"] * 604800 + fx["gps_tow_s"])
+            for fx in fixes if fx.get("gps_week")]
+    if not rows:
+        return None
+    lat = [(t - (g - clock.a) / clock.b) / 1e3 for t, g in rows]
+    s = sorted(lat)
+
+    def q(p):
+        return s[min(len(s) - 1, int(p * (len(s) - 1) + 0.5))]
+    return {"t_us": [t for t, _ in rows], "latency_ms": lat, "median": q(0.5),
+            "p5": q(0.05), "p95": q(0.95), "n": len(s)}
+
+
 def gnss_vel_accuracy_stats(fixes):
     """Median receiver-reported 1-σ GNSS velocity accuracy (horizontal and
     vertical) over every fix with usable velocity (cov_vel not None),
@@ -2068,6 +2223,52 @@ STDDEV_LIMITS = {"roll": 3.0, "pitch": 3.0, "yaw": 10.0, "pos": 20.0}  # deg/deg
 # printed psd suggestion, so the report never proposes a number the
 # findings call fine.
 NOISE_MODEL_WARN_FACTOR = 100.0  # IMU noise stddev: measured vs. configured
+
+# Accelerometer magnitude at standstill vs. the gravity model. The median of
+# |f| over the epochs ins detected as standstill: with no linear acceleration
+# the specific force is gravity alone, so any deviation is the sensor (scale
+# factor, offset, wrong unit) or the position, not the motion. A whole-trial
+# mean is useless for this on a manoeuvring platform (turns add centripetal
+# load, vibration rectifies into |f|), which is why only standstill counts.
+# The bias is estimated by the filter, the scale error is not, hence a
+# few-percent threshold rather than one at bias level.
+ACC_GRAVITY_MIN_SAMPLES = 50
+ACC_GRAVITY_INFO_FRAC = 0.01
+ACC_GRAVITY_WARN_FRAC = 0.02
+STANDARD_GRAVITY_MPS2 = 9.80665
+
+
+def normal_gravity(lat_rad, height_m):
+    """|g| [m/s^2] at an ellipsoidal position from INSLIB's own
+    ins_gravity_ned() (same model the filter assumes), None without the
+    library or outside a plausible range."""
+    try:
+        import ctypes
+        from INSLIB._core import _lib as lib
+        lib.ins_gravity_ned.argtypes = [ctypes.c_float, ctypes.c_float,
+                                        ctypes.c_float * 3]
+        lib.ins_gravity_ned.restype = None
+        out = (ctypes.c_float * 3)()
+        lib.ins_gravity_ned(float(lat_rad), float(height_m), out)
+    except Exception:
+        return None
+    g = float(out[2])
+    return g if 9.7 < g < 9.9 else None
+
+
+def acc_gravity_metrics(norms, lat_rad, height_m):
+    """Median |f| of the standstill epochs against the gravity model, as the
+    "acc_gravity" input of insdoctor_findings(). None when there are too few
+    standstill samples or no gravity value."""
+    n = len(norms)
+    if n < ACC_GRAVITY_MIN_SAMPLES:
+        return None
+    g = normal_gravity(lat_rad, height_m)
+    if g is None:
+        return None
+    srt = sorted(norms)
+    med = float(srt[n // 2] if n % 2 else 0.5 * (srt[n // 2 - 1] + srt[n // 2]))
+    return {"n": n, "median": med, "g": g, "dev": med / g - 1.0}
 # Var(d3)/Var(d2) of the IMU samples: 20/6 for white noise, well below for
 # an IMU output low-pass filtered inside the sensor (an SCH16T at 13 Hz read
 # at 100 Hz gives about 1.5). Below this the per-sample noise check is void.
@@ -2165,6 +2366,55 @@ def insdoctor_findings(m):
     elif m["aiding_mode"] == "gnss":
         f.append((SEV_INFO, "GNSS: fewer than 2 fixes - coverage not assessable"))
 
+    # --- GNSS fix quality and transport latency ----------------------------
+    gq = m.get("gnss_quality")
+    if gq:
+        f.append((SEV_INFO, "GNSS fix quality: " + gnss_quality_text(gq)))
+    gl = m.get("gnss_latency")
+    if gl:
+        delay = m.get("gnss_delay_ms", 0.0)
+        lo, hi = GNSS_LATENCY_PLAUSIBLE_MS
+        span = f"median {gl['median']:.0f} ms, p5..p95 {gl['p5']:.0f}..{gl['p95']:.0f} ms"
+        if not lo <= gl["median"] <= hi:
+            f.append((SEV_WARN, f"GNSS latency implausible ({span}): timesync.csv and"
+                                " gnss.csv do not share one clock, or the receiver's"
+                                " time pulse was on the UTC grid"))
+        elif delay + GNSS_LATENCY_TOL_MS < gl["median"]:
+            f.append((SEV_WARN, f"gnss: delay_ms {delay:.0f} is below the measured"
+                                f" transport latency ({span}) - every fix is fused"
+                                " as newer than it is"))
+        else:
+            f.append((SEV_OK, f"GNSS transport latency {span}, configured delay"
+                              f" {delay:.0f} ms (it also covers the receiver's own"
+                              " filter lag)"))
+
+    # --- GNSS satellites, interference and authentication -----------------
+    gi = m.get("gnss_integrity")
+    if gi:
+        if gi["num_sv"]:
+            sv = gi["num_sv"]
+            f.append((SEV_INFO, f"GNSS satellites used: median {sv['median']},"
+                                f" min {sv['min']}"))
+        for key, label in (("jamming", "jamming"), ("spoofing", "spoofing")):
+            c = gi[key]
+            if not c:
+                continue
+            bad = sum(n for s, n in c.items() if s >= GNSS_IND_WARNING)
+            if bad:
+                f.append((SEV_WARN, f"GNSS receiver indicated {label} on {bad} of"
+                                    f" {sum(c.values())} fixes"
+                                    f" ({gnss_state_text(c, GNSS_IND_NAMES)})"))
+            else:
+                f.append((SEV_OK, f"GNSS receiver indicated no {label}"
+                                  f" (n={sum(c.values())})"))
+        for key, label in (("sig_auth", "signal"), ("nav_auth", "navigation message")):
+            c = gi[key]
+            if not c:
+                continue
+            failed = c.get(GNSS_AUTH_FAILED, 0)
+            txt = f"GNSS {label} authentication: {gnss_state_text(c, GNSS_AUTH_NAMES)}"
+            f.append((SEV_WARN if failed else SEV_INFO, txt))
+
     # --- IMU noise model vs. measured floor --------------------------------
     nm = m["noise"]
     if nm:
@@ -2188,6 +2438,26 @@ def insdoctor_findings(m):
                                   " of configured, safe: motion adds to the sensor floor)"))
             else:
                 f.append((SEV_OK, f"{label} noise model OK (measured x{ratio:.2f} of configured)"))
+
+    # --- Accelerometer magnitude vs. gravity at standstill -----------------
+    ag = m.get("acc_gravity")
+    if ag:
+        dev = ag["dev"]
+        txt = (f"median |acc| at standstill {ag['median']:.3f} m/s^2 vs. gravity model "
+               f"{ag['g']:.3f} m/s^2 ({100.0 * dev:+.1f}%, {ag['n']} samples)")
+        ratio = ag["median"] / ag["g"]
+        if (abs(ratio - STANDARD_GRAVITY_MPS2) < 0.1 * STANDARD_GRAVITY_MPS2
+                or abs(ratio * STANDARD_GRAVITY_MPS2 - 1.0) < 0.1):
+            f.append((SEV_WARN, "accelerometer unit looks wrong (g instead of m/s^2 or "
+                                f"the reverse): {txt}"))
+        elif abs(dev) > ACC_GRAVITY_WARN_FRAC:
+            f.append((SEV_WARN, f"accelerometer scale/offset error: {txt} - the filter "
+                                "estimates the bias, not the scale; calibrate the IMU "
+                                "(tools/inslib_imu_calib.py) or check the unit"))
+        elif abs(dev) > ACC_GRAVITY_INFO_FRAC:
+            f.append((SEV_INFO, f"accelerometer magnitude slightly off gravity: {txt}"))
+        else:
+            f.append((SEV_OK, f"accelerometer magnitude matches gravity: {txt}"))
 
     # --- GNSS accuracy vs. its own reported covariance (standstill) --------
     ga = m["gnss_acc"]
@@ -2315,11 +2585,21 @@ def insdoctor_findings(m):
                             "trouble in the update step"))
     seen, used = diag["n_gnss_seen"], diag["n_gnss_used"]
     if seen > 0:
-        rej = seen - used
+        # Only the stddev gate counts as "rejected for accuracy". The rest of
+        # the unused fixes were skipped whole by the fusion rate limit
+        # (gnss min_delay_ms, default 10 Hz): a receiver faster than that
+        # always loses the in-between fixes, that is pacing and no data error.
+        rej = diag["n_gnss_rejected_noise"]
+        skipped = seen - used - rej
         if rej > 0 and rej / seen > 0.2:
             f.append((SEV_WARN, f"{rej}/{seen} GNSS fixes ({100.0 * rej / seen:.0f}%) not used "
-                                "- gated out by the gnss_max_*_stddev limits, check them "
+                                "- filtered out by the gnss_max_*_stddev limits, check them "
                                 "against the data"))
+        elif skipped > 0 and skipped / seen > 0.2:
+            f.append((SEV_INFO, f"{skipped}/{seen} GNSS fixes ({100.0 * skipped / seen:.0f}%) "
+                                "not fused - skipped by the fusion rate limit (gnss: "
+                                "min_delay_ms) or otherwise unusable, not by the accuracy "
+                                "limits; normal for a receiver faster than the limit"))
         # diag.n_downweighted counts EVERY ins_fuse() call whose chi2 test
         # tripped - GNSS position/velocity, but also the barometric height
         # (REQ-NAV-054), the magnetometer and the zero-velocity updates. Scale
@@ -2702,12 +2982,18 @@ def main():
                          " horizontal solution from a baro-driven height, which"
                          " the scored 3D magnitude mixes together.")
     ap.add_argument("--dump-solution", default=None, metavar="FILE",
-                    help="write the filter's own solution to CSV in the"
-                         " dataset ref format (t_us, lat, lon, h, roll, pitch,"
-                         " yaw, v_ned), so it can be replayed, plotted or"
-                         " compared against another estimator without rerunning"
-                         " this script. Unlike --dump-errors this needs no"
-                         " reference at all.")
+                    help="write the filter's own solution to FILE, so it can"
+                         " be replayed, plotted or compared against another"
+                         " estimator without rerunning this script. Unlike"
+                         " --dump-errors this needs no reference at all."
+                         " FILE.pos: RTKLIB solution format (RTKPLOT), GPS time"
+                         " from the dataset's timesync.csv, without one guessed"
+                         " from the system clock (the header says so)."
+                         " Anything else: CSV in the dataset ref format (t_us,"
+                         " lat, lon, h, roll, pitch, yaw, v_ned) plus the"
+                         " 1-sigma of position, velocity and attitude, usable"
+                         " as another run's ref.csv. With --smooth the"
+                         " smoothed solution goes next to it as FILE_rts.")
     ap.add_argument("--dump-solution-hz", type=float, default=25.0,
                     help="rate of --dump-solution (0 -> every IMU epoch)")
     ap.add_argument("--gnss-outage", action="append", default=[],
@@ -2729,6 +3015,20 @@ def main():
                          "check_simulated.py), but with no gates "
                          "or pass/fail of its own; this stays a pure analysis "
                          "tool.")
+    ap.add_argument("--smooth", action="store_true",
+                    help="also run the offline RTS smoother (tools/ins_rts.py)"
+                         " and print its accuracy next to the filter's. The"
+                         " smoother gets a second forward pass of its own in"
+                         " which ins never stops dead reckoning, so it can"
+                         " bridge an outage the real-time filter gives up on."
+                         " The filter run and its numbers stay unchanged."
+                         " With --plot the PDF gets the smoother's own pages,"
+                         " with --kml its track.")
+    ap.add_argument("--smooth-att-sd-max", type=float, default=None,
+                    metavar="DEG",
+                    help="--smooth: cut the smoother's chain while the"
+                         " filter's attitude 1-sigma is above DEG (see"
+                         " tools/ins_rts.py). Off by default.")
     args = ap.parse_args()
     # Asking for a PDF path obviously means "make the plots": save the user
     # from having to pass --plot as well (a --plot-out without --plot would
@@ -2756,6 +3056,11 @@ def main():
     run = replay_core.Replay(spec, inp, nav, eval_start=args.eval_start,
                              eval_end=args.eval_end,
                              rate_bucket_sec=args.plot_rate_bucket_sec)
+    filter_score = None
+    if args.smooth:
+        import ins_rts
+        filter_score = ins_rts.EpochScore()
+        run.observers.append(filter_score)
     progress, progress_done = _progress_reporter(run.n_imu_total, "imu")
 
     # The GNSS-delay estimate runs on its own whenever it is meaningful
@@ -2785,7 +3090,7 @@ def main():
         run.observers.append(kml_obs)
     sol_obs = None
     if args.dump_solution:
-        sol_obs = _SolutionDump(args.dump_solution, args.dump_solution_hz)
+        sol_obs = ins_solution.SolutionRecorder(args.dump_solution_hz)
         run.observers.append(sol_obs)
     err_obs = None
     if args.dump_errors:
@@ -2796,13 +3101,55 @@ def main():
             pacer=replay_core.Pacer(args.speed) if args.realtime else None)
 
     progress_done()
+    # One time base for the filter's and the smoother's file, guessed from
+    # the system clock when the dataset has no timesync.csv.
+    sol_clock = inp.gps_clock
+    if args.dump_solution and sol_clock is None and run.t0_us is not None:
+        sol_clock = ins_solution.guessed_clock(run.t0_us)
     if sol_obs is not None:
-        sol_obs.close()
+        ins_solution.write(args.dump_solution, sol_obs.solution(), sol_clock,
+                           comment="INSLIB nav_suite solution, tools/replay.py"
+                                   " --dump-solution")
         print(f"solution written to {args.dump_solution}")
     if err_obs is not None:
         err_obs.close()
     run.report()
+    rts_result = smr = None
+    rts_lines = []
+    if args.smooth:
+        print("\nRTS smoother: forward pass with unlimited dead reckoning ...")
+        t_sm = time.time()
+        sm_progress, sm_progress_done = _progress_reporter(run.n_imu_total, "imu")
+        smr = ins_rts.run_smoother(spec, inp, eval_start=args.eval_start,
+                                   eval_end=args.eval_end, progress=sm_progress,
+                                   att_sd_max_deg=args.smooth_att_sd_max)
+        sm_progress_done()
+        rts_result = {
+            "filter": ins_rts.score_filter(filter_score),
+            "rts": ins_rts.score_rts(smr.score, spec["score"].get("leverarm_frd")
+                                     or (0.0, 0.0, 0.0))}
+        rts_lines = ins_rts.score_lines(rts_result["filter"], rts_result["rts"],
+                                        smr.rts.n_cuts)
+        rts_lines.append(f"  {time.time() - t_sm:.1f} s, {len(smr.rts.k_epoch)} "
+                         f"knots, {smr.rts.memory_mb():.0f} MB recorded")
+        print()
+        for line in rts_lines:
+            print(line)
+        if args.dump_solution:
+            rts_path = ins_solution.companion_path(args.dump_solution, "_rts")
+            ins_solution.write(rts_path, ins_rts.solution(smr, args.dump_solution_hz),
+                               sol_clock,
+                               comment="INSLIB RTS smoother solution, tools/replay.py"
+                                       " --smooth --dump-solution")
+            print(f"smoothed solution written to {rts_path}")
     rec = rec_obs.rec if rec_obs is not None else None
+    if smr is not None and rec is not None:
+        # The smoother's pages of the --plot PDF (ins_plots._rts_pages).
+        ins_rts.add_rec_series(rec, smr, run.t0_us, run.origin_ecef,
+                               run.origin_lat, run.origin_lon,
+                               spec["score"].get("leverarm_frd") or (0.0, 0.0, 0.0),
+                               track_hz=args.plot_track_hz or args.plot_hz)
+        rec["rts_lines"] = rts_lines
     # Dr. INS findings: prioritized health check over everything above,
     # printed here and rendered as the --plot PDF's cover page.
     insdoctor = run.findings(rec)
@@ -2836,7 +3183,9 @@ def main():
     if args.kml:
         from ins_kml import write_kml
         write_kml(args.kml, kml_obs.est, kml_obs.ref, kml_obs.fix,
-                  spec["name"] or args.dataset)
+                  spec["name"] or args.dataset,
+                  rts_track=(ins_rts.kml_track(smr, run.t0_us, args.kml_hz)
+                             if smr is not None else ()))
 
     if args.map_frames:
         from ins_map_frames import write_frames
@@ -2872,6 +3221,8 @@ def main():
                 "yaw": {"mean": e_yaw.mean(), "std": e_yaw.std(), "max_abs": e_yaw.max_abs},
             },
         }
+        if rts_result is not None:
+            summary["rts"] = rts_result
         with open(args.summary_json, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
         print(f"\nwrote accuracy summary to {args.summary_json}")
@@ -2902,43 +3253,6 @@ class _TelemetryPublisher(replay_core.Observer):
         self.tele.publish_extra(
             meas_overlay_tree(r.a, r.g, r.last_fix, r.last_mag, r.last_baro,
                               r.origin_ecef, r.origin_lat, r.origin_lon))
-
-
-class _SolutionDump(replay_core.Observer):
-    """--dump-solution: the filter's own trajectory in the dataset ref
-    format. Independent of the reference (there may not be one) and of the
-    warmup, so the caller sees the whole run including the convergence at
-    its start."""
-
-    def __init__(self, path, rate_hz):
-        self.period_us = US_PER_SEC / rate_hz if rate_hz > 0 else 0.0
-        self._last_us = None
-        # newline="\n" so the dataset CSVs stay LF on every platform,
-        # matching datasets/replay_format.py's writers
-        self.f = open(path, "w", encoding="utf-8", newline="\n")
-        self.f.write("# t_us, lat_deg, lon_deg, h_m, roll_deg, pitch_deg,"
-                     " yaw_deg, vn_mps, ve_mps, vd_mps\n")
-        self.f.write("# INSLIB nav_suite solution, tools/replay.py"
-                     " --dump-solution\n")
-
-    def on_epoch(self, r):
-        if self._last_us is not None and (r.t - self._last_us) < self.period_us:
-            return
-        nav = r.nav
-        ecef = nav.position_ecef()
-        rpy = nav.rpy_ins()
-        vel = nav.velocity_ned()
-        if ecef is None or rpy is None or vel is None:
-            return
-        self._last_us = r.t
-        lat, lon, alt = ecef_to_llh(*ecef)
-        self.f.write("%d,%.9f,%.9f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n" % (
-            r.t, math.degrees(lat), math.degrees(lon), alt,
-            math.degrees(rpy[0]), math.degrees(rpy[1]),
-            math.degrees(rpy[2]), vel[0], vel[1], vel[2]))
-
-    def close(self):
-        self.f.close()
 
 
 class _ErrorDump(replay_core.Observer):

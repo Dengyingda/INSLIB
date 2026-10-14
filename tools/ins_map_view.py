@@ -169,14 +169,6 @@ class MapView(QtWidgets.QWidget):
         self.info = QtWidgets.QLabel("no track yet")
 
         bar.addWidget(self.info, 1)
-        self.show_ref = QtWidgets.QCheckBox("Truth")
-        self.show_ref.setChecked(True)
-        self.show_ref.toggled.connect(lambda on: self.c_ref.setVisible(on))
-        bar.addWidget(self.show_ref)
-        self.show_fix = QtWidgets.QCheckBox("GNSS fixes")
-        self.show_fix.setChecked(True)
-        self.show_fix.toggled.connect(lambda on: self.c_fix.setVisible(on))
-        bar.addWidget(self.show_fix)
         self.map_on = QtWidgets.QCheckBox("OpenStreetMap background")
         self.map_on.setToolTip(
             "Fetches map tiles from tile.openstreetmap.org for the area on "
@@ -202,6 +194,9 @@ class MapView(QtWidgets.QWidget):
             [], [], pen=None, symbol="o", symbolSize=4,
             symbolPen=None, name="GNSS fixes")
         self.c_est = self.plot.plot([], [], name="estimate")
+        # The RTS smoother's solution, over the estimate.
+        self.c_rts = self.plot.plot([], [], name="RTS smoother")
+        self._rts_wanted = True
         self.c_here = self.plot.plot(
             [], [], pen=None, symbol="+", symbolSize=14, name="last")
         v.addWidget(self.plot, 1)
@@ -233,6 +228,7 @@ class MapView(QtWidgets.QWidget):
         self.c_ghost.setPen(theme.pen("ghost", 2))
         self.c_fix.setSymbolBrush(theme.T["fix"])
         self.c_est.setPen(theme.pen("map_est", 2))
+        self.c_rts.setPen(theme.pen("rts", 2))
         self.c_here.setSymbolBrush(theme.T["map_here"])
         self.c_here.setSymbolPen(theme.T["map_here"])
 
@@ -265,7 +261,7 @@ class MapView(QtWidgets.QWidget):
         self.origin_merc = None
         self.scale = 1.0
         for c in (self.c_est, self.c_ref, self.c_fix, self.c_here,
-                  self.c_ghost):
+                  self.c_ghost, self.c_rts):
             c.setData([], [])
         # Every tile rect is measured against the origin, and the next
         # track sets a new one. Keeping the pictures would keep them
@@ -274,19 +270,29 @@ class MapView(QtWidgets.QWidget):
         self.images.clear()
         self.info.setText("no track yet")
 
+    def set_ref_visible(self, on):
+        self.c_ref.setVisible(on)
+
+    def set_fix_visible(self, on):
+        self.c_fix.setVisible(on)
+
     def set_ghost_visible(self, on):
         self._ghost_wanted = on
         self.c_ghost.setVisible(on)
 
+    def set_rts_visible(self, on):
+        self._rts_wanted = on
+        self.c_rts.setVisible(on)
+
     def set_tracks(self, est_latlon, ref_latlon, fix_latlon=(),
-                   ghost_latlon=()):
+                   ghost_latlon=(), rts_latlon=()):
         """Replace the view with a replayed trajectory.
 
         est_latlon/ref_latlon/fix_latlon/ghost_latlon: sequences of
         (lat_deg, lon_deg, ...) -- e.g. inspostgui.py's results["kml_est"]/
         ["kml_ref"] rows, extra columns (time, altitude, attitude) are
-        ignored. ghost_latlon is a previous run's estimate. Any may be
-        empty. The origin is the first point of whichever is projected
+        ignored. ghost_latlon is a previous run's estimate, rts_latlon
+        the RTS smoother's solution of this one. Any may be empty. The origin is the first point of whichever is projected
         first (est, then ref, then fix).
         """
         self.clear()
@@ -300,6 +306,7 @@ class MapView(QtWidgets.QWidget):
         ref_xy = project(ref_latlon)
         fix_xy = project(fix_latlon)
         ghost_xy = project(ghost_latlon)
+        rts_xy = project(rts_latlon)
         if est_xy.size:
             self.c_est.setData(est_xy[:, 0], est_xy[:, 1])
             self.c_here.setData([est_xy[-1, 0]], [est_xy[-1, 1]])
@@ -310,6 +317,9 @@ class MapView(QtWidgets.QWidget):
         if ghost_xy.size:
             self.c_ghost.setData(ghost_xy[:, 0], ghost_xy[:, 1])
         self.c_ghost.setVisible(self._ghost_wanted and bool(ghost_xy.size))
+        if rts_xy.size:
+            self.c_rts.setData(rts_xy[:, 0], rts_xy[:, 1])
+        self.c_rts.setVisible(self._rts_wanted and bool(rts_xy.size))
         self.info.setText("estimate %d pts   truth %d pts   GNSS %d fixes"
                           % (len(est_latlon), len(ref_latlon),
                              len(fix_latlon)))

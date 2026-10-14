@@ -22,7 +22,7 @@ exit code and human-readable output.
 
 - **Status:** implemented
 - **Parent:** REQ-VER-002
-- **Verification:** Inspection: datasets/replay_format.py defines the shared config.yaml + imu/ref/gnss/mag/baro/speed/heading/ranges.csv contract (schema documented in doc/INSLIB_manual.tex section "config.yaml", dataset specifics confined to the convert_*.py converters)
+- **Verification:** Inspection: datasets/replay_format.py defines the shared config.yaml + imu/ref/gnss/mag/baro/speed/heading/ranges/timesync.csv contract (schema documented in doc/INSLIB_manual.tex section "config.yaml", dataset specifics confined to the convert_*.py converters)
 
 A single replay harness (one binary, `tools/replay.c`; mirrored by
 `tools/replay.py`) shall consume a dataset-neutral input format: a
@@ -34,7 +34,12 @@ which both harnesses ignore: they read the first seven fields, so a
 dataset written without it stays valid), ref.csv
 (position, attitude, NED velocity), optionally gnss.csv (real GNSS
 measurements with the full NED position and velocity covariance;
-unknown entries zero), mag.csv (calibrated body-frame field [uT]),
+unknown entries zero; optionally followed by the fix quality in RTKLIB's
+numbering, the receiver's GPS week and time of week, the satellites
+used and the receiver's jamming, spoofing and authentication states,
+REQ-VER-045, which the filter does not read, so a gnss.csv without them
+stays valid), timesync.csv (the recording's t_us against GPS time, read by
+tools/replay.py only, REQ-VER-044), mag.csv (calibrated body-frame field [uT]),
 baro.csv (static pressure [Pa]) and speed.csv (scalar ground speed
 [m/s], REQ-NAV-068 -- its per-sample uncertainty and delay come from
 config.yaml as constants, not from further columns) and heading.csv
@@ -313,6 +318,14 @@ re-anchored on the first fix afterwards with the carried states inflated
 Python harness is not run on it: its benchmark is the Groves filter,
 which the two profile datasets are built for and this flight is not.
 
+The C harness shall likewise gate `datasets/simulated/E_gnss_delay`, a
+drone climb/circle/descent whose 2 Hz GNSS fixes arrive 500 ms after their
+time of validity, so the history-anchored delayed fusion is scored against
+truth. Its config opts out of the auto-ZUPT/ZARU for the same reason as
+A_ideal (the vibration-free IMU of the initial steady climb reads as a
+standstill before the first fix arrives) and carries `score:` limits on ins
+attitude, position, the ellipsoid height and the ARS.
+
 ## REQ-VER-017 — Configurable auto-init leveling window
 
 - **Status:** verified
@@ -532,7 +545,8 @@ The replay harness shall, for every gap in the position-aiding stream longer
 than `score: coast_gap_min_sec`, report the filter's position error at the
 first IMU epoch at or after the end of that gap, scored against the
 reference epoch nearest to that IMU epoch, together with the gap's duration
-and the straight-line distance across it, and shall gate that error on
+and the straight-line distance across it, followed by the mean and maximum
+of that error over all gaps that have one, and shall gate that error on
 `score: lim_coast_exit_err_m` when one is configured. A reference epoch
 further than half a second, or half the gap, from that IMU epoch shall not
 be used, and the gap then counts as having no reference epoch.
@@ -1055,3 +1069,207 @@ text names shall exist in src/. `make test` runs this check.
 Rationale: a tutorial is the first code a new user runs. A change to the
 start-up gates, a renamed function or a new source file the build line
 does not list breaks it without any other test noticing.
+
+## REQ-VER-043 — Offline RTS smoother in the replay tooling
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: python/tests/test_ins_rts.py:test_state_minus_inverts_the_correction; Test: python/tests/test_ins_rts.py:test_backward_pass_matches_the_textbook_rts; Test: python/tests/test_ins_rts.py:test_a_bias_only_correction_is_a_knot; Test: python/tests/test_ins_rts.py:test_a_growing_variance_cuts_the_chain; Test: python/tests/test_ins_rts.py:test_smoother_beats_the_filter_through_an_outage; Test: python/tests/test_ins_rts.py:test_replay_py_smooth_keeps_the_filter_numbers; Test: python/tests/test_ins_rts.py:test_kml_track_is_the_smoothed_solution; Test: python/tests/test_ins_rts.py:test_gui_worker_smooths_and_the_window_shows_it; Demonstration: datasets/kfgins with tools/replay.py --smooth: position RMS 26 mm -> 17 mm, maximum 271 mm -> 69 mm, velocity RMS 9.8 -> 4.9 mm/s, the filter's own numbers unchanged, and with a 60 s GNSS outage (--gnss-outage 1200:60) the filter's 11.0 m maximum position error inside the outage drops to 0.07 m
+
+tools/replay.py --smooth and the RTS smoother of tools/inspostgui.py
+shall run a Rauch-Tung-Striebel smoother (tools/ins_rts.py) over a
+forward pass of the unchanged library: every epoch split into
+predict() and correct(), recording Phi, P(k|k-1), P(k|k) and the nominal
+state, then the backward pass in the filter's error convention (dx =
+nominal - truth, attitude through the full rotation), with the smoothed
+solution at the full IMU rate. The smoother's forward pass shall be a
+second replay with allow_unlimited_deadreckoning, so an outage the
+real-time filter gives up on is bridged. The chain shall be cut where
+the filter is no plain Kalman filter: ins not ready, a new local origin,
+a changed state count, or a correction that grows a variance by more
+than 5 %. The filter's own run and every number it reports shall stay
+the same with the smoother on. Its accuracy shall be reported next to
+the filter's at the same scored epochs (position, velocity, attitude),
+in the summary JSON, in pages of the --plot PDF, as a KML path, and in
+the GUI as a 3D trail, a Map tab track, plot series and in the Last run
+panel.
+
+Rationale: the library is a real-time filter, post-processing gains from
+using the measurements after an epoch as well. Running it on the
+existing C API keeps one filter implementation. The second forward
+pass is needed because a filter that stopped dead reckoning leaves no
+trajectory to smooth across the outage, which is where smoothing gains
+most.
+
+## REQ-VER-044 — Solution files
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: python/tests/test_ins_solution.py:test_gps_clock_fits_offset_and_rate; Test: python/tests/test_ins_solution.py:test_gps_clock_utc_grid_suspect_and_single_pair; Test: python/tests/test_ins_solution.py:test_gps_clock_refit_bad_rows_and_restart_segments; Test: python/tests/test_ins_solution.py:test_guessed_clock_is_the_system_time; Test: python/tests/test_ins_solution.py:test_gpst_strings; Test: python/tests/test_ins_solution.py:test_pos_layout; Test: python/tests/test_ins_solution.py:test_csv_is_a_ref_csv; Test: python/tests/test_ins_solution.py:test_replay_py_dump_solution; Test: python/tests/test_ins_solution.py:test_gui_exports_the_solution
+
+tools/replay.py --dump-solution and inspostgui.py's Export solution
+shall write the filter's solution, and with the RTS smoother on the
+smoothed one next to it as <name>_rts, in the format the file extension
+picks (tools/ins_solution.py): .pos the RTKLIB solution format (GPST,
+geodetic position, Q, the ENU position 1-sigma and signed covariance
+roots, age, the demo5 velocity columns), anything else a CSV in the
+ref.csv layout plus the position, velocity and attitude 1-sigma, which
+both harnesses accept as a ref.csv. In the .pos, Q shall be the quality
+of the last GNSS fix while the position is aided (1 where unknown) and
+5 while dead reckoning, ns its satellite count while aided (0 where
+unknown and while dead reckoning), age the seconds since the last absolute
+position aiding. The time shall be GPS time from the dataset's
+timesync.csv: offset and rate of the recording clock fitted to its
+pulse pairs (the offset alone from one pair), TP_SUSPECT pairs left
+out, a pair a whole second off the line dropped by a refit, a pair on
+the receiver's UTC grid named in the file header but not corrected, a
+row whose flags do not parse skipped, and of several clock segments
+(recorder restarts, the mcu_restarts column) only the one with the most
+pairs fitted, named in the header.
+Without timesync.csv the first epoch shall be put at the system clock
+of the export and the header shall say the time is guessed, one guess
+for the filter's and the smoother's file.
+
+Rationale: a solution has to leave the tool to be compared with other
+estimators (RTKPLOT reads .pos) or reused as a reference, and a
+comparison needs a common time base. The recording's microsecond timer
+is only that once mapped onto GPS time, which the recorder's
+pulse-per-second pairs do, rate included (a crystal is tens of ppm
+off).
+
+## REQ-VER-045 — GNSS fix quality, latency and receiver integrity in the evaluation
+
+- **Status:** verified
+- **Parent:** REQ-VER-003
+- **Verification:** Test: python/tests/test_gnss_quality_latency.py:test_quality_and_latency_stats; Test: python/tests/test_gnss_quality_latency.py:test_integrity_stats_and_short_rows; Test: python/tests/test_gnss_quality_latency.py:test_replay_reports_quality_and_latency; Test: python/tests/test_gnss_quality_latency.py:test_delay_below_latency_and_implausible_latency_are_findings; Test: python/tests/test_gnss_quality_latency.py:test_pdf_page_and_gui_plots
+
+gnss.csv shall optionally carry the fix quality (RTKLIB solution status
+numbering: 1 RTK fixed, 2 RTK float, 3 SBAS, 4 DGNSS, 5 single point,
+6 PPP, 0 unknown), the receiver's GPS week and time of week of the
+fix, the satellites used, the receiver's jamming and spoofing
+indications (1 none, 2 warning/indicated, 3 critical/confirmed) and
+whether the signals and the navigation message were authenticated
+(1 no, 2 yes, 3 failed) as trailing columns, 0 unknown, the first 20
+columns unchanged and a row that stops early read as unknown for the
+rest. The replay evaluation shall report the share of each quality,
+the satellite count (median, minimum), the share of each known
+jamming, spoofing and authentication state and, with a
+timesync.csv, the transport latency of the fixes (the row's t_us minus
+the recorder's t_us of the fix's own GPS time; median, 5 and 95
+percentile) in the data quality summary, as Dr. INS findings, on a page
+of the --plot PDF and on the GUI's Plots tab. A configured gnss:
+delay_ms more than 20 ms below the measured median latency shall be a
+warning, a median outside -50 ms .. 2 s a warning that the two clocks
+do not belong together. Any jamming or spoofing indication and any
+failed authentication shall be a warning.
+
+Rationale: the fix type decides how far a fix can be trusted and is
+what a later filter-side use of it needs recorded. Signal and
+navigation message authentication and the receiver's interference
+monitor decide whether a fix can be trusted at all: the columns are
+there before every producer fills them, so a later recording carries
+them without another format change. The configured GNSS
+delay was an assumption: the measured transport latency is the lower
+bound it cannot go below (the receiver's own filter lag adds to it),
+and an implausible latency exposes a timesync.csv that does not belong
+to the recording.
+
+## REQ-VER-046 — Configurable ARS/AHRS leveling and magnetometer tuning
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: tools/replay.c:main; Test: python/tests/test_ahrs_tuning.py:test_zero_leaves_defaults; Test: python/tests/test_ahrs_tuning.py:test_acc_freq_reaches_both_filters
+
+The replay harnesses (tools/replay.c and tools/replay.py, schema shared)
+shall accept the `ahrs:` keys `acc_freq_hz`, `acc_cutoff_freq_hz`,
+`gravity_diff_penalty`, `acc_reject_gravity_mps2`, `chi2_threshold`,
+`kalman_update_dt_sec`, `mag_yaw_stddev_deg`, `mag_freq_hz` and
+`mag_chi2_threshold`, the fields of the same names in `ahrs_config_t`
+(ahrs.h, `mag_yaw_stddev_deg` in degrees), and apply each to both
+`ars_cfg` and `ahrs_cfg`. A key left at 0 shall leave the field at ahrs's
+own default, `gravity_diff_penalty` and `acc_reject_gravity_mps2` also
+accept a negative value (penalty off, rejection disabled). The Python
+binding shall expose them as `Navigator.set_ahrs_tuning()`
+(python/csrc's `ins_suite_set_ahrs_tuning()`).
+
+Rationale: the leveling path (accelerometer rate and low-pass, the
+gravity-norm gating and the chi2 gate) decides how well the ARS holds
+roll and pitch through accelerations. It could only be tuned by editing
+the library defaults, which is not workable when several recordings with
+a true attitude reference have to be compared run by run.
+
+## REQ-VER-047 — Reference rows scored at the estimate's epoch
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: tools/replay.c:main; Test: python/tests/test_replay_core.py:test_reference_attitude_is_interpolated_to_the_estimate_epoch
+
+The replay harnesses (tools/replay.c, tools/replay.py) shall carry the
+position estimate back to the timestamp of the reference row it is
+scored against with the filter's own velocity (not every ref.csv
+carries one) before forming the position error, shall score the
+attitude against the reference attitude interpolated to the estimate's
+epoch between that row and the next one (not across rows further apart
+than 1 s), and the C harness shall
+hand each GNSS or reference-derived fix to the filter with its age
+relative to the IMU epoch it is attached to (gnss_delay_us,
+REQ-NAV-092), tools/insrcv.c likewise relative to the newest IMU sample
+before the fix arrived.
+
+Rationale: rows are attached to the first IMU epoch at or after their
+timestamp, so both a fix and a reference row are up to one IMU period
+older than that epoch. Before REQ-NAV-092 the filter fused the fix as
+current and lagged the truth by that age; scoring the lagging estimate
+against an equally old reference row hid the lag whenever the two
+shared timestamps (the Crazyflie captures). Compensating only the
+filter would then read as a regression of speed times age. The same age
+turns into an attitude error of rotation rate times age: on a 200 Hz
+car trial whose IMU samples trail the reference rows by 4.4 ms it made
+up most of the scored yaw scatter, so a gate on it measured the
+timestamps rather than the filter.
+
+## REQ-VER-048 — ARS/AHRS tuning in the live receiver
+
+- **Status:** verified
+- **Parent:** REQ-VER-046
+- **Verification:** Inspection: tools/insrcv.c:config_set reads every `ahrs:` key of the shared schema, tools/insrcv.c:suite_apply_ahrs_cfg writes them into both `ars_cfg` and `ahrs_cfg` between nav_suite_init and the first update with the same fallbacks as tools/replay.c:main
+
+The live receiver (tools/insrcv.c) shall accept the whole `ahrs:`
+config section of the shared schema (`gyr_noise_psd`, `gyr_bias_rw`,
+`acc_noise_mps2`, `rpy_pred_stddev_rad_sqrts`,
+`gyr_bias_init_stddev_rps_deg` and the REQ-VER-046 tuning keys) and
+apply it to both `ars_cfg` and `ahrs_cfg` the way tools/replay.c does:
+`gyr_noise_psd` and `gyr_bias_rw` left at 0 are derived from `imu:`
+(`sqrt(gyr_psd)`, `gyr_bias_rw`), `gyr_bias_init_stddev_rps_deg` at 0
+leaves the initial bias uncertainty unchanged, every other key at 0
+leaves the field at ahrs's own default, and `gravity_diff_penalty` and
+`acc_reject_gravity_mps2` pass a negative value through.
+
+Rationale: config.yaml is shared between the live receiver and the
+replay harnesses so that a tuning found offline is the tuning that runs
+live. The receiver named the `ahrs:` keys as unused and ran its ARS/AHRS
+on ahrs's built-in defaults, so the attitude filters behaved differently
+live than in the replay that had tuned them.
+
+## REQ-VER-049 — Configurable ins covariance-prediction period
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: python/tests/test_kalman_cadence.py:test_key_reaches_ins_options; Test: python/tests/test_kalman_cadence.py:test_imu_rate_prediction_grows_covariance_sooner; Test: tools/replay.c:main; Inspection: tools/insrcv.c:config_set reads the top-level key and tools/insrcv.c:suite_bootstrap hands it to ins_options_t.kalman_update_dt_sec
+
+The replay harnesses (tools/replay.py and tools/replay.c, schema shared),
+the live receiver (tools/insrcv.c) and the config editor of
+tools/inspostgui.py shall accept the top-level config key
+`kalman_update_dt_sec` [s] and pass it to
+`ins_options_t.kalman_update_dt_sec`. A value of 0 shall leave ins's own
+covariance-prediction default in force.
+
+Rationale: ins propagates the covariance at a fixed period below the IMU
+rate to save CPU time on a microcontroller, while the strapdown itself
+runs at the full IMU rate. On the KF-GINS datasets (200 Hz IMU, car with
+1 Hz RTK) predicting at the IMU rate lowered the yaw error on the
+ICM20602 from 0.233 to 0.179 deg rms and on the ADIS16465 from 0.119 to
+0.106 deg rms. The option already existed in the library and the Python
+binding, but none of the front ends could set it, so a comparison against
+an estimator that predicts at the IMU rate had to run with a handicap
+nobody had chosen.

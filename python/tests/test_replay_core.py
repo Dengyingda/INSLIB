@@ -238,10 +238,28 @@ def test_gui_config_editor_covers_the_schema():
     assert not have - schema, f"editor fields outside the schema: {sorted(have - schema)}"
 
 
+def test_reference_attitude_is_interpolated_to_the_estimate_epoch():
+    # REQ-VER-047: a row 4 ms older than the estimate, the next one 1 ms
+    # newer, yaw crossing +-180 deg in between
+    import math
+    deg = math.radians
+    row = {"t_us": 1_000_000, "roll_rad": deg(1.0), "pitch_rad": 0.0, "yaw_rad": deg(179.0)}
+    nxt = {"t_us": 1_005_000, "roll_rad": deg(2.0), "pitch_rad": 0.0, "yaw_rad": deg(-179.0)}
+    rpy = replay_core.ref_rpy_at(row, nxt, 1_004_000)
+    assert abs(math.degrees(rpy[0]) - 1.8) < 1e-9
+    assert abs(math.degrees(replay.wrap_pi(rpy[2])) - (-179.4)) < 1e-9
+    # at the row's own epoch, without a next row and across a gap: the row
+    assert replay_core.ref_rpy_at(row, nxt, 1_000_000)[0] == row["roll_rad"]
+    assert replay_core.ref_rpy_at(row, None, 1_004_000)[0] == row["roll_rad"]
+    far = dict(nxt, t_us=row["t_us"] + replay_core.REF_ATT_INTERP_MAX_US + 1)
+    assert replay_core.ref_rpy_at(row, far, 1_004_000)[0] == row["roll_rad"]
+
+
 if __name__ == "__main__":
     fails = 0
     for fn in (test_gnss_outage_windows_parse,
                test_gnss_outage_cut_is_anchored_on_the_first_imu_sample,
+               test_reference_attitude_is_interpolated_to_the_estimate_epoch,
                test_estimate_stays_in_the_replay_frame_after_an_origin_reset,
                test_gui_worker_and_replay_py_agree,
                test_gui_config_editor_covers_the_schema):

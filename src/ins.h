@@ -321,11 +321,15 @@ typedef struct
                                    body frame [m] */
 
     /* GNSS time-of-validity, informational only. The filter does not use
-     * it for latency compensation: set gnss_delay_ms, which states how old
-     * the measurement is and is history-anchored. */
-    int gps_week;      /**< 0 if unknown */
-    int gps_itow_ms;   /**< 0 if unknown */
-    int gnss_delay_ms; /**< >0: this many ms old. 0 = now. */
+     * it for latency compensation: set gnss_delay_ms (and gnss_delay_us),
+     * which state how old the measurement is and are history-anchored. */
+    int     gps_week;      /**< 0 if unknown */
+    int     gps_itow_ms;   /**< 0 if unknown */
+    int     gnss_delay_ms; /**< >0: this many ms old. 0 = now. */
+    int32_t gnss_delay_us; /**< >0: further age [us], added to
+                                gnss_delay_ms (REQ-NAV-092), e.g. how much
+                                older the fix is than the IMU epoch it is
+                                handed over with. 0 = none. */
 
     /* Local position aiding (e.g. lighthouse/UWB/mocap) */
     ins_meas_local_pos_t local_pos;               /**< local NED position */
@@ -335,12 +339,19 @@ typedef struct
                                                        many ms old (residual is
                                                        anchored in the history,
                                                        like GNSS). 0 = now. */
+    int32_t local_pos_delay_us;                   /**< >0: further age [us],
+                                                       added to
+                                                       local_pos_delay_ms
+                                                       (REQ-NAV-092). 0 = none. */
 
     /* Absolute yaw aiding (e.g. lighthouse pose, dual-antenna GNSS) */
     ins_meas_yaw_t yaw;          /**< yaw (heading) measurement */
     int            yaw_delay_ms; /**< >0: measurement is this many
                                       ms old (history-anchored).
                                       0 = now. */
+    int32_t yaw_delay_us;        /**< >0: further age [us], added to
+                                      yaw_delay_ms (REQ-NAV-092).
+                                      0 = none. */
 
     /** External attitude/gyro-bias seed for auto-init and re-acquisition
      *  (REQ-NAV-048), e.g. nav_suite's ARS/AHRS (REQ-SUITE-016). */
@@ -363,6 +374,9 @@ typedef struct
     int              speed_delay_ms; /**< >0: measurement is this many ms
                                           old (residual anchored in the
                                           history, like GNSS). 0 = now. */
+    int32_t speed_delay_us;          /**< >0: further age [us], added to
+                                          speed_delay_ms (REQ-NAV-092).
+                                          0 = none. */
 
     /* Virtual measurements */
     bool zero_velocity_update; /**< we know v == 0 */
@@ -1442,9 +1456,13 @@ typedef struct
                                               always hold a real average by
                                               the time the first trigger can
                                               fire */
+    bool auto_zupt_dwelled;               /**< the current stillness run has
+                                              passed the dwell time, cleared
+                                              with auto_zupt_var_since
+                                              (ins_auto_zupt_active, REQ-NAV-013) */
     ins_time_us_t t_last_auto_zupt;       /**< time of the last
-                                              auto-triggered update
-                                              (0 = never) */
+                                               auto-triggered update
+                                               (0 = never) */
     float auto_zupt_gyr_sum[3];           /**< raw gyro sum over the current
                                             stillness run, fused as an average
                                             by the zero-rotation update.

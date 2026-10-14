@@ -230,6 +230,9 @@ def _bind_family(p):
     for n in ("set_gnss_delay_ms", "set_yaw_delay_ms",
               "set_local_pos_delay_ms"):
         g(n).argtypes = [ctypes.c_void_p, ctypes.c_int]
+    for n in ("set_gnss_delay_us", "set_local_pos_delay_us", "set_yaw_delay_us",
+              "set_speed_delay_us"):
+        g(n).argtypes = [ctypes.c_void_p, ctypes.c_int32]
     g("set_magnetic_model_position").argtypes = [
         ctypes.c_void_p, ctypes.c_double, ctypes.c_double, ctypes.c_float]
     g("update").argtypes = [ctypes.c_void_p]
@@ -312,6 +315,7 @@ def _bind():
     L.ins_suite_set_ahrs_gyr_bias_rw.argtypes = [ctypes.c_void_p, ctypes.c_float]
     L.ins_suite_set_ahrs_rpy_pred_stddev.argtypes = [ctypes.c_void_p, ctypes.c_float]
     L.ins_suite_set_ahrs_gyr_bias_init_stddev.argtypes = [ctypes.c_void_p, ctypes.c_float]
+    L.ins_suite_set_ahrs_tuning.argtypes = [ctypes.c_void_p] + [ctypes.c_float] * 9
     L.ins_suite_set_init_att_hint.argtypes = [ctypes.c_void_p, ctypes.c_float,
                                               ctypes.c_float, ctypes.c_float,
                                               ctypes.c_float, ctypes.c_float]
@@ -655,12 +659,14 @@ class _Base:
         # row-major (i,j)=flat[3i+j] -> column-major out[i+3j]=flat[3i+j]
         return _f9(*[flat[3 * i + j] for j in range(3) for i in range(3)])
 
-    def gnss_pos_llh(self, llh, var_ned, delay_ms=0):
+    def gnss_pos_llh(self, llh, var_ned, delay_ms=0, delay_us=0):
         """GNSS position as the receiver reports it: latitude [rad],
         longitude [rad], height above the WGS84 ellipsoid [m].
         ``var_ned`` is the NED position variance, either a length-3
         diagonal or a full 3x3; ``delay_ms`` is the fix's age at the
-        moment it is handed over.
+        moment it is handed over, ``delay_us`` a further age in
+        microseconds added to it (REQ-NAV-092), e.g. how much older the
+        fix is than the IMU epoch it is attached to.
 
         This is the only position input: the filter builds its residual
         from the geodetic difference to its own anchor. A source that is
@@ -673,6 +679,8 @@ class _Base:
             self._c("set_gnss_pos_llh")(self._h, _d3(*llh), _f3(*var_ned))
         if delay_ms:
             self._c("set_gnss_delay_ms")(self._h, int(delay_ms))
+        if delay_us:
+            self._c("set_gnss_delay_us")(self._h, int(delay_us))
 
     def gnss_vel(self, vel_ned, var_ned):
         """GNSS NED velocity; ``var_ned`` diagonal (3) or full 3x3 like
@@ -700,17 +708,21 @@ class _Base:
     def mag(self, data, var):
         self._c("set_mag")(self._h, _f3(*data), _f3(*var))
 
-    def yaw(self, yaw_rad, stddev_rad, delay_ms=0):
+    def yaw(self, yaw_rad, stddev_rad, delay_ms=0, delay_us=0):
         self._c("set_yaw")(self._h, float(yaw_rad), float(stddev_rad))
         if delay_ms:
             self._c("set_yaw_delay_ms")(self._h, int(delay_ms))
+        if delay_us:
+            self._c("set_yaw_delay_us")(self._h, int(delay_us))
 
     def local_pos(self, pos_ned, var_ned, leverarm_b=(0.0, 0.0, 0.0),
-                  delay_ms=0):
+                  delay_ms=0, delay_us=0):
         self._c("set_local_pos")(self._h, _f3(*pos_ned), _f3(*var_ned),
                                  _f3(*leverarm_b))
         if delay_ms:
             self._c("set_local_pos_delay_ms")(self._h, int(delay_ms))
+        if delay_us:
+            self._c("set_local_pos_delay_us")(self._h, int(delay_us))
 
     def baro(self, pressure_pa, stddev_m=0.0):
         """Barometer static pressure [Pa] (stddev of the derived altitude
@@ -718,7 +730,7 @@ class _Base:
         The bare Ins accepts but ignores it."""
         self._c("set_baro")(self._h, float(pressure_pa), float(stddev_m))
 
-    def speed(self, speed_mps, stddev_mps=0.0, delay_ms=0):
+    def speed(self, speed_mps, stddev_mps=0.0, delay_ms=0, delay_us=0):
         """Absolute speed aiding (REQ-NAV-068): the scalar magnitude of the
         velocity, e.g. an OBD-II vehicle speed or a wheel-odometry rate.
 
@@ -726,9 +738,12 @@ class _Base:
         systematic scale error belongs in the config's speed_scale /
         speed_stddev_rel, where a constant bias can be removed instead of
         being disguised as noise. delay_ms is how old the sample is; it is
-        history-anchored exactly like a delayed GNSS fix."""
+        history-anchored exactly like a delayed GNSS fix, delay_us adds a
+        microsecond part (REQ-NAV-092)."""
         self._c("set_speed")(self._h, float(speed_mps), float(stddev_mps),
                              int(delay_ms))
+        if delay_us:
+            self._c("set_speed_delay_us")(self._h, int(delay_us))
 
     def range(self, anchor_ecef, range_m, stddev_m, delay_ms=0, anchor_id=0):
         """Range to an anchor at a known position (REQ-NAV-082): anchor in

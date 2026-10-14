@@ -273,6 +273,25 @@ class Navigator(_Base):
         as set_ahrs_gyr_noise()."""
         self._c("set_ahrs_gyr_bias_init_stddev")(self._h, float(stddev_rps))
 
+    def set_ahrs_tuning(self, acc_freq_hz=0.0, acc_cutoff_freq_hz=0.0,
+                        gravity_diff_penalty=0.0, acc_reject_gravity_mps2=0.0,
+                        chi2_threshold=0.0, kalman_update_dt_sec=0.0,
+                        mag_yaw_stddev_rad=0.0, mag_freq_hz=0.0,
+                        mag_chi2_threshold=0.0):
+        """Set the ARS's/AHRS's SHARED accelerometer-leveling and
+        magnetometer tuning, the ahrs_config_t fields of the same names (see
+        ahrs.h for units and meaning); both sub-filters' templates at once.
+        0 leaves a field at ahrs's own default. gravity_diff_penalty and
+        acc_reject_gravity_mps2 also take a negative value through (penalty
+        -> 0, reject -> disabled), all others ignore <= 0. Same timing
+        contract as set_ahrs_gyr_noise()."""
+        self._c("set_ahrs_tuning")(
+            self._h, float(acc_freq_hz), float(acc_cutoff_freq_hz),
+            float(gravity_diff_penalty), float(acc_reject_gravity_mps2),
+            float(chi2_threshold), float(kalman_update_dt_sec),
+            float(mag_yaw_stddev_rad), float(mag_freq_hz),
+            float(mag_chi2_threshold))
+
     def zaru_active(self):
         """True if a zero-rotation update was applied to the ARS/AHRS on
         the last update() (explicit flag OR'd with ins's own auto-ZUPT/

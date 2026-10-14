@@ -106,8 +106,7 @@ typedef struct
 
     /* Sensor noise model */
     float gyr_noise_psd;  /**< gyro spectral noise density [(rad/s)/sqrt(Hz)]
-                               (0 -> default, shared with INS, see
-                               sensor_defaults.h) */
+                               (0 -> default, see sensor_defaults.h) */
     float gyr_bias_rw;    /**< gyro bias random walk [(rad/s^2)/sqrt(Hz)]
                                (0 -> default, shared with INS, see
                                sensor_defaults.h) */
@@ -121,9 +120,7 @@ typedef struct
      *  not describe (gyro scale factor and misalignment under rotation, a
      *  non-rigid mount). The tuning knob, while gyr_noise_psd stays the
      *  sensor's own figure. Same role as ins_init_t's field of that name.
-     *  (<= 0 -> none: the generic gyr_noise_psd default already carries a
-     *  typical MEMS IMU's margin, set this when gyr_noise_psd is a good
-     *  sensor's own, much smaller figure) */
+     *  (<= 0 -> default, see sensor_defaults.h) */
     float rpy_pred_stddev_rad_sqrts;
 
     /** IMU loss timeout [s] (REQ-AHRS-029): a sample this long after the

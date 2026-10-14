@@ -37,6 +37,14 @@ imu:
 # injected but NOT estimated by ins, so the estimate lands close to these
 # numbers, not exactly on them.
 
+
+# The ARS/AHRS extra attitude noise defaults to a margin sized for a
+# consumer MEMS gyro. Here the gyro is far better than that and the
+# limits below were measured without the margin, so pin it to a negligible
+# value (a value <= 0 would select the default).
+ahrs:
+  rpy_pred_stddev_rad_sqrts: 1.0e-9
+
 gnss:
   leverarm_frd: [0.0, 0.0, 0.0]    # IMU and GNSS colocated (Groves)
   vel_stddev_fallback_mps: 0.1

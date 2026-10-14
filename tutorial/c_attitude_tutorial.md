@@ -21,10 +21,10 @@ velocity, continue with [c_tutorial.md](c_tutorial.md).
 
 | Output | Quality |
 |--------|---------|
-| Roll, pitch | Drift-free. The accelerometer measures gravity and keeps them anchored. |
-| Gyroscope bias (x, y, z) | Estimated and removed continuously. |
+| Roll, pitch | Drift-free. The accelerometer measures gravity and prevents long term drift. |
+| Gyroscope bias (x, y, z) | Estimated online and removed continuously. |
 | Roll/pitch 1-sigma | Reported by the filter. |
-| Yaw | **Not usable.** It is only the integrated z gyro and drifts. Without a magnetometer or other heading source there is nothing to anchor it. |
+| Yaw | **Not north referenced.** It is only the integrated z gyro and drifts. Without a magnetometer or other heading source there is nothing to prevent drift. |
 
 Internally this is a 5-state error-state Kalman filter: roll error, pitch
 error and three gyro bias components. The gyroscope drives the attitude at
@@ -68,7 +68,7 @@ against your IMU driver first:
 
 * **Body frame is FRD**: x forward, y right, z down. If your sensor is
   mounted differently, rotate the samples into FRD *before* you call the
-  filter.
+  filter. Quite often IMUs use a different coordinate system.
 * **Gyroscope in rad/s**, not deg/s.
 * **Accelerometer in m/s², not g.** And it is the *specific force*: what the
   sensor measures. A level sensor at rest reads **-9.81 on z** (the
@@ -118,6 +118,7 @@ static bool imu_read(int64_t* t_us, float gyr_rps[3], float acc_mps2[3])
     if (n >= 500) { return false; }
     *t_us = (int64_t)(++n) * 10000;
 
+    /* TODO: read sensor data here */
     gyr_rps[0] = 0.0f;
     gyr_rps[1] = 0.0f;
     gyr_rps[2] = 0.0f;
@@ -314,12 +315,12 @@ and removes it:
   stationary (wheel encoders, a "motor off" flag), pass `true` as the last
   `ahrs_update()` argument for those epochs.
 
-A platform that vibrates at standstill (a running engine) may not look
-still to the automatic detector, which is deliberately strict. In that
-case the filter simply does not use it and relies on the accelerometer for
-the x/y bias, which still works. If the detector were to arm wrongly on a
-vehicle that cruises smoothly at constant speed, switch it off with
-`cfg.auto_zaru_disable = true` and use your own flag instead.
+A platform that vibrates at standstill (a running engine) may not look still to
+the automatic detector, which is strict. In that case the filter simply does
+not use it and relies on the accelerometer for the x/y bias, which still works.
+If the detector were to arm wrongly on a vehicle that cruises smoothly at
+constant speed, switch it off with `cfg.auto_zaru_disable = true` and use your
+own flag instead.
 
 The estimated bias can be given a head start if you stored it from the
 last run: set `cfg.gyr_bias_init_rps` and `cfg.gyr_bias_init_stddev_rps`.
@@ -332,13 +333,13 @@ most for roll/pitch:
 
 | Field | Meaning | When to change |
 |-------|---------|----------------|
-| `acc_noise_mps2` | How much each accelerometer correction is trusted [m/s²]. Also acts as the margin for non-gravity acceleration. | Larger on a vibrating or accelerating platform (a vehicle, a drone), smaller on a quiet one. |
+| `acc_noise_mps2` | How much each accelerometer correction is trusted [m/s²]. This is NOT only the sensor noise: also acts as the margin for non-gravity acceleration. | Larger on a vibrating or accelerating platform (a vehicle, a drone), smaller on a quiet one. |
 | `acc_freq_hz` | Maximum rate of accelerometer corrections [Hz]. | Lower if accelerations corrupt the attitude, higher if gyro bias tracking is too slow. |
 | `gravity_diff_penalty` | Extra distrust when the accelerometer magnitude differs from g. | Higher for more resistance during manoeuvres. |
 | `acc_reject_gravity_mps2` | Hard-reject the correction when `abs(norm(acc) - g)` exceeds this [m/s²]. | Rarely. |
 | `acc_cutoff_freq_hz` | Low-pass cut-off on the accelerometer [Hz]. | Lower on a vibrating platform, at the cost of delay. |
 | `gyr_noise_psd`, `gyr_bias_rw` | Gyro noise density and bias random walk from the datasheet or an Allan variance plot (`tools/allan_variance.py`). | If you know them. A better gyro left at the default is merely fused too cautiously. |
-| `rpy_pred_stddev_rad_sqrts` | Extra attitude process noise [rad/√s] on top of the gyro noise, for what the sensor figure leaves out (scale factor and misalignment under rotation, a non-rigid mount). | Off by default. Set it once the two gyro fields above hold a good sensor's own figures (datasheet, Allan variance), otherwise the filter becomes overconfident in attitude. Larger if the attitude stddev looks too optimistic. |
+| `rpy_pred_stddev_rad_sqrts` | Extra attitude process noise [rad/√s] on top of the gyro noise, for what the sensor figure leaves out (scale factor and misalignment under rotation, a non-rigid mount). | Has a default (0 selects it). Make it larger if the attitude stddev looks too optimistic. |
 | `imu_loss_timeout_sec` | Gap in the IMU stream [s] that counts as an IMU loss and stops the filter. | Larger only if your IMU delivers in bursts that far apart. |
 
 The basic trade-off: **the gyro is the fast and accurate short-term

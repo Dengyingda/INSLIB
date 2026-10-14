@@ -193,6 +193,8 @@ static void stats_line_break(void);
    couple of dozen messages per round, so it gets a rate of its own well
    below the standard messages, exactly as the Python sender does. */
 #define MAV_SUBFILTER_HZ_DEFAULT 5.0
+/* Rate of ATTITUDE and LOCAL_POSITION_NED. */
+#define MAV_POSE_HZ_DEFAULT 60.0
 /* GLOBAL_POSITION_INT's "heading unknown". */
 #define MAV_HDG_UNKNOWN 65535u
 /* How long after the last GNSS fix ins accepted the MAVLink "gnss_used"
@@ -1111,7 +1113,8 @@ typedef struct
 } mav_sender_t;
 
 /* net_init() has already run in main(), same as for pj_open(). */
-static bool mav_open(mav_sender_t* p, const char* ip, int port, double subfilter_hz)
+static bool mav_open(mav_sender_t* p, const char* ip, int port, double subfilter_hz,
+                     double pose_hz)
 {
     int i;
     memset(p, 0, sizeof(*p));
@@ -1137,11 +1140,16 @@ static bool mav_open(mav_sender_t* p, const char* ip, int port, double subfilter
 
     if (!(subfilter_hz > 0.0)) { subfilter_hz = MAV_SUBFILTER_HZ_DEFAULT; }
     p->interval[MAV_RATE_HEARTBEAT]  = 1.0;
-    p->interval[MAV_RATE_LOCAL_POS]  = 1.0 / 50.0;
-    p->interval[MAV_RATE_GLOBAL_POS] = 1.0 / 20.0;
+    p->interval[MAV_RATE_LOCAL_POS]  = 1.0 / MAV_POSE_HZ_DEFAULT;
+    p->interval[MAV_RATE_GLOBAL_POS] = 1.0 / 10.0;
     p->interval[MAV_RATE_GPS_RAW]    = 1.0 / 5.0;
     p->interval[MAV_RATE_ALTITUDE]   = 1.0 / 20.0;
-    p->interval[MAV_RATE_ATTITUDE]   = 1.0 / 50.0;
+    p->interval[MAV_RATE_ATTITUDE]   = 1.0 / MAV_POSE_HZ_DEFAULT;
+    if (pose_hz > 0.0)
+    {
+        p->interval[MAV_RATE_LOCAL_POS] = 1.0 / pose_hz;
+        p->interval[MAV_RATE_ATTITUDE]  = 1.0 / pose_hz;
+    }
     p->interval[MAV_RATE_IMU]        = 1.0 / 50.0;
     p->interval[MAV_RATE_EKF_STATUS] = 1.0 / 10.0;
     p->interval[MAV_RATE_SUBFILTER]  = 1.0 / subfilter_hz;
@@ -1152,7 +1160,11 @@ static bool mav_open(mav_sender_t* p, const char* ip, int port, double subfilter
 static bool mav_due(mav_sender_t* p, mav_rate_t k, double now)
 {
     if (now < p->next[k]) { return false; }
-    p->next[k] = now + p->interval[k];
+    /* Advance from the previous deadline, not from now: the caller only
+       asks at publish epochs, and restarting from now rounds every period
+       up to the next epoch (16.7 ms asked at 10 ms epochs would send 50 Hz). */
+    p->next[k] += p->interval[k];
+    if (p->next[k] <= now) { p->next[k] = now + p->interval[k]; }
     return true;
 }
 
@@ -1275,6 +1287,7 @@ typedef struct
     int         mav_port;
     bool        mav_on;
     double      mav_subfilter_hz;
+    double      mav_pose_hz;
     bool        nav_on;
     bool        auto_zaru;
     bool        raw_overlay;
@@ -1313,6 +1326,25 @@ typedef struct
     float pos_pred_stddev_m_sqrts;
     float vel_pred_stddev_mps_sqrts;
     float rpy_pred_stddev_rad_sqrts;
+    /* ahrs: shared ARS/AHRS override, same keys and fallbacks as
+       tools/replay.c (REQ-VER-048). gyr_noise_psd/gyr_bias_rw at 0 ->
+       derived from imu:, the rest at 0 -> ahrs's own default.
+       gravity_diff_penalty and acc_reject_gravity_mps2 pass a negative
+       value through (penalty off, rejection disabled). */
+    float ahrs_gyr_noise_psd;             /* [rad/s/sqrt(Hz)] */
+    float ahrs_gyr_bias_rw;               /* [rad/s^2/sqrt(Hz)] */
+    float ahrs_acc_noise_mps2;            /* [m/s^2] */
+    float ahrs_rpy_pred_stddev_rad_sqrts; /* [rad/sqrt(s)] */
+    float ahrs_gyr_bias_init_stddev_deg;  /* [deg/s] */
+    float ahrs_acc_freq_hz;
+    float ahrs_acc_cutoff_freq_hz;
+    float ahrs_gravity_diff_penalty;
+    float ahrs_acc_reject_gravity_mps2;
+    float ahrs_chi2_threshold;
+    float ahrs_kalman_update_dt_sec;
+    float ahrs_mag_yaw_stddev_deg;
+    float ahrs_mag_freq_hz;
+    float ahrs_mag_chi2_threshold;
     float baro_stddev_m;
     float baro_acc_bias_init_stddev_mps2; /* 0 -> baro_alt's own default */
     float leverarm_frd[3];
@@ -1388,6 +1420,8 @@ typedef struct
     float automotive_lateral_after_sec;
     float max_dr_sec;
     bool  allow_unlimited_dr;
+    float kalman_update_dt_sec; /* ins covariance-prediction period [s],
+                                   0 -> ins's own default (REQ-VER-049) */
     /* Free-inertial start (config section free_inertial_start), see
        fi_start_position() for what it does and what it costs. */
     bool     fi_enable;
@@ -1448,6 +1482,10 @@ typedef struct
     bool          have_last_imu;
     gnss_sample_t pending_gnss;
     bool          have_pending_gnss;
+    bool          pending_gnss_has_t;
+    int64_t       pending_gnss_t_us; /* newest IMU t_us when the fix arrived,
+                                        the stamp the recording converter
+                                        gives it */
     baro_sample_t pending_baro;
     bool          have_pending_baro;
     mag_sample_t  pending_mag;
@@ -1564,6 +1602,29 @@ static int config_set(insrcv_t* r, const char* sec, const char* key, const char*
     {
         if (d > 0.0) { r->rpy_pred_stddev_rad_sqrts = (float)d; }
     }
+    else if (!strcmp(full, "ahrs.gyr_noise_psd")) { r->ahrs_gyr_noise_psd = (float)d; }
+    else if (!strcmp(full, "ahrs.gyr_bias_rw")) { r->ahrs_gyr_bias_rw = (float)d; }
+    else if (!strcmp(full, "ahrs.acc_noise_mps2")) { r->ahrs_acc_noise_mps2 = (float)d; }
+    else if (!strcmp(full, "ahrs.rpy_pred_stddev_rad_sqrts"))
+    {
+        r->ahrs_rpy_pred_stddev_rad_sqrts = (float)d;
+    }
+    else if (!strcmp(full, "ahrs.gyr_bias_init_stddev_rps_deg"))
+    {
+        r->ahrs_gyr_bias_init_stddev_deg = (float)d;
+    }
+    else if (!strcmp(full, "ahrs.acc_freq_hz")) { r->ahrs_acc_freq_hz = (float)d; }
+    else if (!strcmp(full, "ahrs.acc_cutoff_freq_hz")) { r->ahrs_acc_cutoff_freq_hz = (float)d; }
+    else if (!strcmp(full, "ahrs.gravity_diff_penalty")) { r->ahrs_gravity_diff_penalty = (float)d; }
+    else if (!strcmp(full, "ahrs.acc_reject_gravity_mps2"))
+    {
+        r->ahrs_acc_reject_gravity_mps2 = (float)d;
+    }
+    else if (!strcmp(full, "ahrs.chi2_threshold")) { r->ahrs_chi2_threshold = (float)d; }
+    else if (!strcmp(full, "ahrs.kalman_update_dt_sec")) { r->ahrs_kalman_update_dt_sec = (float)d; }
+    else if (!strcmp(full, "ahrs.mag_yaw_stddev_deg")) { r->ahrs_mag_yaw_stddev_deg = (float)d; }
+    else if (!strcmp(full, "ahrs.mag_freq_hz")) { r->ahrs_mag_freq_hz = (float)d; }
+    else if (!strcmp(full, "ahrs.mag_chi2_threshold")) { r->ahrs_mag_chi2_threshold = (float)d; }
     else if (!strcmp(full, "init_hint.roll_deg")) { r->init_hint_roll_deg = (float)d; }
     else if (!strcmp(full, "init_hint.pitch_deg")) { r->init_hint_pitch_deg = (float)d; }
     else if (!strcmp(full, "init_hint.rpy_stddev_deg"))
@@ -1806,6 +1867,10 @@ static int config_set(insrcv_t* r, const char* sec, const char* key, const char*
         r->allow_unlimited_dr = ((int)d != 0);
     }
     else if (!strcmp(full, "max_deadreckoning_sec")) { if (d > 0.0) r->max_dr_sec = (float)d; }
+    else if (!strcmp(full, "kalman_update_dt_sec"))
+    {
+        if (d > 0.0) r->kalman_update_dt_sec = (float)d;
+    }
     else if (!strcmp(full, "chi2_disable")) { r->chi2_disable = ((int)d != 0); }
     else if (!config_key_is_replay_only(sec, key))
     {
@@ -2708,6 +2773,55 @@ static void publish_suite(insrcv_t* r)
  * ===========================================================================
  */
 
+/* config ahrs: onto both ARS/AHRS templates (REQ-VER-048), the same
+   mapping as tools/replay.c: one value for both sub-filters, since they
+   consume the same physical gyro/accelerometer. Called between
+   nav_suite_init and the first update, as nav_suite.h asks. */
+static void suite_apply_ahrs_cfg(insrcv_t* r)
+{
+    ahrs_config_t* c = &r->suite.ars_cfg;
+    int            k;
+
+    if (r->ahrs_gyr_noise_psd > 0.0f) { c->gyr_noise_psd = r->ahrs_gyr_noise_psd; }
+    else if (r->gyr_psd > 0.0f) { c->gyr_noise_psd = sqrtf(r->gyr_psd); }
+    if (r->ahrs_gyr_bias_rw > 0.0f) { c->gyr_bias_rw = r->ahrs_gyr_bias_rw; }
+    else if (r->gyr_bias_rw > 0.0f) { c->gyr_bias_rw = r->gyr_bias_rw; }
+    c->acc_noise_mps2            = r->ahrs_acc_noise_mps2;
+    c->rpy_pred_stddev_rad_sqrts = r->ahrs_rpy_pred_stddev_rad_sqrts;
+    c->acc_freq_hz               = r->ahrs_acc_freq_hz;
+    c->acc_cutoff_freq_hz        = r->ahrs_acc_cutoff_freq_hz;
+    c->gravity_diff_penalty      = r->ahrs_gravity_diff_penalty;
+    c->acc_reject_gravity_mps2   = r->ahrs_acc_reject_gravity_mps2;
+    c->chi2_threshold            = r->ahrs_chi2_threshold;
+    c->kalman_update_dt_sec      = r->ahrs_kalman_update_dt_sec;
+    c->mag_yaw_stddev_rad        = DEG2RAD(r->ahrs_mag_yaw_stddev_deg);
+    c->mag_freq_hz               = r->ahrs_mag_freq_hz;
+    c->mag_chi2_threshold        = r->ahrs_mag_chi2_threshold;
+    if (r->ahrs_gyr_bias_init_stddev_deg > 0.0f)
+    {
+        for (k = 0; k < 3; ++k)
+        {
+            c->gyr_bias_init_stddev_rps[k] = DEG2RAD(r->ahrs_gyr_bias_init_stddev_deg);
+        }
+    }
+
+    ahrs_config_t* a = &r->suite.ahrs_cfg;
+    a->gyr_noise_psd             = c->gyr_noise_psd;
+    a->gyr_bias_rw               = c->gyr_bias_rw;
+    a->acc_noise_mps2            = c->acc_noise_mps2;
+    a->rpy_pred_stddev_rad_sqrts = c->rpy_pred_stddev_rad_sqrts;
+    a->acc_freq_hz               = c->acc_freq_hz;
+    a->acc_cutoff_freq_hz        = c->acc_cutoff_freq_hz;
+    a->gravity_diff_penalty      = c->gravity_diff_penalty;
+    a->acc_reject_gravity_mps2   = c->acc_reject_gravity_mps2;
+    a->chi2_threshold            = c->chi2_threshold;
+    a->kalman_update_dt_sec      = c->kalman_update_dt_sec;
+    a->mag_yaw_stddev_rad        = c->mag_yaw_stddev_rad;
+    a->mag_freq_hz               = c->mag_freq_hz;
+    a->mag_chi2_threshold        = c->mag_chi2_threshold;
+    for (k = 0; k < 3; ++k) { a->gyr_bias_init_stddev_rps[k] = c->gyr_bias_init_stddev_rps[k]; }
+}
+
 static void suite_bootstrap(insrcv_t* r, int64_t t_us)
 {
     if (r->suite_ready) { return; }
@@ -2797,6 +2911,7 @@ static void suite_bootstrap(insrcv_t* r, int64_t t_us)
     opt.gnss_vel_stddev_floor_ver_mps            = r->vel_stddev_floor_ver_mps;
     opt.allow_unlimited_deadreckoning      = r->allow_unlimited_dr;
     opt.max_deadreckoning_sec              = r->max_dr_sec;
+    opt.kalman_update_dt_sec               = r->kalman_update_dt_sec;
     opt.chi2_disable                       = r->chi2_disable;
     /* Automotive mode (REQ-NAV-034): course over ground fused as yaw once
        the platform is moving fast enough. Both tuning values 0 -> ins's own
@@ -2851,6 +2966,7 @@ static void suite_bootstrap(insrcv_t* r, int64_t t_us)
         fprintf(stderr, "[insrcv] nav_suite_init failed\n");
         exit(1);
     }
+    suite_apply_ahrs_cfg(r);
     /* Known initial attitude (config init_hint). Armed right after
        nav_suite_init and before the first update, as the contract asks:
        it is only consulted while neither AHRS has initialized and only
@@ -3169,6 +3285,14 @@ static void on_imu(insrcv_t* r, const imu_sample_t* s)
         }
         for (i = 0; i < 3; ++i) { m.gnss_leverarm_b[i] = r->leverarm_frd[i]; }
         m.gnss_delay_ms = r->gnss_delay_ms;
+        /* The fix arrived after the previous IMU sample and rides on this
+           one, so it is that much older (REQ-NAV-092). Same age as a
+           replay of the converted recording, which stamps the fix with
+           that previous IMU sample's t_us. */
+        if (r->pending_gnss_has_t && s->t_us > r->pending_gnss_t_us)
+        {
+            m.gnss_delay_us = (int32_t)(s->t_us - r->pending_gnss_t_us);
+        }
     }
 
     if (r->have_pending_baro)
@@ -3219,6 +3343,7 @@ static void on_imu(insrcv_t* r, const imu_sample_t* s)
             /* ins cannot anchor a residual in the future, so a sample that
                is slightly ahead fuses against the current state. */
             m.speed_delay_ms   = age_ms > 0 ? age_ms : 0;
+            m.speed_delay_us   = age_us > 0 ? (int32_t)(age_us % 1000) : 0; /* REQ-NAV-092 */
             if (age_ms < 0) { r->n_odo_lead++; }
         }
         else
@@ -3241,7 +3366,9 @@ static void on_imu(insrcv_t* r, const imu_sample_t* s)
     const double now = host_now_sec();
     if (now >= r->next_pub_sec)
     {
-        r->next_pub_sec = now + 1.0 / r->pub_hz;
+        /* Same drift-free stepping as mav_due(). */
+        r->next_pub_sec += 1.0 / r->pub_hz;
+        if (r->next_pub_sec <= now) { r->next_pub_sec = now + 1.0 / r->pub_hz; }
         publish_suite(r);
     }
     if (r->raw_overlay && now >= r->next_raw_sec)
@@ -3499,6 +3626,8 @@ static void dispatch(insrcv_t* r, uint8_t msg_class, uint8_t msg_id, const uint8
             }
             r->pending_gnss       = s;
             r->have_pending_gnss  = true;
+            r->pending_gnss_has_t = r->have_last_imu;
+            r->pending_gnss_t_us  = r->last_imu_t_us;
         }
     }
 }
@@ -3832,7 +3961,9 @@ static void usage(const char* argv0)
             "  --mav-port <n>        MAVLink UDP port (default %d)\n"
             "  --mav-subfilter-hz <f>\n"
             "                        NAMED_VALUE_FLOAT block rate (default %g)\n"
-            "  --pub-hz <f>          estimate publish rate (default 50)\n"
+            "  --mav-pose-hz <f>     ATTITUDE and LOCAL_POSITION_NED rate\n"
+            "                        (raises --pub-hz if lower, default %g)\n"
+            "  --pub-hz <f>          estimate publish rate (default 60)\n"
             "  --raw-imu-hz <f>      raw IMU publish rate cap (default 100)\n"
             "  --stats-sec <f>       stats line interval, 0 disables (default 1)\n"
             "  --no-auto-zaru        don't arm the ARS/AHRS velocity-blind auto-ZARU\n"
@@ -3869,7 +4000,7 @@ static void usage(const char* argv0)
             "                        diagnostics only: fuses every measurement at its\n"
             "                        nominal variance, even gross outliers)\n",
             argv0, UDP_PORT_DEFAULT, UDP_BIND_DEFAULT, MAV_IP_DEFAULT, MAV_PORT_DEFAULT,
-            MAV_SUBFILTER_HZ_DEFAULT);
+            MAV_SUBFILTER_HZ_DEFAULT, MAV_POSE_HZ_DEFAULT);
 }
 
 static bool arg_f(int argc, char** argv, int* i, const char* name, float* out)
@@ -3929,13 +4060,14 @@ int main(int argc, char** argv)
     r.mav_port         = MAV_PORT_DEFAULT;
     r.mav_on           = false; /* opt-in: nothing listens on 14550 by default */
     r.mav_subfilter_hz = MAV_SUBFILTER_HZ_DEFAULT;
+    r.mav_pose_hz      = MAV_POSE_HZ_DEFAULT;
     r.nav_on           = true;
     r.auto_zaru        = true;
     r.raw_overlay      = true;
     /* 50, as --help and the <= 0 fallback below have always said. The
        initializer said 25 and won, so the publish rate was half the
        documented one. */
-    r.pub_hz           = 50.0;
+    r.pub_hz           = 60.0;
     r.raw_imu_hz       = 100.0;
     r.stats_sec        = 1.0;
     r.acc_psd          = 0.0f;
@@ -3992,6 +4124,7 @@ int main(int argc, char** argv)
         if (arg_s(argc, argv, &i, "--mav-ip", &r.mav_ip)) { continue; }
         if (arg_i(argc, argv, &i, "--mav-port", &r.mav_port)) { continue; }
         if (arg_d(argc, argv, &i, "--mav-subfilter-hz", &r.mav_subfilter_hz)) { continue; }
+        if (arg_d(argc, argv, &i, "--mav-pose-hz", &r.mav_pose_hz)) { continue; }
         if (arg_d(argc, argv, &i, "--pub-hz", &r.pub_hz)) { continue; }
         if (arg_d(argc, argv, &i, "--raw-imu-hz", &r.raw_imu_hz)) { continue; }
         if (arg_d(argc, argv, &i, "--stats-sec", &r.stats_sec)) { continue; }
@@ -4039,7 +4172,7 @@ int main(int argc, char** argv)
         fprintf(stderr, "[insrcv] --udp-port must be 1..65535\n");
         return 2;
     }
-    if (r.pub_hz <= 0.0) { r.pub_hz = 50.0; }
+    if (r.pub_hz <= 0.0) { r.pub_hz = 60.0; }
     if (r.raw_imu_hz <= 0.0) { r.raw_imu_hz = 100.0; }
 
     if (r.fi_enable)
@@ -4132,7 +4265,10 @@ int main(int argc, char** argv)
         net_cleanup();
         return 1;
     }
-    if (r.mav_on && !mav_open(&r.mav, r.mav_ip, r.mav_port, r.mav_subfilter_hz))
+    /* MAVLink is sent from the publish round, so it can never run faster
+       than that. */
+    if (r.mav_on && r.mav_pose_hz > r.pub_hz) { r.pub_hz = r.mav_pose_hz; }
+    if (r.mav_on && !mav_open(&r.mav, r.mav_ip, r.mav_port, r.mav_subfilter_hz, r.mav_pose_hz))
     {
         pj_close(&r.pj);
         net_cleanup();

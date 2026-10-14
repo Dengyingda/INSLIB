@@ -178,7 +178,7 @@ the body frame), each rate-limited to one fusion per Kalman period.
 
 - **Status:** verified
 - **Parent:** REQ-NAV-012
-- **Verification:** Test: tests/test_ins_core.c:scenario_auto_zupt; Test: tests/test_ins_core.c:scenario_static_variance_gate
+- **Verification:** Test: tests/test_ins_core.c:scenario_auto_zupt; Test: tests/test_ins_core.c:scenario_static_variance_gate; Test: tests/test_ins_core.c:scenario_auto_zupt_gnss_vel_while_moving
 
 The filter shall detect stillness autonomously and inject
 zero-velocity/zero-rotation updates without an external trigger,
@@ -188,9 +188,11 @@ be enabled by default and fully disableable. A public accessor
 considers the filter stationary, for diagnostics/telemetry and so
 nav_suite can propagate the (velocity-aware) trigger to the ARS/AHRS
 (REQ-SUITE-009), which cannot detect stillness on their own. That
-accessor shall apply every criterion the detector itself applies: it
-feeds filters that have no way to second-guess it, so reporting
-stillness the detector would refuse to act on is not admissible.
+accessor shall apply every criterion the detector itself applies,
+including the dwell time: it feeds filters that have no way to
+second-guess it, so reporting stillness the detector would refuse to
+act on is not admissible. Only the minimum interval is exempt, since it
+throttles the updates of a platform that is still all the same.
 
 The primary stillness criterion shall be the per-axis sample VARIANCE
 of the raw (not bias-corrected) gyro and accelerometer over a short
@@ -242,6 +244,13 @@ configurable accuracy requirement (auto_zupt_max_vel_stddev_mps,
 with a large uncertainty is not evidence of standstill, so it shall
 not be used for the gate even if otherwise usable for fusion (that is
 a separate, looser question answered by opt.gnss_max_*_vel_stddev_mps).
+Every GNSS velocity observation shall be recorded for the gate on the
+epoch it arrives, whatever the IMU criteria conclude on that epoch. A
+fix arriving while the IMU plainly shows motion is exactly the evidence
+that keeps a later, IMU-quiet stretch of the same motion (a steady
+turn, a constant climb) from being read as standstill. Recording it
+only on epochs the IMU already finds still would let the observation
+age out during motion and open the gate mid-flight.
 Without a GNSS velocity observation meeting both the recency
 (INS_AUTOZUPT_EXT_VEL_MAX_AGE_SEC) and the accuracy requirement, the
 velocity gate shall not be applied at all -- it shall pass
@@ -2990,3 +2999,79 @@ the loss behind a covariance nothing supports. Checking on every epoch
 stops the filter as soon as the loss is certain instead of when the IMU
 returns, so no stale solution is published and no measurement is fused
 against it in the meantime.
+
+## REQ-NAV-090 — chi2 gate holds under a swarm of gross GNSS faults
+
+- **Status:** verified
+- **Parent:** REQ-SYS-006
+- **Verification:** Test: tests/test_ins_core.c:scenario_chi2_outlier_swarm
+
+With the chi2 gate active (REQ-NAV-046), a stream of GNSS position fixes
+in which a substantial share is grossly wrong yet reported as accurate as
+the good ones shall leave the position solution at the metre level. The
+verification stream contains isolated faults of 100 to 500 m on every
+fifth fix and a burst of consecutive fixes with the same 100 m offset,
+with automatic zero-velocity updates off so the gate alone has to hold.
+With chi2_disable (REQ-NAV-035) the same stream shall pull the solution
+tens of metres off, which shows the bound is earned by the gate and not by
+the scenario.
+
+Rationale: the single-outlier case of REQ-NAV-035 does not show that the
+downweighting survives repeated or consecutive faults, where each fix
+could drag the state a little further before the next one arrives.
+
+## REQ-NAV-091 — Re-acquisition velocity without a velocity measurement
+
+- **Status:** verified
+- **Parent:** REQ-SYS-010
+- **Verification:** Test: tests/test_ins_core.c:scenario_reacquire_yaw_unknown; Test: tests/test_ins_core.c:scenario_reacquire_variants
+
+When the re-acquisition fix after an expired coasting window
+(REQ-NAV-023) carries no usable velocity (a GNSS fix without one, or a
+local position fix), the filter shall keep the frozen velocity as a
+value only and reset its variance to an unknown-velocity prior instead
+of the configured initial velocity stddev, so that the following
+position fixes determine the velocity.
+
+Rationale: the frozen velocity dates from the start of the outage and
+says nothing about the platform at its end. Seeded with the initial
+velocity stddev, on the KF-GINS car datasets with 60 s outages every
+300 s it claimed 0.05 m/s for a velocity 14 m/s off. The following
+position fixes could only explain the conflict through attitude and
+gyro bias: the gyro bias ran to over 100 deg/s and the yaw jumped
+between +180 and -180 deg for minutes with GNSS back. The heading
+after such a re-acquisition remains unknown without a hint or a GNSS
+velocity (REQ-NAV-059) and needs motion to converge, which is
+accepted.
+
+## REQ-NAV-092 — Exact time of validity of delayed position measurements
+
+- **Status:** verified
+- **Parent:** REQ-NAV-008
+- **Verification:** Test: tests/test_ins_core.c:scenario_subepoch_age; Test: tests/test_ins_core.c:scenario_tov_interpolation
+
+The measurement interface shall accept the age of a GNSS, local
+position, yaw and speed measurement in microseconds (gnss_delay_us,
+local_pos_delay_us, yaw_delay_us, speed_delay_us) in addition to the
+whole-millisecond delay, both parts adding up. For every delayed
+measurement (these four and ranges) the filter shall form the residual
+against the state at the time of validity, linearly interpolated between
+the two states around it: two history entries, or the newest history
+entry and the current state. Position, velocity and body rate are
+interpolated linearly, the attitude by normalized linear quaternion
+interpolation. Only when the time of validity is not bracketed by two
+states closer together than INS_TOV_MAX_SPAN_US does the nearer state
+stand in, a position then carried over the remaining time difference
+with that state's velocity (first order, the velocity entering the
+measurement Jacobian accordingly). With no age stated the residual is
+formed against the current state as before.
+
+Rationale: a fix is handed to the filter with the first IMU epoch at or
+after its time of validity, so it is between zero and one IMU period
+older than that epoch, and the history grid (INS_HISTORY_DT_MS) is far
+coarser than that. Fusing such a fix as current leaves a bias of speed
+times age along the track. On the KF-GINS car datasets (200 Hz IMU,
+1 Hz RTK, mean age 2.45 ms) this was 1 to 2 cm of horizontal RMS error,
+about half of the total, and a -2.5 ms offset in the time-shift test.
+Snapping to the nearest history entry instead of interpolating leaves up
+to half a grid step (10 ms) of the same error for any delay.

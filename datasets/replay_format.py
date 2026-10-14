@@ -18,9 +18,30 @@ both tools/replay.c and tools/replay.py:
   ref.csv      t_us, lat_deg, lon_deg, h_m, roll/pitch/yaw [deg], v_ned
   gnss.csv     t_us, lat_deg, lon_deg, h_m, full NED position covariance
                (nn,ne,nd,ee,ed,dd) [m^2], v_ned [m/s], full NED velocity
-               covariance (nn,ne,nd,ee,ed,dd) [(m/s)^2], vel_ok.
+               covariance (nn,ne,nd,ee,ed,dd) [(m/s)^2], vel_ok, and
+               optionally quality, gps_week, gps_tow_s, num_sv, jamming,
+               spoofing, sig_auth, nav_auth.
                Zero diagonal entries mean "unknown" and are replaced by
-               the config fallback stddevs at replay time.
+               the config fallback stddevs at replay time. t_us is when the
+               fix reached the recorder, the receiver's latency (config.yaml
+               gnss: delay_ms) included. quality is the fix type in RTKLIB's
+               solution numbering (GNSS_Q_*: 1 RTK fixed, 2 RTK float,
+               3 SBAS, 4 DGNSS, 5 single point, 6 PPP, 0 unknown),
+               gps_week/gps_tow_s the receiver's own GPS time of the fix
+               (its time of validity, NAV-PVT iTOW, 0/0 unknown), num_sv
+               the satellites used in the fix (0 unknown). jamming and
+               spoofing are the receiver's interference monitor
+               (GNSS_IND_*: 1 none, 2 warning/indicated, 3 critical/
+               confirmed, 0 unknown or not monitored), sig_auth and
+               nav_auth whether the signals (ranging codes) and the
+               navigation message (e.g. Galileo OSNMA) of the fix were
+               authenticated (GNSS_AUTH_*: 1 not authenticated,
+               2 authenticated, 3 authentication failed, 0 unknown or not
+               supported). A column the producer cannot fill is written
+               as 0. The harnesses read the first 20 columns for the
+               filter, the trailing ones are evaluation only, so a
+               gnss.csv without them, or with only the first few of them,
+               stays valid.
   mag.csv      t_us, mag_frd_xyz [uT]                (optional)
   baro.csv     t_us, static pressure [Pa]            (optional)
   speed.csv    t_us, scalar ground speed [m/s]      (optional)
@@ -46,6 +67,24 @@ both tools/replay.c and tools/replay.py:
                1-sigma and carries the antenna lever arm. Trailing columns
                are the producer's own record, both harnesses read the first
                seven only.
+  timesync.csv the recording's clock against GPS time    (optional)
+               TIMESYNC_HEADER's columns, of which only timesync_t_us
+               (the recorder's t_us of a pulse-per-second edge), gps_week,
+               gps_tow_s (the receiver's time of that edge) and flags are
+               read. flags is the board's 0x40/0x05 flags word:
+               TP_SUSPECT (0x0010) pairs are left out. The time has to be
+               GPS time: with UTC_BASE (0x0002) the receiver's time pulse
+               was on the UTC grid and the pairs are off by the leap
+               seconds, which the reader only warns about. Rows without a GPS time are skipped, a few
+               rows over the recording are plenty (one already gives the
+               offset, two the rate of the recording clock). mcu_restarts
+               counts recorder restarts, t_us starts anew with each: the
+               reader fits the segment with the most pairs. The other
+               columns are the recorder's own record (host clock, link
+               segments). Read by tools/replay.py only, to stamp a
+               solution file with GPS time (tools/ins_solution.py, RTKLIB
+               .pos). Always this name, no inputs: override, the filter
+               never sees it.
 
 Converters import these helpers so the format cannot drift apart.
 
@@ -55,7 +94,18 @@ Converters import these helpers so the format cannot drift apart.
 GNSS_HEADER = ("# t_us, lat_deg, lon_deg, h_m,"
                " cov_pos_ned nn,ne,nd,ee,ed,dd [m^2],"
                " vn, ve, vd [m/s],"
-               " cov_vel_ned nn,ne,nd,ee,ed,dd [(m/s)^2], vel_ok\n")
+               " cov_vel_ned nn,ne,nd,ee,ed,dd [(m/s)^2], vel_ok,"
+               " quality, gps_week, gps_tow_s, num_sv,"
+               " jamming, spoofing, sig_auth, nav_auth\n")
+
+# gnss.csv quality, RTKLIB's solution status numbering (the Q of a .pos).
+GNSS_Q_UNKNOWN, GNSS_Q_FIX, GNSS_Q_FLOAT, GNSS_Q_SBAS = 0, 1, 2, 3
+GNSS_Q_DGNSS, GNSS_Q_SINGLE, GNSS_Q_PPP = 4, 5, 6
+# gnss.csv jamming/spoofing, the numbering of u-blox' UBX-SEC-SIG
+# jamState/spfState (and of MON-HW jammingState).
+GNSS_IND_UNKNOWN, GNSS_IND_NONE, GNSS_IND_WARNING, GNSS_IND_CRITICAL = 0, 1, 2, 3
+# gnss.csv sig_auth/nav_auth.
+GNSS_AUTH_UNKNOWN, GNSS_AUTH_NO, GNSS_AUTH_OK, GNSS_AUTH_FAILED = 0, 1, 2, 3
 
 IMU_HEADER = ("# t_us, gyr_frd_x [rad/s], gyr_frd_y [rad/s], gyr_frd_z [rad/s],"
               " acc_frd_x [m/s^2], acc_frd_y [m/s^2], acc_frd_z [m/s^2]\n")
@@ -88,6 +138,19 @@ HEADING_HEADER = ("# t_us, heading_deg, stddev_deg, carr_soln,"
 # of which move from row to row.
 RANGES_HEADER = ("# t_us, anchor_id, anchor_x_m, anchor_y_m, anchor_z_m,"
                  " range_m, stddev_m\n")
+# A plain CSV header row (no "#"), the recorder writes this file with
+# csv.writer and readers address the columns by name.
+TIMESYNC_HEADER = ("utc_iso,host_unix_s,imu_t_us,timesync_t_us,gps_week,"
+                   "gps_tow_s,n_timesync_pairs,segment,mcu_restarts,flags\n")
+
+
+def timesync_row(t_us, gps_week, gps_tow_s, flags, n_pairs=0, mcu_restarts=0):
+    """Format one timesync.csv line for a pulse pair from a converter,
+    which has no host clock: utc_iso/host_unix_s stay empty, imu_t_us is
+    the pulse's own t_us. mcu_restarts: the recorder restarts before the
+    pair, its t_us is only comparable within one count."""
+    return ",,%d,%d,%d,%.6f,%d,0,%d,0x%04x\n" % (
+        t_us, t_us, gps_week, gps_tow_s, n_pairs, mcu_restarts, flags)
 
 
 def range_row(t_us, anchor_id, anchor_ecef, range_m, stddev_m, extra=()):
@@ -100,16 +163,37 @@ def range_row(t_us, anchor_id, anchor_ecef, range_m, stddev_m, extra=()):
 
 
 def gnss_row(t_us, lat_deg, lon_deg, h_m, cov_pos6, vel_ned, cov_vel6,
-             vel_ok):
+             vel_ok, quality=GNSS_Q_UNKNOWN, gps_week=0, gps_tow_s=0.0,
+             num_sv=0, jamming=GNSS_IND_UNKNOWN, spoofing=GNSS_IND_UNKNOWN,
+             sig_auth=GNSS_AUTH_UNKNOWN, nav_auth=GNSS_AUTH_UNKNOWN):
     """Format one gnss.csv line. cov_pos6/cov_vel6 are the 6 unique
-    elements (nn, ne, nd, ee, ed, dd) of the symmetric NED covariance;
-    pass zeros for unknown entries."""
-    return ("%d,%.10f,%.10f,%.4f,%s,%.4f,%.4f,%.4f,%s,%d\n" % (
-        t_us, lat_deg, lon_deg, h_m,
-        ",".join("%.6g" % c for c in cov_pos6),
-        vel_ned[0], vel_ned[1], vel_ned[2],
-        ",".join("%.6g" % c for c in cov_vel6),
-        1 if vel_ok else 0))
+    elements (nn, ne, nd, ee, ed, dd) of the symmetric NED covariance,
+    zeros for unknown entries. quality, gps_week, gps_tow_s, num_sv,
+    jamming, spoofing, sig_auth, nav_auth: see the module docstring, the
+    defaults mean unknown."""
+    return ("%d,%.10f,%.10f,%.4f,%s,%.4f,%.4f,%.4f,%s,%d,%d,%d,%.3f,"
+            "%d,%d,%d,%d,%d\n" % (
+                t_us, lat_deg, lon_deg, h_m,
+                ",".join("%.6g" % c for c in cov_pos6),
+                vel_ned[0], vel_ned[1], vel_ned[2],
+                ",".join("%.6g" % c for c in cov_vel6),
+                1 if vel_ok else 0, quality, gps_week, gps_tow_s,
+                num_sv, jamming, spoofing, sig_auth, nav_auth))
+
+
+def ublox_quality(fix_type, gnss_fix_ok, diff_soln, carr_soln):
+    """gnss.csv quality of a u-blox NAV-PVT (fixType, flags gnssFixOK,
+    diffSoln, carrSoln). NAV-PVT has no SBAS bit of its own, an SBAS
+    corrected fix counts as DGNSS."""
+    if not gnss_fix_ok or fix_type not in (2, 3, 4):
+        return GNSS_Q_UNKNOWN
+    if carr_soln == 2:
+        return GNSS_Q_FIX
+    if carr_soln == 1:
+        return GNSS_Q_FLOAT
+    if diff_soln:
+        return GNSS_Q_DGNSS
+    return GNSS_Q_SINGLE
 
 
 def _fmt_float(x):

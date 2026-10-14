@@ -21,6 +21,8 @@ GNSS_COLOR = "0.35"      # raw GNSS fixes, on the dedicated altitude page
 BARO_RAW_COLOR = "0.6"   # raw (unfiltered) barometer altitude, altitude page
 MAG_RAW_COLOR = "0.6"    # uncalibrated magnetometer field, WMM page
 ELLIPSOID_COLOR = "tab:purple"  # nav_suite_get_height_ellipsoid(), altitude page
+RTS_COLOR = "#c2188f"    # the RTS smoother's solution (tools/ins_rts.py), its pages
+RTS_FILTER_COLOR = "0.25"  # the filter as the thin comparison line on those pages
 
 # Outlier-rejection page: one fixed color per sub-filter, consistent with
 # subfilter_overlay_tree's naming in replay.py.
@@ -423,7 +425,7 @@ def plot_results(rec, name, warmup_sec, out_path=None, gnss_delay_curve=None,
         (pos_key, "pos_sigma", "ref_pos", ("N [m]", "E [m]", "Up [m]")),
         ("vel", "vel_sigma", "ref_vel", ("vN [m/s]", "vE [m/s]", "vUp [m/s]")),
         ("rpy_deg", "rpy_sigma_deg", "ref_rpy_deg",
-         ("roll [deg]", "pitch [deg]", "yaw [deg]")),
+         ("roll [°]", "pitch [°]", "yaw [°]")),
     )
     for row, (key, skey, rkey, labels) in enumerate(groups):
         is_yaw_row = key == "rpy_deg"
@@ -477,7 +479,7 @@ def plot_results(rec, name, warmup_sec, out_path=None, gnss_delay_curve=None,
             # hundreds of metres across a long dead-reckoning stretch and
             # would otherwise flatten the metre-level error everywhere else.
             _cap_symmetric_axis(ax, err, sig, _SIGMA_AXIS_CAP_M, "m")
-        for i, lbl in enumerate(("roll [deg]", "pitch [deg]", "yaw [deg]")):
+        for i, lbl in enumerate(("roll [°]", "pitch [°]", "yaw [°]")):
             ax = axes2[1][i]
             _band(ax, t, _col(rec["rpy_err_deg"], i),
                  _col(rec["rpy_sigma_deg"], i), "error", EST_COLOR)
@@ -498,6 +500,12 @@ def plot_results(rec, name, warmup_sec, out_path=None, gnss_delay_curve=None,
         _shade_zupt(fig3, t, rec.get("zupt_active"))
         figs.append(fig3)
 
+    # --- Figure 3r: the RTS smoother's solution, when it ran ----------------
+    for fig_rts, timeline in _rts_pages(rec, t, name, has_ref, warmup_sec):
+        if timeline:
+            _shade_zupt(fig_rts, t, rec.get("zupt_active"))
+        figs.append(fig_rts)
+
     # --- Figure 3a: magnetometer coverage / hard-iron sphere ----------------
     fig_mag = _mag_sphere_page(rec, name)
     if fig_mag is not None:
@@ -514,6 +522,12 @@ def plot_results(rec, name, warmup_sec, out_path=None, gnss_delay_curve=None,
         if fig_sub is not None:
             _shade_zupt(fig_sub, t, rec.get("zupt_active"))
             figs.append(fig_sub)
+
+    # --- Figure 4c: attitude error comparison + RMS/max statistics ----------
+    fig_att = _attitude_compare_page(rec, t, name, warmup_sec)
+    if fig_att is not None:
+        _shade_zupt(fig_att, t, rec.get("zupt_active"))
+        figs.append(fig_att)
 
     # --- Figure 5a: heading source comparison -------------------------------
     fig_hdg = _heading_page(rec, t, name)
@@ -550,6 +564,11 @@ def plot_results(rec, name, warmup_sec, out_path=None, gnss_delay_curve=None,
     if fig_gnss_sd is not None:
         figs.append(fig_gnss_sd)
 
+    # --- Figure 7c: GNSS fix quality and transport latency ------------------
+    fig_gnss_q = _gnss_quality_page(rec, name, configured_gnss_delay_ms)
+    if fig_gnss_q is not None:
+        figs.append(fig_gnss_q)
+
     # --- Figure 8: outlier rejection (chi2 downweight) over time ------------
     fig_outlier = _outlier_page(rec, t, name)
     if fig_outlier is not None:
@@ -568,7 +587,7 @@ def plot_results(rec, name, warmup_sec, out_path=None, gnss_delay_curve=None,
 
     # --- Front page: trajectory summary + Dr. INS findings digest -----------
     fig_summary = _summary_page(rec, name, growth_rate, baro_growth_rate,
-                                ahrs_growth_rate)
+                                ahrs_growth_rate, warmup_sec)
     if fig_summary is not None:
         figs.insert(0, fig_summary)
 
@@ -599,6 +618,183 @@ def plot_results(rec, name, warmup_sec, out_path=None, gnss_delay_curve=None,
         plt.close("all")
 
 
+def _has_rts(rec):
+    """Whether rec carries the RTS smoother's series (ins_rts.add_rec_series)
+    with at least one smoothed sample."""
+    rows = rec.get("rts_pos")
+    return bool(rows) and len(rows) == len(rec["t"]) and any(
+        row[0] == row[0] for row in rows)
+
+
+def _line(ax, t, values, **kw):
+    values, t = _thin(values, t)
+    ax.plot(t, values, **kw)
+
+
+def _rts_pages(rec, t, name, has_ref, warmup_sec):
+    """The RTS smoother's pages (tools/ins_rts.py, replay.py --smooth, the
+    GUI's RTS smoother): trajectory with the accuracy table, state
+    history, error vs. ground truth and IMU biases, each with the
+    smoother's own 1-σ band and the filter as a thin line for comparison.
+    (figure, has a time axis) pairs, empty when the smoother did not run."""
+    if not _has_rts(rec):
+        return []
+    figs = [(_rts_trajectory_page(rec, name, has_ref), False),
+            (_rts_state_page(rec, t, name, has_ref), True)]
+    if has_ref:
+        figs.append((_rts_error_page(rec, t, name, warmup_sec), True))
+    fig_b = _rts_bias_page(rec, t, name)
+    if fig_b is not None:
+        figs.append((fig_b, True))
+    return figs
+
+
+def _rts_trajectory_page(rec, name, has_ref):
+    """North-East track of the filter, the smoother and the reference,
+    with the filter-vs-RTS accuracy table (rec["rts_lines"]) next to it."""
+    import matplotlib.pyplot as plt
+    fig = plt.figure(figsize=(14, 9))
+    fig.suptitle(f"{name}: RTS smoother, North-East position")
+    gs = fig.add_gridspec(1, 2, width_ratios=(2.2, 1.0))
+    ax = fig.add_subplot(gs[0, 0])
+    track = rec.get("track_ne") or rec.get("pos_ref_pt") or rec["pos"]
+    n, e = _thin_track(_col(track, 0), _col(track, 1))
+    ax.plot(e, n, color=RTS_FILTER_COLOR, linewidth=0.8, label="filter")
+    rts_track = rec.get("rts_track_ne") or rec["rts_pos_ref_pt"]
+    n, e = _thin_track(_col(rts_track, 0), _col(rts_track, 1))
+    ax.plot(e, n, color=RTS_COLOR, linewidth=1.4, label="RTS smoother")
+    if has_ref:
+        ref_track = rec.get("track_ref_ne") or rec["ref_pos"]
+        rn, re = _thin_track(_col(ref_track, 0), _col(ref_track, 1))
+        ax.plot(re, rn, "--", color=REF_COLOR, linewidth=1.0,
+                label="ground truth")
+    ax.set_xlabel("East [m]")
+    ax.set_ylabel("North [m]")
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.legend(loc="best", fontsize=8)
+    tx = fig.add_subplot(gs[0, 1])
+    tx.axis("off")
+    lines = rec.get("rts_lines") or []
+    tx.text(0.0, 1.0, "\n".join(lines), transform=tx.transAxes, va="top",
+            ha="left", family="monospace", fontsize=8)
+    fig.tight_layout()
+    _apply_grid(fig)
+    return fig
+
+
+def _rts_state_page(rec, t, name, has_ref):
+    """Like the state-history page, for the smoother: its 1-σ band, the
+    filter as a thin line, the reference dashed."""
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(3, 3, figsize=(14, 9), sharex=True)
+    fig.suptitle(f"{name}: RTS smoother, state history (1-σ band)")
+    f_pos = "pos_ref_pt" if rec.get("pos_ref_pt") else "pos"
+    groups = (
+        ("rts_pos_ref_pt", "rts_pos_sigma", f_pos, "ref_pos",
+         ("N [m]", "E [m]", "Up [m]")),
+        ("rts_vel", "rts_vel_sigma", "vel", "ref_vel",
+         ("vN [m/s]", "vE [m/s]", "vUp [m/s]")),
+        ("rts_rpy_deg", "rts_rpy_sigma_deg", "rpy_deg", "ref_rpy_deg",
+         ("roll [°]", "pitch [°]", "yaw [°]")),
+    )
+    for row, (key, skey, fkey, rkey, labels) in enumerate(groups):
+        for i in range(3):
+            ax = axes[row][i]
+
+            def shown(values, row=row, i=i):
+                if row == 2 and i == 2:
+                    return _unwrap_deg(values)
+                if row < 2 and i == 2:
+                    return [-v for v in values]  # D shown as Up
+                return values
+            _band(ax, t, shown(_col(rec[key], i)), _col(rec[skey], i),
+                  "RTS", RTS_COLOR)
+            _line(ax, t, shown(_col(rec[fkey], i)), color=RTS_FILTER_COLOR,
+                  linewidth=0.7, label="filter")
+            if has_ref:
+                _line(ax, t, shown(_col(rec[rkey], i)), linestyle="--",
+                      color=REF_COLOR, linewidth=1.0, label="ground truth")
+            ax.set_ylabel(labels[i])
+            if row == 0 and i == 0:
+                ax.legend(loc="best", fontsize=8)
+    for i in range(3):
+        axes[-1][i].set_xlabel("time [s]")
+    fig.tight_layout()
+    _apply_grid(fig)
+    return fig
+
+
+def _rts_error_page(rec, t, name, warmup_sec):
+    """The smoother's error vs. the ground truth with its own 1-σ band,
+    the filter's error as a thin line."""
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(2, 3, figsize=(14, 6), sharex=True)
+    fig.suptitle(f"{name}: RTS smoother, error vs. ground truth (1-σ band)")
+    for i, lbl in enumerate(("N [m]", "E [m]", "Up [m]")):
+        ax = axes[0][i]
+        sign = -1.0 if i == 2 else 1.0  # D error shown as Up error
+        err = [sign * v for v in _col(rec["rts_pos_err_ned"], i)]
+        sig = _col(rec["rts_pos_sigma"], i)
+        _band(ax, t, err, sig, "RTS", RTS_COLOR)
+        _line(ax, t, [sign * v for v in _col(rec["pos_err_ned"], i)],
+              color=RTS_FILTER_COLOR, linewidth=0.7, label="filter")
+        ax.axhline(0.0, color="black", linewidth=0.5)
+        ax.set_ylabel(f"pos err {lbl}")
+        _cap_symmetric_axis(ax, err, sig, _SIGMA_AXIS_CAP_M, "m")
+        if i == 0:
+            ax.legend(loc="best", fontsize=8)
+    for i, lbl in enumerate(("roll [°]", "pitch [°]", "yaw [°]")):
+        ax = axes[1][i]
+        err = _col(rec["rts_rpy_err_deg"], i)
+        sig = _col(rec["rts_rpy_sigma_deg"], i)
+        _band(ax, t, err, sig, "RTS", RTS_COLOR)
+        _line(ax, t, _col(rec["rpy_err_deg"], i), color=RTS_FILTER_COLOR,
+              linewidth=0.7, label="filter")
+        ax.axhline(0.0, color="black", linewidth=0.5)
+        ax.set_ylabel(f"att err {lbl}")
+        ax.set_xlabel("time [s]")
+    if warmup_sec > 0:
+        for ax in axes.flat:
+            ax.axvline(warmup_sec, color="gray", linestyle=":", linewidth=1)
+    fig.tight_layout()
+    _apply_grid(fig)
+    return fig
+
+
+def _rts_bias_page(rec, t, name):
+    """The smoother's IMU (and, 18-state, magnetometer) bias with its 1-σ
+    band, the filter's estimate as a thin line."""
+    if not any(row[0] == row[0] for row in rec["rts_acc_bias"]):
+        return None
+    has_mag = any(row[0] == row[0] for row in rec.get("rts_mag_bias", []))
+    import matplotlib.pyplot as plt
+    n_rows = 3 if has_mag else 2
+    fig, axes = plt.subplots(n_rows, 3, figsize=(14, 3.5 * n_rows), sharex=True)
+    fig.suptitle(f"{name}: RTS smoother, IMU bias (1-σ band)")
+    rows = [("rts_acc_bias", "rts_acc_bias_sigma", "acc_bias", 1.0,
+             "acc bias {} [m/s²]"),
+            ("rts_gyr_bias", "rts_gyr_bias_sigma", "gyr_bias", 180.0 / math.pi,
+             "gyro bias {} [°/s]")]
+    if has_mag:
+        rows.append(("rts_mag_bias", "rts_mag_bias_sigma", "mag_bias", 1.0,
+                     "mag bias {} [µT]"))
+    for r, (key, skey, fkey, scale, label) in enumerate(rows):
+        for i, axis_lbl in enumerate(("x", "y", "z")):
+            ax = axes[r][i]
+            _band(ax, t, [scale * v for v in _col(rec[key], i)],
+                  [scale * v for v in _col(rec[skey], i)], "RTS", RTS_COLOR)
+            _line(ax, t, [scale * v for v in _col(rec[fkey], i)],
+                  color=RTS_FILTER_COLOR, linewidth=0.7, label="filter")
+            ax.set_ylabel(label.format(axis_lbl))
+            if r == 0 and i == 0:
+                ax.legend(loc="best", fontsize=8)
+    for i in range(3):
+        axes[-1][i].set_xlabel("time [s]")
+    fig.tight_layout()
+    _apply_grid(fig)
+    return fig
+
+
 def _bias_page(rec, t, name):
     """ins's own accelerometer/gyro bias estimate with a 1-σ band,
     plus (18-state mode only) the magnetometer hard-iron
@@ -616,7 +812,7 @@ def _bias_page(rec, t, name):
         ax = axes[0][i]
         _band(ax, t, _col(rec["acc_bias"], i), _col(rec["acc_bias_sigma"], i),
              "estimate", EST_COLOR)
-        ax.set_ylabel(f"acc bias {axis_lbl} [m/s^2]")
+        ax.set_ylabel(f"acc bias {axis_lbl} [m/s²]")
         if i == 0:
             ax.legend(loc="best", fontsize=8)
     for i, axis_lbl in enumerate(("x", "y", "z")):
@@ -624,7 +820,7 @@ def _bias_page(rec, t, name):
         center = [math.degrees(v) for v in _col(rec["gyr_bias"], i)]
         sigma = [math.degrees(v) for v in _col(rec["gyr_bias_sigma"], i)]
         _band(ax, t, center, sigma, "estimate", EST_COLOR)
-        ax.set_ylabel(f"gyro bias {axis_lbl} [deg/s]")
+        ax.set_ylabel(f"gyro bias {axis_lbl} [°/s]")
         if not has_mag_bias:
             ax.set_xlabel("time [s]")
     if has_mag_bias:
@@ -836,8 +1032,35 @@ def _wmm_page(rec, name):
     return fig
 
 
+def _pos_err_lines(rec, warmup_sec):
+    """Summary lines with the position error vs the reference (north, east,
+    up, horizontal, 3D) as RMS / max |e| from the end of the warm-up on.
+    Empty when there is no usable reference."""
+    t = rec["t"]
+    errs = rec.get("pos_err_ned") or []
+    rows = []
+    for ti, e in zip(t, errs):
+        if ti >= warmup_sec and e and all(v == v for v in e[:3]):
+            rows.append(e)
+    if not rows:
+        return []
+    cols = {
+        "north": [e[0] for e in rows],
+        "east": [e[1] for e in rows],
+        "up": [-e[2] for e in rows],
+        "horizontal": [math.hypot(e[0], e[1]) for e in rows],
+        "3D": [math.sqrt(e[0] ** 2 + e[1] ** 2 + e[2] ** 2) for e in rows],
+    }
+    lines = ["", "position error vs ground truth (RMS / max |e| in m):"]
+    for key, vals in cols.items():
+        rms = math.sqrt(sum(v * v for v in vals) / len(vals))
+        lines.append(f"  {key:11s}{rms:7.3f} / "
+                     f"{max(abs(v) for v in vals):7.3f}")
+    return lines
+
+
 def _summary_page(rec, name, growth_rate=None, baro_growth_rate=None,
-                  ahrs_growth_rate=None):
+                  ahrs_growth_rate=None, warmup_sec=0.0):
     """Trajectory summary: total time/distance and the velocity/acceleration
     envelope, taken from ground truth when available (rec['ref_*'], else the
     filter estimate). Kinematic acceleration = |d v/dt| is gravity-free by
@@ -904,7 +1127,7 @@ def _summary_page(rec, name, growth_rate=None, baro_growth_rate=None,
         f"max horizontal speed  : {max_horiz:8.2f} m/s ({_kmh(max_horiz):6.1f} km/h)",
         f"max climb rate        : {max_climb:8.2f} m/s",
         f"max descent rate      : {max_descent:8.2f} m/s",
-        f"max acceleration      : {max_acc:8.2f} m/s^2 ({max_acc / 9.80665:5.2f} g,"
+        f"max acceleration      : {max_acc:8.2f} m/s² ({max_acc / 9.80665:5.2f} g,"
         f" gravity-free)",
     ]
 
@@ -925,12 +1148,12 @@ def _summary_page(rec, name, growth_rate=None, baro_growth_rate=None,
         lines.append("final 1-σ (last epoch, filter-reported):")
         lines.append(f"  pos NED   {p[0]:.3f} {p[1]:.3f} {p[2]:.3f} m")
         lines.append(f"  vel NED   {v[0]:.3f} {v[1]:.3f} {v[2]:.3f} m/s")
-        lines.append(f"  att RPY   {a[0]:.3f} {a[1]:.3f} {a[2]:.3f} deg")
-        lines.append(f"  acc bias  {ab[0]:.4f} {ab[1]:.4f} {ab[2]:.4f} m/s^2 "
+        lines.append(f"  att RPY   {a[0]:.3f} {a[1]:.3f} {a[2]:.3f} °")
+        lines.append(f"  acc bias  {ab[0]:.4f} {ab[1]:.4f} {ab[2]:.4f} m/s² "
                      f"(1-σ {ab_s[0]:.4f} {ab_s[1]:.4f} {ab_s[2]:.4f})")
         lines.append(f"  gyr bias  {math.degrees(gb[0]):.4f} "
                      f"{math.degrees(gb[1]):.4f} {math.degrees(gb[2]):.4f} "
-                     f"deg/s (1-σ {math.degrees(gb_s[0]):.4f} "
+                     f"°/s (1-σ {math.degrees(gb_s[0]):.4f} "
                      f"{math.degrees(gb_s[1]):.4f} {math.degrees(gb_s[2]):.4f})")
         mb = _last_valid_row(rec.get("mag_bias", []))
         if mb:
@@ -949,6 +1172,24 @@ def _summary_page(rec, name, growth_rate=None, baro_growth_rate=None,
         if gv:
             lines.append(f"  vel NED   {gv[0]:.3f} {gv[1]:.3f} {gv[2]:.3f} m/s")
 
+    # Position accuracy against the reference (RMS and worst case), same
+    # warm-up rule as the attitude statistics below.
+    lines.extend(_pos_err_lines(rec, warmup_sec))
+
+    # Attitude accuracy of INSLIB / ARS / AHRS (RMS and worst case), see
+    # _attitude_compare_page() for the traces behind these numbers.
+    att_rows = _att_stat_rows(rec, warmup_sec)
+    if att_rows:
+        last_ref = None
+        for ref_label, label, ax, s in att_rows:
+            if ref_label != last_ref:
+                lines.append("")
+                lines.append(f"attitude error vs {ref_label} "
+                             f"(RMS / max |e| in °):")
+                last_ref = ref_label
+            lines.append(f"  {label + ' ' + _ATT_AXIS_NAMES[ax]:14s}"
+                         f"{s['rms']:7.3f} / {abs(s['max']):7.3f}")
+
     # Theoretical free-inertial (no aiding) growth rate from the configured
     # imu process noise -- see replay.process_noise_growth_rate() and its
     # baro_alt_growth_rate()/ahrs_growth_rate() counterparts. growth_rate is
@@ -962,8 +1203,8 @@ def _summary_page(rec, name, growth_rate=None, baro_growth_rate=None,
                      f"{g['horizon_sec']:.0f} s free-inertial coasting, "
                      f"no aiding):")
         lines.append(f"  pos   {g['pos_mps']:.4f} m/s")
-        lines.append(f"  vel   {g['vel_mps2']:.4f} m/s^2")
-        lines.append(f"  att   {math.degrees(g['att_radps']):.4f} deg/s")
+        lines.append(f"  vel   {g['vel_mps2']:.4f} m/s²")
+        lines.append(f"  att   {math.degrees(g['att_radps']):.4f} °/s")
     else:
         lines.append("ins process noise growth rate: N/A - set "
                      "imu.pos_pred_stddev_m_sqrts / vel_pred_stddev_mps_sqrts "
@@ -974,10 +1215,10 @@ def _summary_page(rec, name, growth_rate=None, baro_growth_rate=None,
                      f"{g['horizon_sec']:.0f} s free vertical coasting, "
                      f"no baro):")
         lines.append(f"  height    {g['h_mps']:.4f} m/s")
-        lines.append(f"  vel (-D)  {g['v_mps2']:.4f} m/s^2")
-        lines.append(f"  acc bias  {g['bias_mps2_per_s']:.6f} m/s^2/s  "
+        lines.append(f"  vel (-D)  {g['v_mps2']:.4f} m/s²")
+        lines.append(f"  acc bias  {g['bias_mps2_per_s']:.6f} m/s²/s  "
                      f"(bias_rw {g['bias_rw_mps2_sqrths']:.2e} "
-                     f"m/s^2/sqrt(Hz))")
+                     f"m/s²/√Hz)")
     else:
         lines.append("baro_alt process noise growth rate: N/A - "
                      "set baro.acc_noise_mps2_sqrthz / acc_bias_rw "
@@ -986,7 +1227,7 @@ def _summary_page(rec, name, growth_rate=None, baro_growth_rate=None,
         g = ahrs_growth_rate
         lines.append(f"ars/ahrs process noise growth rate (avg over "
                      f"{g['horizon_sec']:.0f} s free coasting):")
-        lines.append(f"  att   {math.degrees(g['att_radps']):.4f} deg/s")
+        lines.append(f"  att   {math.degrees(g['att_radps']):.4f} °/s")
     else:
         lines.append("ars/ahrs process noise growth rate: N/A - "
                      "set ahrs.gyr_noise_psd / gyr_bias_rw explicitly in "
@@ -1039,9 +1280,9 @@ def _subfilter_page(rec, t, name, prefix, label):
     # offset: shifted onto the reference at the first common sample (like the
     # heading page) so only the relative drift remains visible.
     free_yaw = prefix == "ars"
-    panels = [(0, "roll [deg]"), (1, "pitch [deg]"),
-              (2, "free gyro heading [deg]\n(synced at start)" if free_yaw
-               else "yaw [deg]")]
+    panels = [(0, "roll [°]"), (1, "pitch [°]"),
+              (2, "free gyro heading [°]\n(synced at start)" if free_yaw
+               else "yaw [°]")]
     rpy_sigma = rec[f"{prefix}_rpy_sigma_deg"]
     for i, lbl in panels:
         ax = axes[0][i]
@@ -1084,12 +1325,204 @@ def _subfilter_page(rec, t, name, prefix, label):
         _band(ax, t, center, sigma, label, EST_COLOR)
         full3d_bias, tf = _thin([math.degrees(v) for v in _col(rec["gyr_bias"], i)], t)
         ax.plot(tf, full3d_bias, "--", color="0.4", linewidth=1.2, label="full3d")
-        ax.set_ylabel(f"gyro bias {axis_lbl} [deg/s]")
+        ax.set_ylabel(f"gyro bias {axis_lbl} [°/s]")
         ax.set_xlabel("time [s]")
         if i == 0:
             ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
     _apply_grid(fig)
+    return fig
+
+
+_ATT_AXIS_NAMES = ("roll", "pitch", "yaw")
+
+
+def _wrap180(d):
+    return (d + 180.0) % 360.0 - 180.0
+
+
+def _att_ref_axes(rec):
+    """Attitude axes (0 roll, 1 pitch, 2 yaw) for which rec holds a real
+    ground-truth attitude. A position-only reference is padded with constant
+    angles, so an axis only counts when the reference actually moves (yaw:
+    1 deg, roll/pitch: 0.5 deg; roll/pitch also count when yaw is real)."""
+    if rec.get("ref_epoch_count", 2) < 2:
+        return ()
+    rows = rec.get("ref_rpy_deg") or []
+    cols = [[v for v in _col(rows, i) if v == v] for i in range(3)]
+    if not all(cols):
+        return ()
+    cols[2] = [v for v in _unwrap_deg(cols[2]) if v == v]
+    spread = [max(c) - min(c) for c in cols]
+    yaw_ok = spread[2] >= 1.0
+    rp_ok = yaw_ok or max(spread[0], spread[1]) >= 0.5
+    return tuple(i for i, ok in ((0, rp_ok), (1, rp_ok), (2, yaw_ok)) if ok)
+
+
+def _att_sources(rec):
+    """(label, color, rpy rec key, axes) of every attitude filter that
+    produced output. The gyro-only ARS has no absolute yaw, so no yaw axis."""
+    out = []
+    for label, ck, key, axes in (("INSLIB", "full3d", "rpy_deg", (0, 1, 2)),
+                                 ("ARS", "ars", "ars_rpy_deg", (0, 1)),
+                                 ("AHRS", "ahrs", "ahrs_rpy_deg", (0, 1, 2))):
+        rows = rec.get(key)
+        if rows and any(r[0] == r[0] for r in rows):
+            out.append((label, DOWNWEIGHT_COLORS[ck], key, axes))
+    return out
+
+
+def _att_error(est, ref, axis):
+    """Per-sample angle error est - ref in deg, NaN where either is NaN.
+    Yaw is wrapped to +-180 deg."""
+    out = []
+    for e, r in zip(est, ref):
+        if e == e and r == r:
+            d = e - r
+            out.append(_wrap180(d) if axis == 2 else d)
+        else:
+            out.append(math.nan)
+    return out
+
+
+def _att_error_series(rec):
+    """Attitude error traces, ground truth first (if usable), then INSLIB as
+    the reference. Returns a list of (ref_label, [(label, color, axis, err)])
+    where err is parallel to rec['t']."""
+    sources = _att_sources(rec)
+    groups = []
+    ref_axes = _att_ref_axes(rec)
+    if ref_axes:
+        traces = []
+        for label, color, key, axes in sources:
+            for ax in axes:
+                if ax in ref_axes:
+                    traces.append((label, color, ax, _att_error(
+                        _col(rec[key], ax), _col(rec["ref_rpy_deg"], ax), ax)))
+        if traces:
+            groups.append(("ground truth", traces))
+    if sources and sources[0][0] == "INSLIB":
+        traces = []
+        for label, color, key, axes in sources[1:]:
+            for ax in axes:
+                traces.append((label, color, ax, _att_error(
+                    _col(rec[key], ax), _col(rec["rpy_deg"], ax), ax)))
+        if traces:
+            groups.append(("INSLIB", traces))
+    return groups
+
+
+def _att_stats(err, t, warmup_sec):
+    """RMS, mean, max |error| (signed value and time) of the finite samples
+    from warmup_sec on, or None."""
+    vals = [(e, ti) for e, ti in zip(err, t) if e == e and ti >= warmup_sec]
+    if not vals:
+        return None
+    n = len(vals)
+    emax, tmax = max(vals, key=lambda p: abs(p[0]))
+    return {"rms": math.sqrt(sum(e * e for e, _ in vals) / n),
+            "mean": sum(e for e, _ in vals) / n,
+            "max": emax, "tmax": tmax, "n": n}
+
+
+def _att_stat_rows(rec, warmup_sec):
+    """Flat list of (ref_label, label, axis, stats) for the attitude
+    comparison table and the front page."""
+    t = rec["t"]
+    rows = []
+    for ref_label, traces in _att_error_series(rec):
+        for label, _color, ax, err in traces:
+            s = _att_stats(err, t, warmup_sec)
+            if s is not None:
+                rows.append((ref_label, label, ax, s))
+    return rows
+
+
+def _att_table_lines(rows):
+    lines = []
+    last_ref = None
+    for ref_label, label, ax, s in rows:
+        if ref_label != last_ref:
+            if last_ref is not None:
+                lines.append("")
+            lines.append(f"error vs {ref_label}:")
+            lines.append(f"  {'':16s}{'RMS':>8s}{'mean':>9s}{'max |e|':>10s}"
+                         f"{'at t [s]':>10s}   [°]")
+            last_ref = ref_label
+            best = {}
+            for r2, l2, a2, s2 in rows:
+                if r2 == ref_label:
+                    best[a2] = min(best.get(a2, (math.inf, l2)),
+                                   (s2["rms"], l2))
+        mark = "*" if best.get(ax, (0, ""))[1] == label else " "
+        lines.append(f"  {label + ' ' + _ATT_AXIS_NAMES[ax]:16s}"
+                     f"{s['rms']:8.3f}{s['mean']:9.3f}{abs(s['max']):10.3f}"
+                     f"{s['tmax']:10.1f} {mark}")
+    if lines:
+        lines.append("")
+        lines.append("  * = lowest RMS of that axis. Statistics from the end "
+                     "of the warm-up on.")
+    return lines
+
+
+def _attitude_compare_page(rec, t, name, warmup_sec):
+    """Attitude error of INSLIB / ARS / AHRS against the ground-truth
+    attitude and of ARS / AHRS against the INSLIB solution (roll/pitch for
+    the ARS, plus yaw for INSLIB and AHRS), with RMS / mean / max statistics.
+    The largest deviation of each trace is marked. Returns None when there
+    is nothing to compare."""
+    groups = _att_error_series(rec)
+    if not groups:
+        return None
+    rows = _att_stat_rows(rec, warmup_sec)
+    lines = _att_table_lines(rows)
+    import matplotlib.pyplot as plt
+
+    n_plot = len(groups)
+    plot_h = 3.0
+    table_h = 0.26 * len(lines) + 0.6
+    fig = plt.figure(figsize=(14, 1.0 + plot_h * n_plot + table_h))
+    gs = fig.add_gridspec(n_plot + 1, 3,
+                          height_ratios=[plot_h] * n_plot + [table_h])
+    fig.suptitle(f"{name}: attitude error, INSLIB vs ARS vs AHRS")
+    for r, (ref_label, traces) in enumerate(groups):
+        for ax_i in range(3):
+            ax = fig.add_subplot(gs[r, ax_i])
+            ax.axhline(0.0, color="black", linewidth=0.5)
+            drawn = False
+            for label, color, a, err in traces:
+                if a != ax_i:
+                    continue
+                y, ty = _thin(err, t)
+                ax.plot(ty, y, color=color, linewidth=1.0, label=label)
+                s = _att_stats(err, t, warmup_sec)
+                if s is not None:
+                    ax.plot([s["tmax"]], [s["max"]], "v", color=color,
+                            markersize=6, markeredgecolor="black",
+                            markeredgewidth=0.5)
+                drawn = True
+            ax.set_ylabel(f"{_ATT_AXIS_NAMES[ax_i]} err vs {ref_label} [°]")
+            ax.set_xlabel("time [s]")
+            if warmup_sec > 0:
+                ax.axvline(warmup_sec, color="gray", linestyle=":",
+                           linewidth=1)
+            if drawn:
+                ax.legend(loc="best", fontsize=8)
+            else:
+                ax.text(0.5, 0.5, "n/a", transform=ax.transAxes,
+                        ha="center", va="center", color="0.5")
+    _apply_grid(fig)
+    ax_t = fig.add_subplot(gs[n_plot, :])
+    ax_t.axis("off")
+    ax_t.set_xlim(0, 1)
+    ax_t.set_ylim(0, 1)
+    step = 1.0 / max(1, len(lines))
+    y = 1.0
+    for line in lines:
+        ax_t.text(0.0, y, line, color="0.1", family="monospace",
+                  fontsize=10, va="top")
+        y -= step
+    fig.tight_layout()
     return fig
 
 
@@ -1159,7 +1592,7 @@ def _heading_page(rec, t, name):
     for label, color, ls, synced in sources:
         y, ty = _thin(synced, t)
         ax_abs.plot(ty, y, ls, color=color, linewidth=1.2, label=label)
-    ax_abs.set_ylabel("heading [deg]")
+    ax_abs.set_ylabel("heading [°]")
     ax_abs.legend(loc="best", fontsize=8, ncol=2)
 
     ax_dev.axhline(0.0, color=REF_COLOR, linestyle=":", linewidth=1.6,
@@ -1169,7 +1602,7 @@ def _heading_page(rec, t, name):
                for s, r in zip(synced, ref_u)]
         y, ty = _thin(dev, t)
         ax_dev.plot(ty, y, ls, color=color, linewidth=1.2, label=label)
-    ax_dev.set_ylabel(f"heading error vs {ref_label} [deg]")
+    ax_dev.set_ylabel(f"heading error vs {ref_label} [°]")
     ax_dev.set_xlabel("time [s]")
     ax_dev.legend(loc="best", fontsize=8, ncol=2)
 
@@ -1490,7 +1923,7 @@ def _baro_page(rec, t, name):
     ax_b = axes[2]
     _band(ax_b, t, rec["baro_acc_bias"], rec["baro_acc_bias_sigma"],
          "baro_alt z-accel bias", EST_COLOR)
-    ax_b.set_ylabel("z-accel bias [m/s^2]")
+    ax_b.set_ylabel("z-accel bias [m/s²]")
     ax_b.set_xlabel("time [s]")
     ax_b.legend(loc="best", fontsize=8)
 
@@ -1679,6 +2112,118 @@ def _gnss_stddev_page(rec, t, name):
     return fig
 
 
+# gnss.csv quality (RTKLIB numbering): label and colour of each level, in
+# the order the y axis lists them (best on top).
+_GNSS_Q_LEVELS = ((1, "fix", "#1e8449"), (2, "float", "#c87f0a"),
+                  (6, "ppp", "#2471a3"), (4, "dgnss", "#7d3c98"),
+                  (3, "sbas", "#5d6d7e"), (5, "single", "#c0392b"))
+
+
+# gnss.csv jamming/spoofing/sig_auth/nav_auth: row label and the colour of
+# each known state (0 unknown is not drawn). Good green, doubtful orange,
+# bad red.
+_GNSS_IND_ROWS = (
+    ("jamming", "jamming", {1: "#1e8449", 2: "#c87f0a", 3: "#c0392b"}),
+    ("spoofing", "spoofing", {1: "#1e8449", 2: "#c87f0a", 3: "#c0392b"}),
+    ("sig_auth", "signal auth", {1: "#c87f0a", 2: "#1e8449", 3: "#c0392b"}),
+    ("nav_auth", "nav msg auth", {1: "#c87f0a", 2: "#1e8449", 3: "#c0392b"}))
+_GNSS_IND_STATE_NAMES = {
+    "jamming": {1: "none", 2: "warning", 3: "critical"},
+    "spoofing": {1: "none", 2: "indicated", 3: "confirmed"},
+    "sig_auth": {1: "not authenticated", 2: "authenticated", 3: "failed"},
+    "nav_auth": {1: "not authenticated", 2: "authenticated", 3: "failed"}}
+
+
+def _gnss_quality_page(rec, name, configured_delay_ms=None):
+    """GNSS fix quality over time (gnss.csv's quality column, one dot per
+    fix on its level), the transport latency of every fix (arrival on
+    the recorder's clock minus the fix's own GPS time, via timesync.csv,
+    replay.gnss_latency_stats) against the configured gnss: delay_ms, the
+    satellites used (num_sv) and the receiver's jamming/spoofing and
+    authentication states (one row each, coloured by state). Each panel
+    only where the data carries it, None when it carries none."""
+    qt, q = rec.get("gnss_q_t") or [], rec.get("gnss_q") or []
+    lt, lat = rec.get("gnss_lat_t") or [], rec.get("gnss_lat_ms") or []
+    st, sv = rec.get("gnss_sv_t") or [], rec.get("gnss_sv") or []
+    it, ind = rec.get("gnss_ind_t") or [], rec.get("gnss_ind") or {}
+    ind_rows = [r for r in _GNSS_IND_ROWS if any(ind.get(r[0]) or [])]
+    if not q and not lat and not sv and not ind_rows:
+        return None
+    import matplotlib.pyplot as plt
+    rows = sum(1 for p in (q, lat, sv, ind_rows) if p)
+    fig, axes = plt.subplots(rows, 1, figsize=(12, 3.5 * rows), sharex=True,
+                             squeeze=False)
+    fig.suptitle(f"{name}: GNSS fix quality and latency")
+    ax_i = 0
+    if q:
+        ax = axes[ax_i][0]
+        ax_i += 1
+        levels = [lv for lv in _GNSS_Q_LEVELS if lv[0] in set(q)]
+        ypos = {lv[0]: len(levels) - i for i, lv in enumerate(levels)}
+        n = len(q)
+        for code, label, color in levels:
+            sel = [i for i, v in enumerate(q) if v == code]
+            ax.plot([qt[i] for i in sel], [ypos[code]] * len(sel), "|",
+                    color=color, markersize=12,
+                    label=f"{label} {100.0 * len(sel) / n:.1f}%")
+        ax.set_yticks([ypos[lv[0]] for lv in levels])
+        ax.set_yticklabels([lv[1] for lv in levels])
+        ax.set_ylim(0.5, len(levels) + 0.5)
+        ax.set_ylabel("fix quality")
+        ax.legend(loc="upper right", fontsize=8, ncol=len(levels))
+    if lat:
+        ax = axes[ax_i][0]
+        ax_i += 1
+        lat_v, lat_t = _thin(list(lat), list(lt))
+        ax.plot(lat_t, lat_v, ".", markersize=2, color=EST_COLOR,
+                label="transport latency")
+        if configured_delay_ms is not None:
+            ax.axhline(configured_delay_ms, color="black", linestyle="--",
+                       linewidth=1, label=f"configured delay_ms {configured_delay_ms:.0f}")
+        s = sorted(lat)
+        med = s[len(s) // 2]
+        lo, hi = s[int(0.01 * (len(s) - 1))], s[int(0.99 * (len(s) - 1))]
+        # Zero, the data (1..99 %) and the configured delay always in
+        # view, an all-negative latency included.
+        bottom = min(0.0, lo)
+        top = max(0.0, hi, configured_delay_ms or 0.0)
+        ax.set_ylim(bottom - 0.1 * (top - bottom) - 10.0,
+                    top + 0.2 * (top - bottom) + 10.0)
+        ax.set_ylabel("latency [ms]")
+        ax.set_title(f"arrival minus GPS time of validity, median {med:.0f} ms",
+                     fontsize=9)
+        ax.legend(loc="upper right", fontsize=8)
+    if sv:
+        ax = axes[ax_i][0]
+        ax_i += 1
+        sv_v, sv_t = _thin(list(sv), list(st))
+        ax.step(sv_t, sv_v, where="post", color=GNSS_COLOR)
+        ax.set_ylim(0, max(sv) + 2)
+        ax.set_ylabel("satellites used")
+    if ind_rows:
+        ax = axes[ax_i][0]
+        ax_i += 1
+        n_rows = len(ind_rows)
+        for i, (key, label, colors) in enumerate(ind_rows):
+            y = n_rows - i
+            vals = ind[key]
+            for state, color in colors.items():
+                sel = [j for j, v in enumerate(vals) if v == state]
+                if sel:
+                    ax.plot([it[j] for j in sel], [y] * len(sel), "|",
+                            color=color, markersize=12,
+                            label=f"{label}: {_GNSS_IND_STATE_NAMES[key][state]}")
+        ax.set_yticks([n_rows - i for i in range(n_rows)])
+        ax.set_yticklabels([r[1] for r in ind_rows])
+        ax.set_ylim(0.5, n_rows + 0.5)
+        ax.set_ylabel("receiver integrity")
+        ax.legend(loc="upper right", fontsize=7, ncol=2)
+    axes[-1][0].set_xlabel("time [s]")
+    fig.tight_layout()
+    _apply_grid(fig)
+    return fig
+
+
 def _outlier_page(rec, t, name):
     """Cumulative chi2-downweight counters over time, one
     step line per sub-filter, so an outlier-heavy stretch shows up as a
@@ -1720,7 +2265,7 @@ def _zupt_page(rec, t, name):
     considers the platform still while ins's position-aided detector
     doesn't, because ins has no GNSS lock yet) is visible directly.
 
-    ins auto-ZUPT/ZARU: ins's own detector, velocity-aware (uses ins's
+    INS auto-ZUPT/ZARU: ins's own detector, velocity-aware (uses ins's
     estimated velocity, GNSS-informed when available), needs ins ready
     (position aiding), REQ-SUITE-009/-010.
 
@@ -1747,7 +2292,7 @@ def _zupt_page(rec, t, name):
     ahrs = rec.get("ahrs_zaru_applied", [])
     ars_ahrs = [1.0 if a == 1.0 or h == 1.0 else 0.0 for a, h in zip(ars, ahrs)]
     rows = (
-        ("ins auto-ZUPT/ZARU", rec.get("auto_zupt_active", []), EST_COLOR),
+        ("INS auto-ZUPT/ZARU", rec.get("auto_zupt_active", []), EST_COLOR),
         ("ARS/AHRS ZARU applied", ars_ahrs, "tab:orange"),
         ("baro_alt vertical ZUPT", rec.get("vertical_zupt_active", []), BARO_COLOR),
     )

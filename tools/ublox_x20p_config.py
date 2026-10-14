@@ -19,6 +19,8 @@ Configures:
      applies and reports that in RXM-COR, see below)
   - Measurement rate 5 Hz (RATE-MEAS 250 ms, RATE-NAV 1 -> raw data and
     navigation solution both run at 5 Hz), dynModel airborne <4g
+  - Time pulse on the GPS time grid (CFG-TP-TIMEGRID), so TIM-TP and the
+    board's time sync carry GPS time, not UTC (the receiver default)
   - Message output on UART1 AND UART2:
       NAV-PVT, NAV-COV, RXM-RAWX, RXM-SFRBX, TIM-TP  = on
       NAV-TIMEGPS                                    = off
@@ -108,6 +110,10 @@ CFG = {
     "CFG-RATE-MEAS":          (0x30210001, 200),   # 200 ms measurement epoch = 5 Hz -> RXM-RAWX/SFRBX
     "CFG-RATE-NAV":           (0x30210002, 1),     # measurements per nav solution -> NAV-PVT/COV also 5 Hz
     "CFG-NAVSPG-DYNMODEL":    (0x20110021, 8),     # airborne <4g
+    # Time pulse on the GPS time grid, so TIM-TP (and with it the board's
+    # 0x40/0x05 time sync) carries GPS time of week and not UTC, which
+    # is the receiver's default and is off by the leap seconds.
+    "CFG-TP-TIMEGRID_TP2":    (0x20050017, 1),     # 1 = GPS
     # Message output UART1
     "CFG-MSGOUT-NAV_PVT_UART1":     (0x20910007, 1),
     "CFG-MSGOUT-NAV_COV_UART1":     (0x20910084, 0),  # disable

@@ -164,6 +164,12 @@ was lost on the GNSS UART, when the receiver restarted its time solution,
 or at a genuine discontinuity. Treat such pairs as outliers in the clock
 fit rather than discarding the frame.
 
+`UTC_BASE` follows the receiver's time pulse grid (u-blox
+`CFG-TP-TIMEGRID_TPx`), whose default is UTC: `tow_ms`/`week` are then a
+UTC time of week, off GPS time by the leap seconds. `tools/ublox_x20p_config.py`
+and `tools/ublox_f9p_config.py` set the grid to GPS. Consumers take the time
+as GPS time and do not correct a UTC-grid capture.
+
 ### 0x40 / 0x0D IMU health
 
 Diagnostics for the IMU acquisition chain: 19 u32 in the order below, all

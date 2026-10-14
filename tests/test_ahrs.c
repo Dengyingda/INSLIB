@@ -1307,42 +1307,49 @@ static void yaw_carry_epoch(nav_suite_t* s, ahrs_time_us_t t, float yaw_rate_rps
     nav_suite_update(s, &m);
 }
 
+/* ins init/options shared by the heading carry-over scenarios
+ * (REQ-SUITE-022): GNSS position aiding only, no magnetometer. */
+static void yaw_carry_config(ins_init_t* init, ins_options_t* opt, ahrs_time_us_t t)
+{
+    memset(init, 0, sizeof(*init));
+    init->time                            = t;
+    init->llh[0]                          = 48.783 * M_PI / 180.0;
+    init->llh[1]                          = 9.181 * M_PI / 180.0;
+    init->llh[2]                          = 300.0;
+    init->pos_init_stddev_m               = 10.0f;
+    init->vel_init_stddev_mps             = 1.0f;
+    init->rpy_init_stddev_rad[0]          = DEG2RAD(5.0f);
+    init->rpy_init_stddev_rad[1]          = DEG2RAD(5.0f);
+    init->acc_bias_init_stddev_mps2       = 0.1f;
+    init->gyr_bias_init_stddev_rps        = DEG2RAD(0.01f);
+    init->pos_pred_stddev_m_sqrts         = 0.01f;
+    init->vel_pred_stddev_mps_sqrts       = 0.05f;
+    init->rpy_pred_stddev_rad_sqrts       = DEG2RAD(0.01f);
+    init->acc_bias_pred_stddev_mps2_sqrts = 1e-4f;
+    init->gyr_bias_pred_stddev_rps_sqrts  = 1e-6f;
+    init->zero_vel_stddev_mps             = 0.01f;
+    init->zero_rot_stddev_rps             = DEG2RAD(0.001f);
+
+    memset(opt, 0, sizeof(*opt));
+    opt->kalman_update_dt_sec               = 0.01f;
+    opt->max_prediction_time_sec            = 0.5f;
+    opt->gnss_max_horizontal_pos_stddev_m   = 10.0f;
+    opt->gnss_max_vertical_pos_stddev_m     = 20.0f;
+    opt->gnss_max_horizontal_vel_stddev_mps = 1.0f;
+    opt->gnss_max_vertical_vel_stddev_mps   = 2.0f;
+    opt->auto_init                          = true;
+    opt->gnss_init_dwell_disable            = true;
+}
+
 static void scenario_suite_yaw_carry(void)
 {
     printf("\n-- scenario: ins re-init heading = last 3D heading + ARS delta "
            "(REQ-SUITE-022) --\n");
 
-    ins_init_t init;
-    memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t                     = 1000000;
-    init.time                            = t;
-    init.llh[0]                          = 48.783 * M_PI / 180.0;
-    init.llh[1]                          = 9.181 * M_PI / 180.0;
-    init.llh[2]                          = 300.0;
-    init.pos_init_stddev_m               = 10.0f;
-    init.vel_init_stddev_mps             = 1.0f;
-    init.rpy_init_stddev_rad[0]          = DEG2RAD(5.0f);
-    init.rpy_init_stddev_rad[1]          = DEG2RAD(5.0f);
-    init.acc_bias_init_stddev_mps2       = 0.1f;
-    init.gyr_bias_init_stddev_rps        = DEG2RAD(0.01f);
-    init.pos_pred_stddev_m_sqrts         = 0.01f;
-    init.vel_pred_stddev_mps_sqrts       = 0.05f;
-    init.rpy_pred_stddev_rad_sqrts       = DEG2RAD(0.01f);
-    init.acc_bias_pred_stddev_mps2_sqrts = 1e-4f;
-    init.gyr_bias_pred_stddev_rps_sqrts  = 1e-6f;
-    init.zero_vel_stddev_mps             = 0.01f;
-    init.zero_rot_stddev_rps             = DEG2RAD(0.001f);
-
-    ins_options_t opt;
-    memset(&opt, 0, sizeof(opt));
-    opt.kalman_update_dt_sec               = 0.01f;
-    opt.max_prediction_time_sec            = 0.5f;
-    opt.gnss_max_horizontal_pos_stddev_m   = 10.0f;
-    opt.gnss_max_vertical_pos_stddev_m     = 20.0f;
-    opt.gnss_max_horizontal_vel_stddev_mps = 1.0f;
-    opt.gnss_max_vertical_vel_stddev_mps   = 2.0f;
-    opt.auto_init                          = true;
-    opt.gnss_init_dwell_disable            = true;
+    ins_init_t     init;
+    ins_options_t  opt;
+    ahrs_time_us_t t = 1000000;
+    yaw_carry_config(&init, &opt, t);
 
     static nav_suite_t s;
     memset(&s, 0, sizeof(s));
@@ -1429,6 +1436,69 @@ static void scenario_suite_yaw_carry(void)
     t += US_PER_SEC / 100;
     yaw_carry_epoch(&s, t, 0.0f, init_ecef(&init), true, (const float*)0);
     CHECK_TRUE(!s.yaw_carry.valid, "carry-over dropped when the ars re-bootstraps");
+}
+
+/* REQ-SUITE-022 at a re-acquisition: the coasting window expires, so ins
+ * stays initialized but freezes its state, and the platform turns while it
+ * is frozen. The GNSS receiver reports position only. Without the carried
+ * heading in the hint the re-acquisition would reset the yaw to unknown
+ * (REQ-NAV-059) and keep the frozen 40 deg. */
+static void scenario_suite_yaw_carry_reacquire(void)
+{
+    printf("\n-- scenario: ins re-acquisition heading = last 3D heading + ARS delta "
+           "(REQ-SUITE-022) --\n");
+
+    ins_init_t     init;
+    ins_options_t  opt;
+    ahrs_time_us_t t = 1000000;
+    yaw_carry_config(&init, &opt, t);
+    opt.max_deadreckoning_sec = 5.0f;
+
+    static nav_suite_t s;
+    memset(&s, 0, sizeof(s));
+    CHECK_TRUE(nav_suite_init(&s, &init, &opt) == 0, "nav_suite_init");
+
+    const float yaw_true = DEG2RAD(40.0f);
+    int         i;
+    for (i = 0; i < 500; ++i) /* 5 s aided, with a heading */
+    {
+        t += US_PER_SEC / 100;
+        yaw_carry_epoch(&s, t, 0.0f, init_ecef(&init), true, &yaw_true);
+    }
+    CHECK_TRUE(ins_is_ready(&s.ins) && s.yaw_carry.valid, "ins ready, heading latched");
+
+    for (i = 0; i < 700; ++i) /* 7 s without a fix: past the 5 s window */
+    {
+        t += US_PER_SEC / 100;
+        yaw_carry_epoch(&s, t, 0.0f, init_ecef(&init), false, (const float*)0);
+    }
+    CHECK_TRUE(s.ins.is_initialized && !ins_is_ready(&s.ins),
+               "coasting window expired: initialized, not ready");
+
+    /* The turn happens while ins is frozen, only the ARS sees it. */
+    const float turn_deg     = 30.0f;
+    const float yaw_rate_rps = DEG2RAD(10.0f);
+    for (i = 0; i < 300; ++i)
+    {
+        t += US_PER_SEC / 100;
+        yaw_carry_epoch(&s, t, yaw_rate_rps, init_ecef(&init), false, (const float*)0);
+    }
+
+    /* Fixes back (position only, held then differenced, REQ-NAV-091). */
+    const uint32_t n_reacq = ins_get_diag(&s.ins)->n_reacquire;
+    for (i = 0; i < 200; ++i)
+    {
+        t += US_PER_SEC / 100;
+        yaw_carry_epoch(&s, t, 0.0f, init_ecef(&init), (i % 100) == 0, (const float*)0);
+    }
+    CHECK_TRUE(ins_get_diag(&s.ins)->n_reacquire == n_reacq + 1, "ins re-acquired");
+
+    float roll, pitch, yaw, roll_sd, pitch_sd, yaw_sd;
+    CHECK_TRUE(ins_get_rpy(&s.ins, &roll, &pitch, &yaw), "ins rpy available");
+    CHECK_NEAR(RAD2DEG(ins_angle_diff(yaw, yaw_true)), turn_deg, 2.0,
+               "re-acquired heading = last 3D heading + ARS delta [deg]");
+    CHECK_TRUE(ins_get_rpy_stddev(&s.ins, &roll_sd, &pitch_sd, &yaw_sd), "ins stddev available");
+    CHECK_TRUE(RAD2DEG(yaw_sd) < 30.0f, "re-acquired yaw prior is a real prior, not 'unknown'");
 }
 
 /* ---------------------------------------------------------------------------
@@ -3837,16 +3907,16 @@ static void scenario_rpy_pred_extra_noise(void)
     float expect = sqrtf(1e-8f + (N * N + E * E) * T);
     CHECK_NEAR(s_split, expect, 0.05 * expect, "growth matches (N^2 + E^2) * T");
 
-    /* (c) 0 (and negative) -> no extra term: the growth is the gyro noise
-           alone, the filter behaves exactly as without the field. */
+    /* (c) 0 (and negative) -> the default extra term. */
     float resolved = -1.0f;
     float s_def    = roll_stddev_after_predict(N, 0.0f, T, &resolved);
     float s_neg    = roll_stddev_after_predict(N, -1.0f, T, (float*)0);
-    float s_gyro   = sqrtf(1e-8f + N * N * T);
-    printf("  default extra term %.5f deg/sqrt(s), roll %.5f deg (gyro noise alone %.5f deg)\n",
-           (double)RAD2DEG(resolved), (double)RAD2DEG(s_def), (double)RAD2DEG(s_gyro));
-    CHECK_NEAR(resolved, 0.0, 1e-12, "0 -> no extra term");
-    CHECK_NEAR(s_def, s_gyro, 0.05 * s_gyro, "default growth is the gyro noise alone");
+    float D        = AHRS_DEFAULT_RPY_PRED_STDDEV_RPS_SQRTS;
+    float s_exp    = sqrtf(1e-8f + (N * N + D * D) * T);
+    printf("  default extra term %.5f deg/sqrt(s), roll %.5f deg (expected %.5f deg)\n",
+           (double)RAD2DEG(resolved), (double)RAD2DEG(s_def), (double)RAD2DEG(s_exp));
+    CHECK_NEAR(resolved, D, 1e-12, "0 -> shared default extra term");
+    CHECK_NEAR(s_def, s_exp, 0.05 * s_exp, "default growth is (N^2 + D^2) * T");
     CHECK_NEAR(s_neg, s_def, 1e-9, "negative behaves like 0");
 }
 
@@ -5036,6 +5106,7 @@ int main(void)
     scenario_suite_init_att_hint();
     scenario_suite_init_att_hint_roll_pitch();
     scenario_suite_yaw_carry();
+    scenario_suite_yaw_carry_reacquire();
     scenario_suite_heading_switch_no_jump();
     scenario_suite_heading_cross_check();
     scenario_nan_inputs();

@@ -15,6 +15,9 @@ DARK = {
     "hover": "#283441", "box_edge": "#3a4654", "strong": "#ffffff",
     "text": "#d8dee6", "dim": "#8fa0b4", "idle": "#5a6470",
     "accent": "#54aaff",
+    # The primary action button (Run): filled, so it stands out of the
+    # toolbar's neutral buttons.
+    "go": "#2e9e56", "go_hover": "#38b866", "go_edge": "#4cc77a",
     # Plot traces: N/E/D (also x/y/z, roll/pitch/yaw), reference, 1-sigma
     # band, warm-up marker, a fourth series.
     "trace": ("#ff6a6a", "#5af08a", "#54aaff"),
@@ -24,6 +27,8 @@ DARK = {
     "map_est": "#ff6a6a", "map_here": "#ffb454", "fix": "#ffc83c",
     # The previous run, drawn behind the current one.
     "ghost": "#9aa4b2",
+    # The RTS smoother's solution (3D view overlay and the post-run plots).
+    "rts": "#f472d0",
     # Where a ZUPT/ZARU was applied, on the 3D trail.
     "zupt": "#ff5ad2",
     # Ranging anchors, once ranges are fed to the filter.
@@ -46,11 +51,13 @@ LIGHT = {
     "hover": "#d6dde7", "box_edge": "#9aa4b2", "strong": "#101418",
     "text": "#1b2027", "dim": "#5b6675", "idle": "#98a2b0",
     "accent": "#1f6fb2",
+    "go": "#1c8a4e", "go_hover": "#22a05c", "go_edge": "#167040",
     "trace": ("#c0392b", "#1c8a4e", "#1f6fb2"),
     "ref": "#303840", "sigma": "#7a8490", "warm": "#b86e00",
     "extra": "#7d3c98", "est": "#1f6fb2",
     "map_est": "#c0392b", "map_here": "#b86e00", "fix": "#c88a00",
     "ghost": "#8a93a0",
+    "rts": "#a8327e",
     "zupt": "#c2188f",
     "anchor": "#d35400",
     "gl_bg": "#fbfbfd", "gl_grid": "#b9c0ca", "ref_trail": "#1c8a4e",
@@ -113,6 +120,11 @@ def stylesheet():
         "QPushButton:hover { background: %(hover)s; } "
         "QPushButton:checked { background: %(hover)s; } "
         "QPushButton:disabled { color: %(idle)s; } "
+        "QPushButton#primary { background: %(go)s; border: 1px solid "
+        "%(go_edge)s; color: #ffffff; font-weight: bold; padding: 6px 18px; } "
+        "QPushButton#primary:hover { background: %(go_hover)s; } "
+        "QPushButton#primary:disabled { background: %(raised)s; border: 1px "
+        "solid %(line)s; color: %(idle)s; } "
         "QLineEdit, QComboBox, QDoubleSpinBox, QPlainTextEdit { "
         "background: %(field)s; border: 1px solid %(line)s; padding: 3px; "
         "color: %(text)s; } "

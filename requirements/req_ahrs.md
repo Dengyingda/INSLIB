@@ -470,7 +470,9 @@ ahrs_config_t.rpy_pred_stddev_rad_sqrts [rad/sqrt(s)] shall add an attitude
 process noise on top of the gyro noise: per covariance prediction the
 attitude noise variance shall be (gyr_noise_psd^2 +
 rpy_pred_stddev_rad_sqrts^2) * dt. Left at (or explicitly set to) <= 0 it
-shall add nothing, leaving the filter exactly as without the term.
+shall resolve to a default (sensor_defaults.h). Together with the default
+gyr_noise_psd the root-sum-square of the two defaults shall equal the gyro
+noise density the filter was tuned with (0.02 deg/s/sqrt(Hz)).
 
 Rationale: gyr_noise_psd is meant to be the sensor's own figure (datasheet,
 Allan variance), and nav_suite users set it from the same IMU description as
@@ -480,11 +482,12 @@ leaves out the model errors that dominate in practice (scale factor and
 misalignment under rotation, a non-rigid mount). Without a separate term the
 filter would become overconfident in attitude the moment a real sensor figure
 is entered. The extra term is the tuning knob, the same split ins makes with
-its own rpy_pred_stddev_rad_sqrts (REQ-NAV-049). Unlike there, the default
-is none: the generic gyro noise default the ARS/AHRS falls back to already
-carries the margin of a typical MEMS IMU, and the filter was tuned on it
-alone (roughly 0.1 to 0.2 deg 1-sigma roll/pitch). Only a caller who enters
-a good sensor's own figure needs the term.
+its own rpy_pred_stddev_rad_sqrts (REQ-NAV-049). The ARS/AHRS defaults are
+smaller than ins's, because the leveling correction degrades with more
+attitude noise under sustained accelerations (coordinated turns), so the
+defaults are split (sensor noise plus extra term) but keep the previous
+total. A caller with a very good gyro who wants no margin sets a negligible
+positive value, since <= 0 selects the default.
 
 ## REQ-AHRS-028 — Attitude uncertainty across a time gap
 

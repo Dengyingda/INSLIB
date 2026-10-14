@@ -315,6 +315,12 @@ extern "C"
     void ins_core_set_gnss_delay_ms(void* h, int ms);
     void ins_core_set_yaw_delay_ms(void* h, int ms);
     void ins_core_set_local_pos_delay_ms(void* h, int ms);
+    /** Further age [us] on top of the ms delay (REQ-NAV-092), e.g. how much
+     *  older the fix is than the IMU epoch it is handed over with. */
+    void ins_core_set_gnss_delay_us(void* h, int32_t us);
+    void ins_core_set_local_pos_delay_us(void* h, int32_t us);
+    void ins_core_set_yaw_delay_us(void* h, int32_t us);
+    void ins_core_set_speed_delay_us(void* h, int32_t us);
     void ins_core_update(void* h);
 
     /** Time-propagation half of ins_core_update() (see ins_predict_step()):
@@ -505,6 +511,18 @@ extern "C"
      *  if left at the (generous) default. Same timing contract as
      *  ins_suite_set_ahrs_gyr_noise. */
     void ins_suite_set_ahrs_gyr_bias_init_stddev(void* h, float stddev_rps);
+    /** Set the ARS's/AHRS's SHARED accelerometer-leveling and magnetometer
+     *  tuning (the ahrs_config_t fields of the same names, in the order of
+     *  the arguments): one call sets both ars_cfg and ahrs_cfg. 0 leaves a
+     *  field at ahrs's own default. gravity_diff_penalty and
+     *  acc_reject_gravity_mps2 also take a negative value through (penalty
+     *  -> 0, reject -> disabled), all others ignore <= 0. Same timing
+     *  contract as ins_suite_set_ahrs_gyr_noise. */
+    void ins_suite_set_ahrs_tuning(void* h, float acc_freq_hz, float acc_cutoff_freq_hz,
+                                   float gravity_diff_penalty, float acc_reject_gravity_mps2,
+                                   float chi2_threshold, float kalman_update_dt_sec,
+                                   float mag_yaw_stddev_rad, float mag_freq_hz,
+                                   float mag_chi2_threshold);
     /** Known initial roll/pitch and/or yaw for ins's auto-init bootstrap
      *  (REQ-NAV-048's att_hint, the static "I just know it" case -- e.g. a
      *  known heading with no mag/GNSS-course yaw aiding to derive it
@@ -519,6 +537,12 @@ extern "C"
     void ins_suite_set_gnss_delay_ms(void* h, int ms);
     void ins_suite_set_yaw_delay_ms(void* h, int ms);
     void ins_suite_set_local_pos_delay_ms(void* h, int ms);
+    /** Further age [us] on top of the ms delay (REQ-NAV-092), e.g. how much
+     *  older the fix is than the IMU epoch it is handed over with. */
+    void ins_suite_set_gnss_delay_us(void* h, int32_t us);
+    void ins_suite_set_local_pos_delay_us(void* h, int32_t us);
+    void ins_suite_set_yaw_delay_us(void* h, int32_t us);
+    void ins_suite_set_speed_delay_us(void* h, int32_t us);
     void ins_suite_update(void* h);
 
     /** Time-propagation half of ins_suite_update() (see

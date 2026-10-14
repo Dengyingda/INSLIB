@@ -1,6 +1,65 @@
 # Changelog
 
-## [Unreleased]
+## [1.3.0] - 2026-10-14 - RTS Smoother
+
+### Added
+
+- RTS (Rauch, Tung, Striebel) smoother added to Python post-processing.
+  This will perform a forward and backwards processing of the data for
+  better results (no change to the C code required for this feature).
+- GUI quality of life improvements (e.g. better colors, highlight
+  variables that have changed from the defaults, grid size)
+- More ARS/AHRS tuning variables for `config.yaml`: `acc_freq_hz`,
+  `acc_cutoff_freq_hz`, `gravity_diff_penalty`, `acc_reject_gravity_mps2`,
+  `chi2_threshold`, `kalman_update_dt_sec`, `mag_yaw_stddev_deg`, `mag_freq_hz`
+  and `mag_chi2_threshold`.
+- `replay.py`/`inspostgui` PDF: attitude comparison page (INS, ARS and AHRS
+  error against the reference attitude, with RMS, mean and maximum) and the
+  same figures on the front page.
+- Improved measurement delay compensation: Delayed measurement are now
+  interpolated to the time of validity between the two surrounding history
+  entries instead of just the nearest history entry.
+- INS: top-level `config.yaml` key `kalman_update_dt_sec`, the covariance
+  prediction interval of the INS can be tuned now.
+- `allan_variance.py`: improvements, e.g. bias instability marked in the plot,
+  IMU temperature curve added, PDF output tweaks.
+
+### Changed (allan_variance.py)
+
+- The first 30 s and the last 60 s of the recording are now skipped by
+  default (`--skip-start 0 --skip-end 0` restores the old behaviour).
+
+### Changed
+
+- Improved PDF output with more plots and statistics (e.g. for RTS).
+- Logging: the library-wide default `LOG_LEVEL` is now `LOG_LEVEL_WARN`
+  (was INFO), so INFO messages are compiled out unless a build defines
+  `-DLOG_LEVEL=LOG_LEVEL_INFO`.
+- u-blox F9P/X20 configuration script: change to GPS time base instead
+  of UTC.
+- `nav_suite`: Under GNSS alone (no baro, no local position) the baro/GNSS
+  offset filter now stays idle instead of re-estimating the datum's
+  ellipsoid height (with a meaningless sigma). inspostgui shows N/A there.
+
+### Fixed
+
+- For GNSS receivers without velocity measurements (a bit of an edge case) and
+  INS re-acquisition after a GNSS loss: The estimated velocity at the start of
+  the outage was used at the re-acquisition.  This old velocity is outdated
+  at the time of the re-acquisition and caused issues. Fixed (also for local
+  position fixes).
+- `nav_suite`: the ARS-tracked heading carry-over now also initializes an INS
+  re-acquisition after an expired coasting window, not only a re-init.
+  The ARS gyro heading can now support the full 3D INS re-init.
+- Post-Processing Bug: `replay.c` (`init: ref`): with a GNSS delay the
+  prescribed start state was taken at the first IMU sample instead of the later
+  first fix where INS actually starts, offsetting a moving start.
+- Auto-ZUPT/ZARU bug: the GNSS velocity test missed fixes on epochs the IMU
+  already read as moving, so it could trigger during steady turns or climbs.
+- `ins_auto_zupt_active()` reported stillness before the detector's dwell
+  time had passed (REQ-NAV-013), so the ARS/AHRS received zero-rotation
+  updates during short slow-speed phases the INS itself did not act on.
+  It now applies the dwell time like the detector.
 
 ## [1.2.1] - 2026-10-08 - Bug fixes
 
@@ -15,7 +74,10 @@
 - ARS/AHRS: `ahrs_config_t.rpy_pred_stddev_rad_sqrts` (config.yaml
   `ahrs: rpy_pred_stddev_rad_sqrts`), an extra attitude process noise on top
   of the gyro noise, the same is already in INS.
-  Off by default, so a typical IMU behaves as before.
+  The default (0 selects it) is sized so that, together with the new, smaller
+  default gyro noise density, a caller leaving both at 0 gets the same total
+  attitude noise as before. A caller who sets the gyro noise explicitly now
+  gets the extra term on top, set a small positive value to avoid it.
 - `inspostgui`: ranging anchors are shown in the 3D view (dots with their id).
 
 ### Changed

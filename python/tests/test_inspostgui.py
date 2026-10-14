@@ -297,13 +297,62 @@ def test_gui_run_result_panel_and_error_report():
             QtWidgets.QMessageBox = real
 
 
+def test_gui_other_dataset_clears_view():
+    if QtCore is None:
+        print("  skip  PyQt6 not installed")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        app, _gui, win = _window(os.path.join(d, "settings"))
+        assert win.run_btn.objectName() == "primary"  # the green Run button
+        for sub in ("a", "b"):
+            os.makedirs(os.path.join(d, sub))
+        ds_a = test_range_stream._dataset(os.path.join(d, "a"), 1e6, False)
+        ds_b = test_range_stream._dataset(os.path.join(d, "b"), 1e6, False)
+        assert win.open_dataset(ds_a)
+        _run_and_wait(app, win)
+        assert win.results is not None and win.pos_view.trail_points
+
+        # Another config of the same dataset keeps the run as comparison.
+        cfg_a = win.cfg_path
+        variant = os.path.join(os.path.dirname(cfg_a), "config_variant.yaml")
+        shutil.copyfile(cfg_a, variant)
+        assert win.open_dataset(variant)
+        assert win.results is not None and win.pos_view.trail_points
+
+        # Another dataset empties the views, the ghost included.
+        assert win.open_dataset(ds_b)
+        assert win.results is None and win._ghost is None
+        assert not win.pos_view.trail_points
+        assert not win.result_frame.isVisibleTo(win)
+        assert not win.pdf_btn.isEnabled()
+
+        # Opened while a replay runs: that replay is stopped and cut loose,
+        # so it cannot draw the old dataset into the emptied views.
+        win.chk_realtime.setChecked(True)
+        win._on_run()
+        t_end = time.time() + 30.0
+        while not win.pos_view.trail_points and time.time() < t_end:
+            app.processEvents()
+            time.sleep(0.02)
+        assert win.pos_view.trail_points
+        assert win.open_dataset(ds_a)
+        assert win.worker is None and win.run_btn.isEnabled()
+        for _ in range(20):
+            app.processEvents()
+            time.sleep(0.02)
+        assert win.results is None and not win.pos_view.trail_points
+        win.close()  # waits for the stopped replay
+        assert not any(w.isRunning() for w in win._stale_workers)
+
+
 if __name__ == "__main__":
     fails = 0
     for fn in (test_gui_config_dirty_tracking_and_guards,
                test_gui_legend_follows_overlays_and_speed_scale,
                test_gui_trail_speed_scale_is_adjustable,
                test_gui_shortcuts,
-               test_gui_run_result_panel_and_error_report):
+               test_gui_run_result_panel_and_error_report,
+               test_gui_other_dataset_clears_view):
         try:
             fn()
             print("  ok    %s" % fn.__name__)

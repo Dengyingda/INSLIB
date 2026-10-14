@@ -309,7 +309,11 @@ have:
 * **`m.gnss_delay_ms`, `m.local_pos_delay_ms`, `m.yaw_delay_ms`** - if a
   fix is a known number of milliseconds old (latency) the filter anchors
   the correction at the right point in its state history. This is essential
-  for agile vehicles.
+  for agile vehicles. `m.gnss_delay_us`, `m.local_pos_delay_us`,
+  `m.yaw_delay_us` and `m.speed_delay_us` add a
+  microsecond part on top: if you attach a fix to the next IMU sample after
+  it arrived, pass how much older it is than that sample, otherwise the
+  solution trails the truth by speed times that age.
 
 Every field is documented in `src/ins.h` - this header is the reference
 for the whole API.

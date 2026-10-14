@@ -311,11 +311,13 @@ replay:    $(REPLAY)
 # otherwise drown the terse ok/FAIL output in noise (verified: over
 # 2000 chi2-downweight lines in one run without this). test_log itself
 # is excluded - it specifically exercises level filtering across the
-# full range and needs log.h's default (LOG_LEVEL_INFO) ceiling intact.
+# full range and so pins the INFO ceiling explicitly, since log.h's
+# default is lower.
 # Not applied to $(CFLAGS)/pylib/replay/insrcv: consumers of the
-# library get full logging by default, as documented in log.h - only
-# this repo's own noisy fault-injection tests opt out.
+# library get log.h's default ceiling - only this repo's own noisy
+# fault-injection tests opt out.
 TEST_LOG_LEVEL_CFLAGS := -DLOG_LEVEL=LOG_LEVEL_NONE
+TEST_LOG_INFO_CFLAGS  := -DLOG_LEVEL=LOG_LEVEL_INFO
 
 all: $(TEST_CORE) $(TEST_MATH) $(TEST_AHRS) $(TEST_AHRS_NOMAG) $(TEST_BARO) $(TEST_LOG) \
      $(TEST_YAML) $(ALL_TEST_CFG)
@@ -338,7 +340,7 @@ $(TEST_BARO): $(SUITE_SRC) $(KFCORE_SRC) tests/test_baro.c $(NAV_HDR) | $(BUILD_
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
 
 $(TEST_LOG): src/log.c tests/test_log.c $(NAV_HDR) | $(BUILD_DIR)
-	$(CC) $(HARNESS_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
+	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_INFO_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
 
 # The config.yaml helpers the two harnesses share (YAML subset reader, IMU
 # mounting). Header only, so this needs nothing but -Itools and the test
@@ -391,7 +393,7 @@ test-asan: | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(SAN_FLAGS) $(INCLUDES) $(SUITE_SRC) $(KFCORE_SRC) tests/test_ahrs.c $(LDLIBS) -o $(BUILD_DIR)/test_ahrs_asan
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(AHRS_NOMAG_FLAGS) $(SAN_FLAGS) $(INCLUDES) $(AHRS_NOMAG_SRC) $(KFCORE_SRC) tests/test_ahrs_nomag.c $(LDLIBS) -o $(BUILD_DIR)/test_ahrs_nomag_asan
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(SAN_FLAGS) $(INCLUDES) $(SUITE_SRC) $(KFCORE_SRC) tests/test_baro.c $(LDLIBS) -o $(BUILD_DIR)/test_baro_asan
-	$(CC) $(HARNESS_CFLAGS) $(SAN_FLAGS) $(INCLUDES) src/log.c tests/test_log.c $(LDLIBS) -o $(BUILD_DIR)/test_log_asan
+	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_INFO_CFLAGS) $(SAN_FLAGS) $(INCLUDES) src/log.c tests/test_log.c $(LDLIBS) -o $(BUILD_DIR)/test_log_asan
 ifneq ($(HAVE_EMBEDDED),)
 	$(CC) $(HARNESS_CFLAGS) $(SAN_FLAGS) $(FW_INCLUDES) $(FW_CFG_SRC) tests/test_cfg.c $(LDLIBS) -o $(BUILD_DIR)/test_cfg_asan
 	$(CC) $(HARNESS_CFLAGS) $(SAN_FLAGS) $(FW_INCLUDES) $(FW_RNG_SRC) $(FW_RNG_TEST) $(LDLIBS) -o $(BUILD_DIR)/test_ranging_asan
@@ -632,6 +634,9 @@ datasets-fog: $(REPLAY)
 # KF-GINS Dataset: Leador-A15 FOG + RTK-GNSS (https://github.com/i2Nav-WHU/KF-GINS/dataset).
 datasets-kfgins: $(REPLAY)
 	$(RUN)$(REPLAY) datasets/kfgins/config.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_vel.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_vel_outage.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_vel_outage_nhc.yaml
 
 # Car through a road tunnel: real u-blox fixes across a 94 s total GNSS
 # blackout, the only recording here that drives the coasting expiry, the
@@ -704,9 +709,13 @@ SIMULATED_DATASETS := datasets/simulated/profile_1_car \
 # inert mid-gap and re-acquires at the far end (REQ-NAV-064, REQ-NAV-065,
 # REQ-NAV-066). Without the second config nothing gates the freeze on data
 # with an independent truth.
+#
+# E_gnss_delay fuses GNSS fixes arriving 500 ms after their time of validity
+# (history-anchored delayed fusion) at 2 Hz on a drone climb/circle/descent.
 SIMULATED_C_ONLY := datasets/simulated/A_ideal \
                     datasets/simulated/B_drone \
-                    datasets/simulated/B_drone/config_coasting.yaml
+                    datasets/simulated/B_drone/config_coasting.yaml \
+                    datasets/simulated/E_gnss_delay
 
 # Part of `make test` (the default stability gate): the C harness always
 # runs (pure C, committed data). check_simulated.py runs additionally when
@@ -790,7 +799,9 @@ COV_OBJDIR := $(COV_DIR)/obj
 COV_KFCORE_OBJDIR := $(COV_DIR)/obj-kfcore
 # -MMD -MP: per-object header dependency files (coverage/obj/**/*.d, included
 # below), so a changed header invalidates every coverage .o that included it.
-COV_CFLAGS := $(HARNESS_CFLAGS) -O0 -g --coverage -MMD -MP
+# The full INFO ceiling is pinned so the LOG_* call sites stay compiled in
+# and measured, independent of log.h's (lower) default.
+COV_CFLAGS := $(HARNESS_CFLAGS) $(TEST_LOG_INFO_CFLAGS) -O0 -g --coverage -MMD -MP
 
 # Branch coverage: the --rc option was renamed in lcov 2.x
 # (1.x: lcov_branch_coverage, 2.x: branch_coverage) -- with the wrong
