@@ -21,7 +21,13 @@ _G = 9.81
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     pkg = os.path.dirname(os.path.abspath(INSLIB.__file__))
-    if os.path.commonpath([pkg, here]) == os.path.dirname(here):
+    checkout = os.path.join(os.path.dirname(here), "INSLIB")
+
+    def norm(p):
+        return os.path.normcase(os.path.realpath(p))
+
+    # A plain comparison, commonpath() raises for paths on different drives.
+    if norm(pkg) == norm(checkout):
         print("FAIL: imported the checkout %s, not the wheel" % pkg)
         return 1
 
