@@ -1,0 +1,142 @@
+name: Release Python package (PyPI)
+
+# Builds the INSLIB wheels (python/, one py3-none wheel per platform via
+# cibuildwheel, configured in python/pyproject.toml) and uploads them
+# through Trusted Publishing (OIDC, no API token stored anywhere).
+#
+#   version tag v*      -> build, then upload to pypi.org
+#   run by hand         -> build only, wheels kept as workflow artifacts
+#   run by hand with "Upload to TestPyPI" and a dev number N
+#                       -> build version x.y.z.devN, upload to test.pypi.org
+#
+# The dev number exists because an index never accepts the same version
+# twice (not even after deleting it), so every test upload needs a fresh
+# one. It only changes the version inside this run, nothing is committed.
+#
+# The repository check keeps this from running in the private development
+# repository, which carries the same file and tags its releases too.
+#
+# One-time setup, separately on pypi.org and on test.pypi.org (separate
+# accounts): Publishing, add a (pending) trusted publisher with owner jnz,
+# repository INSLIB, workflow release-pypi.yml and environment pypi
+# respectively testpypi. In the GitHub repository settings create both
+# environments, pypi with a required reviewer, so every real upload waits
+# for a manual approval.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      testpypi:
+        description: 'Upload to TestPyPI (test.pypi.org)'
+        type: boolean
+        default: false
+      dev:
+        description: 'Dev number N for the TestPyPI version x.y.z.devN (new one per upload)'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Check version
+    if: github.repository == 'jnz/INSLIB'
+    runs-on: ubuntu-latest
+    outputs:
+      dev: ${{ steps.check.outputs.dev }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: check
+        shell: bash
+        env:
+          TESTPYPI: ${{ inputs.testpypi }}
+          DEV: ${{ inputs.dev }}
+        run: |
+          pkg=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' python/INSLIB/__init__.py)
+          echo "package version $pkg"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            test "v$pkg" = "$GITHUB_REF_NAME" || {
+              echo "::error::tag $GITHUB_REF_NAME does not match __version__ $pkg"; exit 1; }
+          elif [[ "$TESTPYPI" == "true" ]]; then
+            [[ "$DEV" =~ ^[0-9]+$ ]] || {
+              echo "::error::TestPyPI upload needs a dev number (digits only)"; exit 1; }
+            echo "dev=$DEV" >> "$GITHUB_OUTPUT"
+            echo "TestPyPI version $pkg.dev$DEV"
+          fi
+
+  wheels:
+    name: Wheel ${{ matrix.os }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86_64 + aarch64 Linux (manylinux and musllinux), x64 Windows
+        # (MinGW-w64 gcc of the runner image), Intel and Apple silicon macOS.
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest,
+             macos-15-intel, macos-14]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Dev version for TestPyPI
+        if: needs.version.outputs.dev != ''
+        shell: bash
+        run: |
+          sed -i.bak 's/^__version__ = "\(.*\)"$/__version__ = "\1.dev${{ needs.version.outputs.dev }}"/' python/INSLIB/__init__.py
+          grep '^__version__' python/INSLIB/__init__.py
+
+      - name: Build and smoke test
+        uses: pypa/cibuildwheel@v3.2.1
+        with:
+          package-dir: python
+          output-dir: wheelhouse
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  publish:
+    name: Upload to PyPI
+    needs: wheels
+    if: github.repository == 'jnz/INSLIB' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/inslib/
+    permissions:
+      id-token: write    # Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-test:
+    name: Upload to TestPyPI
+    needs: [version, wheels]
+    if: needs.version.outputs.dev != ''
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/inslib/
+    permissions:
+      id-token: write    # Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
