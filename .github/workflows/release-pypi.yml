@@ -68,20 +68,35 @@ jobs:
           fi
 
   wheels:
-    name: Wheel ${{ matrix.os }}
+    name: Wheel ${{ matrix.archs }} (${{ matrix.os }})
     needs: version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # x86_64 + aarch64 Linux (manylinux and musllinux), x64 Windows
-        # (MinGW-w64 gcc of the runner image), Intel and Apple silicon macOS.
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest,
-             macos-15-intel, macos-14]
+        include:
+          # Linux wheels come as manylinux and musllinux each.
+          - { os: ubuntu-latest, archs: x86_64 }
+          - { os: ubuntu-24.04-arm, archs: aarch64 }
+          # 32-bit Raspberry Pi OS (Pi 2 and newer). QEMU runs the armv7l
+          # container in case the runner CPU has no 32-bit mode.
+          - { os: ubuntu-24.04-arm, archs: armv7l, qemu: true }
+          # x64 with the runner image's MinGW-w64 gcc, ARM64 with MSVC
+          # (see python/setup.py).
+          - { os: windows-latest, archs: AMD64 }
+          - { os: windows-11-arm, archs: ARM64 }
+          - { os: macos-15-intel, archs: x86_64 }
+          - { os: macos-14, archs: arm64 }
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+
+      - name: QEMU
+        if: matrix.qemu
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
 
       - name: Dev version for TestPyPI
         if: needs.version.outputs.dev != ''
@@ -92,13 +107,15 @@ jobs:
 
       - name: Build and smoke test
         uses: pypa/cibuildwheel@v3.2.1
+        env:
+          CIBW_ARCHS: ${{ matrix.archs }}
         with:
           package-dir: python
           output-dir: wheelhouse
 
       - uses: actions/upload-artifact@v6
         with:
-          name: wheels-${{ matrix.os }}
+          name: wheels-${{ matrix.os }}-${{ matrix.archs }}
           path: wheelhouse/*.whl
 
   publish:

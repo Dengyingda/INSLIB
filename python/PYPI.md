@@ -15,6 +15,11 @@ layer over it, with no required dependencies.
 pip install inslib
 ```
 
+Wheels exist for Linux x86_64, aarch64 and armv7l (64- and 32-bit Raspberry
+Pi OS included), Windows x64 and ARM64, and macOS Intel and Apple silicon.
+Anywhere else (a Pi Zero/1, for example), install from a checkout of the
+repository with `pip install -e python/`, which needs a C compiler.
+
 The import name is `INSLIB`. Optional extras: `inslib[mavlink]` (MAVLink
 telemetry), `inslib[replay]` (the YAML-configured CSV runner `inslib-run`).
 

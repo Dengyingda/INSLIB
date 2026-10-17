@@ -63,13 +63,8 @@ include-package-data = false
 version = { attr = "INSLIB.__version__" }
 
 # The py3-none tag covers every CPython, so one interpreter per platform is
-# enough. Only 64-bit Windows: MinGW-w64 on the runners targets x86_64.
+# enough. Which architectures each runner builds is set by the workflow's
+# matrix (CIBW_ARCHS in .github/workflows/release-pypi.yml).
 [tool.cibuildwheel]
 build = "cp312-*"
 test-command = "python {project}/python/tests/wheel_smoke.py"
-
-[tool.cibuildwheel.linux]
-archs = ["auto64"]
-
-[tool.cibuildwheel.windows]
-archs = ["AMD64"]
