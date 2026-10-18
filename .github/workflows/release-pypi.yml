@@ -44,7 +44,7 @@ jobs:
   version:
     name: Check version
     if: github.repository == 'jnz/INSLIB'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       dev: ${{ steps.check.outputs.dev }}
     steps:
@@ -76,7 +76,7 @@ jobs:
       matrix:
         include:
           # Linux wheels come as manylinux and musllinux each.
-          - { os: ubuntu-latest, archs: x86_64 }
+          - { os: ubuntu-24.04, archs: x86_64 }
           - { os: ubuntu-24.04-arm, archs: aarch64 }
           # 32-bit Raspberry Pi OS (Pi 2 and newer). QEMU runs the armv7l
           # container in case the runner CPU has no 32-bit mode.
@@ -122,7 +122,7 @@ jobs:
     name: Upload to PyPI
     needs: wheels
     if: github.repository == 'jnz/INSLIB' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: pypi
       url: https://pypi.org/project/inslib/
@@ -141,7 +141,7 @@ jobs:
     name: Upload to TestPyPI
     needs: [version, wheels]
     if: needs.version.outputs.dev != ''
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: testpypi
       url: https://test.pypi.org/project/inslib/

@@ -626,8 +626,11 @@ class _Base:
         if not self._h:
             raise MemoryError(f"{p}_create failed")
         self._n_states = 15  # updated by init(); default matches the 15-state mode
-        if config is not None:
-            self.init(config)
+        # Always initialized: a handle that never saw init() runs on an
+        # all-zero setup (no IMU timeout, so every epoch reads as an IMU
+        # loss) and never produces a solution. Navigator() therefore means
+        # Navigator(Config()), init() may still be called again later.
+        self.init(config if config is not None else Config())
 
     def init(self, config: Config):
         rc = self._c("init")(self._h, ctypes.byref(config._to_struct()))

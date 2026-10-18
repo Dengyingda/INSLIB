@@ -22,7 +22,11 @@ authors = [{ name = "Jan Zwiener", email = "jan@zwiener.org" }]
 license = "AGPL-3.0-or-later"
 keywords = ["navigation", "kalman-filter", "ins", "gnss", "imu", "ahrs"]
 classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: C",
     "Operating System :: POSIX :: Linux",
     "Operating System :: Microsoft :: Windows",
@@ -47,6 +51,8 @@ inslib-run = "INSLIB.runner:main"
 
 [project.urls]
 Homepage = "https://github.com/jnz/INSLIB"
+Source = "https://github.com/jnz/INSLIB"
+Issues = "https://github.com/jnz/INSLIB/issues"
 Documentation = "https://github.com/jnz/INSLIB/blob/main/tutorial/python_tutorial.md"
 Changelog = "https://github.com/jnz/INSLIB/blob/main/CHANGELOG.md"
 

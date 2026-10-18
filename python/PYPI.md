@@ -1,5 +1,7 @@
 # INSLIB
 
+![INSLIB](https://raw.githubusercontent.com/jnz/INSLIB/main/doc/figures/inslib_logo_transparent_small.png)
+
 Python binding of [INSLIB](https://github.com/jnz/INSLIB), a portable C11
 library for 3D navigation state estimation: a 15/18-state error-state Kalman
 filter fusing IMU, GNSS, magnetometer, barometer and local position, plus
