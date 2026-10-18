@@ -34,18 +34,9 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 
-[project.optional-dependencies]
-mavlink = ["pymavlink"]
-plot = ["matplotlib"]
-kml = ["simplekml", "pyproj"]
-replay = ["pyyaml", "pymavlink", "matplotlib", "simplekml", "pyproj", "Pillow"]
-# The host-side tools in tools/: pyserial for the serial link,
-# pyubx2 for GNSS UBX decode, pymavlink for --mavlink.
-recv = ["pyserial", "pyubx2", "pymavlink"]
-
 # The YAML-configured CSV runner: inslib-run config.yaml
-# (equivalent: python3 -m INSLIB config.yaml). Needs the 'replay' extra
-# (PyYAML, pymavlink only for MAVLink output).
+# (equivalent: python3 -m INSLIB config.yaml). Needs PyYAML, and pymavlink
+# only for MAVLink output, both installed separately (pip install pyyaml).
 [project.scripts]
 inslib-run = "INSLIB.runner:main"
 
@@ -53,7 +44,8 @@ inslib-run = "INSLIB.runner:main"
 Homepage = "https://github.com/jnz/INSLIB"
 Source = "https://github.com/jnz/INSLIB"
 Issues = "https://github.com/jnz/INSLIB/issues"
-Documentation = "https://github.com/jnz/INSLIB/blob/main/tutorial/python_tutorial.md"
+Documentation = "https://jnz.github.io/INSLIB/"
+Tutorial = "https://github.com/jnz/INSLIB/blob/main/tutorial/python_tutorial.md"
 Changelog = "https://github.com/jnz/INSLIB/blob/main/CHANGELOG.md"
 
 [tool.setuptools]

@@ -341,220 +341,293 @@ _bind()
 
 @dataclass
 class Config:
-    """Filter configuration (a friendly view of ins_cfg_t).
+    """Filter configuration (a friendly view of ``ins_cfg_t``).
 
     Every tuning field defaults to 0, which the C library resolves to its
     own default (ins.c, REQ-NAV-043/049). The binding deliberately keeps no
     numbers of its own: a Python-side copy would silently differ from the C
-    filter the day either side is tuned. Override the initial lat/lon/h
-    (ignored when ``auto_init`` bootstraps from the first fix),
-    ``magnetic_n`` (NED reference for magnetometer fusion) and the noise
-    terms as needed.
+    filter the day either side is tuned. An empty ``Config()`` is a working
+    setup, override only what you need, for example the initial position
+    (ignored when ``auto_init`` bootstraps from the first fix) and the noise
+    terms.
     """
     time_us: int = 0
+    """Initialization time stamp [us]."""
     lat_rad: float = 0.0
+    """Initial latitude [rad]. Overridden by ``auto_init``."""
     lon_rad: float = 0.0
+    """Initial longitude [rad]. Overridden by ``auto_init``."""
     h_m: float = 0.0
-    pos_init_stddev_m: float = 0.0      # [m], 0 -> C default
-    vel_init_stddev_mps: float = 0.0    # [m/s], 0 -> C default
+    """Initial ellipsoidal height [m]. Overridden by ``auto_init``."""
+    pos_init_stddev_m: float = 0.0
+    """Initial position 1-sigma [m], 0 -> C default."""
+    vel_init_stddev_mps: float = 0.0
+    """Initial velocity 1-sigma [m/s], 0 -> C default."""
     rpy_init_stddev_rad: tuple = (0.0, 0.0, 0.0)
-                                        # roll/pitch/yaw, independently
-                                        # settable (each 0 -> its own C
-                                        # default; no cross-axis fallback)
-    acc_bias_init_stddev_mps2: float = 0.0  # [m/s^2], 0 -> C default
-    gyr_bias_init_stddev_rps: float = 0.0   # [rad/s], 0 -> C default
-    pos_pred_stddev_m_sqrts: float = 0.0    # [m/sqrt(s)], 0 -> C default
-    vel_pred_stddev_mps_sqrts: float = 0.0  # [m/s/sqrt(s)], 0 -> C default
-    rpy_pred_stddev_rad_sqrts: float = 0.0  # [rad/sqrt(s)], 0 -> C default
-    acc_bias_pred_stddev_mps2_sqrts: float = 0.0  # [m/s^2/sqrt(s)], 0 -> C default
-    gyr_bias_pred_stddev_rps_sqrts: float = 0.0   # [rad/s/sqrt(s)], 0 -> C default
-    zero_vel_stddev_mps: float = 0.0    # [m/s], 0 -> C default
-    zero_rot_stddev_rps: float = 0.0    # [rad/s], 0 -> C default
+    """Initial roll/pitch/yaw 1-sigma [rad], each axis on its own (each 0 ->
+    its own C default, no cross-axis fallback)."""
+    acc_bias_init_stddev_mps2: float = 0.0
+    """Initial accelerometer bias 1-sigma [m/s^2], 0 -> C default."""
+    gyr_bias_init_stddev_rps: float = 0.0
+    """Initial gyro bias 1-sigma [rad/s], 0 -> C default."""
+    pos_pred_stddev_m_sqrts: float = 0.0
+    """Position process noise [m/sqrt(s)], 0 -> C default."""
+    vel_pred_stddev_mps_sqrts: float = 0.0
+    """Velocity process noise [m/s/sqrt(s)], 0 -> C default."""
+    rpy_pred_stddev_rad_sqrts: float = 0.0
+    """Extra attitude process noise [rad/sqrt(s)], 0 -> C default."""
+    acc_bias_pred_stddev_mps2_sqrts: float = 0.0
+    """Accelerometer bias random walk [m/s^2/sqrt(s)], 0 -> C default."""
+    gyr_bias_pred_stddev_rps_sqrts: float = 0.0
+    """Gyro bias random walk [rad/s/sqrt(s)], 0 -> C default."""
+    zero_vel_stddev_mps: float = 0.0
+    """1-sigma of a zero-velocity update (ZUPT) [m/s], 0 -> C default."""
+    zero_rot_stddev_rps: float = 0.0
+    """1-sigma of a zero-rotation update (ZARU) [rad/s], 0 -> C default."""
     gyr_bias_init_rps: tuple = (0.0, 0.0, 0.0)
+    """Initial gyro bias estimate [rad/s]. Only seeds the estimated bias
+    state, unlike ``imu_gyr_fixed_bias``."""
     magnetic_n: tuple = (0.0, 0.0, 0.0)
-    kalman_update_dt_sec: float = 0.0  # 0 -> C default (20 Hz)
-    max_prediction_time_sec: float = 0.0  # [s], 0 -> C default
-    gnss_max_horizontal_pos_stddev_m: float = 0.0    # [m], 0 -> C default
-    gnss_max_vertical_pos_stddev_m: float = 0.0      # [m], 0 -> C default
-    gnss_max_horizontal_vel_stddev_mps: float = 0.0  # [m/s], 0 -> C default
-    gnss_max_vertical_vel_stddev_mps: float = 0.0    # [m/s], 0 -> C default
-    magnetometer_min_delay_ms: int = 0  # 0 -> C default (1 Hz), negative ->
-                                        # no rate limit (fuse every sample)
+    """Magnetic reference field in NED [uT] for magnetometer fusion.
+    ``set_magnetic_model()`` fills it from the World Magnetic Model."""
+    kalman_update_dt_sec: float = 0.0
+    """Covariance prediction period [s], 0 -> C default. The strapdown
+    itself still runs at the full IMU rate."""
+    max_prediction_time_sec: float = 0.0
+    """Largest allowed time step [s] (REQ-NAV-043), a longer one counts as
+    a time jump, 0 -> C default."""
+    gnss_max_horizontal_pos_stddev_m: float = 0.0
+    """GNSS fusion gate: largest accepted horizontal position 1-sigma [m],
+    0 -> C default."""
+    gnss_max_vertical_pos_stddev_m: float = 0.0
+    """GNSS fusion gate: largest accepted vertical position 1-sigma [m],
+    0 -> C default."""
+    gnss_max_horizontal_vel_stddev_mps: float = 0.0
+    """GNSS fusion gate: largest accepted horizontal velocity 1-sigma [m/s],
+    0 -> C default."""
+    gnss_max_vertical_vel_stddev_mps: float = 0.0
+    """GNSS fusion gate: largest accepted vertical velocity 1-sigma [m/s],
+    0 -> C default."""
+    magnetometer_min_delay_ms: int = 0
+    """Minimum time between two fused magnetometer samples [ms], 0 -> C
+    default, negative -> no rate limit (fuse every sample)."""
     auto_init: bool = True
+    """Bootstrap position, velocity and attitude from the first usable
+    measurements instead of the initial values given here."""
     allow_unlimited_deadreckoning: bool = False
-    rpy_init_rad: tuple = (0.0, 0.0, 0.0)  # roll/pitch/yaw [rad], auto_init=False
-    init_vel_ned: tuple = (0.0, 0.0, 0.0)  # initial NED velocity [m/s] for a
-                                        # non-stationary manual start
-                                        # (auto_init=False); 0 -> start at rest
-    max_deadreckoning_sec: float = 0.0  # 0 -> C default (10 s); IMU-only
-                                        # coasting budget before ready degrades
-    auto_zupt_disable: bool = False     # disable the built-in stillness ZUPT
-    mag_field_tolerance: float = 0.0    # 0 -> C default (0.30); WMM |B| gate
-    mag_field_check_disable: bool = False  # uncalibrated/unit-less mag
-    estimate_mag_bias: bool = False     # 18-state mode: mag hard-iron states
-    mag_bias_init_stddev_ut: float = 0.0   # [uT], 0 -> C default
-    mag_bias_pred_stddev_ut_sqrts: float = 0.0      # [uT/sqrt(s)], 0 -> C default
-    chi2_disable: bool = False          # disable chi2 outlier downweighting
-                                        # library-wide (diagnostics only)
-    automotive_mode: bool = False       # yaw from GNSS course over ground
-    automotive_min_speed_mps: float = 0.0  # 0 -> C default (2 m/s); ground
-                                        # speed floor for automotive_mode
-    automotive_min_yaw_stddev: float = 0.0  # [rad], 0 -> C default (5 deg);
-                                        # floor on automotive_mode's fused
-    automotive_lateral_constraint: bool = False  # non-holonomic lateral
-                                        # velocity constraint (REQ-NAV-077),
-                                        # needs automotive_mode
-    automotive_lateral_stddev_mps: float = 0.0  # [m/s], 0 -> C default
-    automotive_lateral_max_yaw_rate: float = 0.0  # [rad/s], 0 -> C default
-    automotive_lateral_after_sec: float = 0.0  # [s], 0 -> C default,
-                                        # negative -> no delay
-    range_height_with_baro: bool = False  # ranges also correct the height
-                                        # under the barometric height source
-    range_aiding_max_hpos_stddev_m: float = 0.0  # [m], 0 -> C default: the
-                                        # horizontal 1-sigma in its worst
-                                        # direction below which fused ranges
-                                        # count as position aiding
-                                        # yaw stddev. Raise it where the
-                                        # course-equals-heading assumption is
-                                        # itself looser than a car's (e.g.
-                                        # aircraft wind drift)
-    # IMU calibration (REQ-NAV-037): corrected = M * (raw - fixed_bias),
-    # applied to the raw acc/gyr at the measurement boundary. M is a
-    # column-major 3x3 (all-0 -> identity); the fixed bias is removed
-    # permanently and never estimated (unlike gyr_bias_init_rps, which only
-    # seeds the estimated bias state).
-    imu_acc_misalignment: tuple = (0.0,) * 9   # col-major 3x3
-    imu_gyr_misalignment: tuple = (0.0,) * 9   # col-major 3x3
-    imu_acc_fixed_bias: tuple = (0.0, 0.0, 0.0)  # [m/s^2]
-    imu_gyr_fixed_bias: tuple = (0.0, 0.0, 0.0)  # [rad/s]
-    # GNSS covariance conditioning (REQ-NAV-038): stddev_axis =
-    # max(scale * stddev_reported, floor_axis), applied before the
-    # shutdown gates and fusion. Scale 0 -> 1 (no change); floor 0 -> none.
-    gnss_pos_cov_scale: float = 0.0            # multiplies GNSS pos stddev
-    gnss_pos_cov_scale_height: float = 0.0     # multiplies GNSS pos *height* stddev
-    gnss_vel_cov_scale: float = 0.0            # multiplies GNSS vel stddev
-    gnss_pos_stddev_floor_hor_m: float = 0.0   # min horiz. pos stddev [m]
-    gnss_pos_stddev_floor_ver_m: float = 0.0   # min vert.  pos stddev [m]
-    gnss_vel_stddev_floor_hor_mps: float = 0.0  # min horiz. vel stddev [m/s]
-    gnss_vel_stddev_floor_ver_mps: float = 0.0  # min vert.  vel stddev [m/s]
-    # Magnetometer calibration (REQ-NAV-039): corrected = M*(raw-fixed_bias),
-    # M col-major 3x3 soft-iron/scale/misalignment (all-0 -> identity),
-    # fixed_bias the hard-iron offset [uT]. In nav_suite this is forwarded to
-    # the magnetometer AHRS too (REQ-SUITE-012). Independent of the optional
-    # 18-state estimated hard-iron bias (estimate_mag_bias).
-    mag_misalignment: tuple = (0.0,) * 9   # col-major 3x3
-    mag_fixed_bias: tuple = (0.0, 0.0, 0.0)  # [uT]
-    # Global chi2 downweight significance level (REQ-NAV-046): 0 -> each
-    # channel keeps its gate (GNSS/local 10, mag/yaw 9), a positive
-    # alpha sets one shared threshold chi2inv(1-alpha, 1) for all channels.
+    """Never expire the IMU-only coasting window. Lets the filter start and
+    run without any position aiding."""
+    rpy_init_rad: tuple = (0.0, 0.0, 0.0)
+    """Initial roll/pitch/yaw [rad], used with ``auto_init=False``."""
+    init_vel_ned: tuple = (0.0, 0.0, 0.0)
+    """Initial NED velocity [m/s] for a non-stationary manual start
+    (``auto_init=False``), 0 -> start at rest."""
+    max_deadreckoning_sec: float = 0.0
+    """IMU-only coasting budget [s] before ``ready`` degrades, 0 -> C
+    default."""
+    auto_zupt_disable: bool = False
+    """Disable the built-in stillness detector (automatic ZUPT)."""
+    mag_field_tolerance: float = 0.0
+    """Largest deviation of the measured field strength from the World
+    Magnetic Model, as a fraction, before the magnetometer is downweighted,
+    0 -> C default. Needs the magnetometer in uT."""
+    mag_field_check_disable: bool = False
+    """Skip the field strength check, for an uncalibrated or unit-less
+    magnetometer."""
+    estimate_mag_bias: bool = False
+    """18-state mode: estimate the magnetometer hard-iron bias."""
+    mag_bias_init_stddev_ut: float = 0.0
+    """Initial hard-iron bias 1-sigma [uT], 0 -> C default."""
+    mag_bias_pred_stddev_ut_sqrts: float = 0.0
+    """Hard-iron bias random walk [uT/sqrt(s)], 0 -> C default."""
+    chi2_disable: bool = False
+    """Disable the chi2 outlier downweighting library-wide (diagnostics
+    only)."""
+    automotive_mode: bool = False
+    """Yaw from the GNSS course over ground."""
+    automotive_min_speed_mps: float = 0.0
+    """Ground speed floor [m/s] for ``automotive_mode``, 0 -> C default."""
+    automotive_min_yaw_stddev: float = 0.0
+    """Floor [rad] on the yaw 1-sigma that ``automotive_mode`` fuses, 0 -> C
+    default. Raise it where the course-equals-heading assumption is itself
+    looser than a car's (aircraft wind drift, for example)."""
+    automotive_lateral_constraint: bool = False
+    """Non-holonomic lateral velocity constraint (REQ-NAV-077), needs
+    ``automotive_mode``."""
+    automotive_lateral_stddev_mps: float = 0.0
+    """1-sigma of the lateral velocity constraint [m/s], 0 -> C default."""
+    automotive_lateral_max_yaw_rate: float = 0.0
+    """|Yaw rate| [rad/s] above which the lateral constraint is skipped,
+    where side slip breaks the assumption, 0 -> C default."""
+    automotive_lateral_after_sec: float = 0.0
+    """Hold the lateral constraint off until this long [s] without a GNSS
+    fusion, 0 -> C default, negative -> no delay."""
+    range_height_with_baro: bool = False
+    """Let ranges correct the height also while the barometer is the height
+    source."""
+    range_aiding_max_hpos_stddev_m: float = 0.0
+    """Horizontal 1-sigma [m] in its worst direction below which fused ranges
+    count as position aiding, 0 -> C default."""
+    imu_acc_misalignment: tuple = (0.0,) * 9
+    """Accelerometer calibration matrix M, column-major 3x3 (all 0 ->
+    identity). The calibration (REQ-NAV-037) is ``corrected = M * (raw -
+    fixed_bias)``, applied to the raw samples at the measurement boundary."""
+    imu_gyr_misalignment: tuple = (0.0,) * 9
+    """Gyro calibration matrix M, column-major 3x3 (all 0 -> identity)."""
+    imu_acc_fixed_bias: tuple = (0.0, 0.0, 0.0)
+    """Accelerometer fixed bias [m/s^2], removed permanently, never
+    estimated."""
+    imu_gyr_fixed_bias: tuple = (0.0, 0.0, 0.0)
+    """Gyro fixed bias [rad/s], removed permanently, never estimated (unlike
+    ``gyr_bias_init_rps``, which only seeds the estimated bias)."""
+    gnss_pos_cov_scale: float = 0.0
+    """Factor on the reported GNSS position 1-sigma, 0 -> 1. The GNSS
+    covariance conditioning (REQ-NAV-038) is ``stddev = max(scale *
+    stddev_reported, floor)``, applied before the gates and the fusion."""
+    gnss_pos_cov_scale_height: float = 0.0
+    """Factor on the reported GNSS height 1-sigma, 0 -> 1."""
+    gnss_vel_cov_scale: float = 0.0
+    """Factor on the reported GNSS velocity 1-sigma, 0 -> 1."""
+    gnss_pos_stddev_floor_hor_m: float = 0.0
+    """Smallest horizontal GNSS position 1-sigma [m], 0 -> no floor."""
+    gnss_pos_stddev_floor_ver_m: float = 0.0
+    """Smallest vertical GNSS position 1-sigma [m], 0 -> no floor."""
+    gnss_vel_stddev_floor_hor_mps: float = 0.0
+    """Smallest horizontal GNSS velocity 1-sigma [m/s], 0 -> no floor."""
+    gnss_vel_stddev_floor_ver_mps: float = 0.0
+    """Smallest vertical GNSS velocity 1-sigma [m/s], 0 -> no floor."""
+    mag_misalignment: tuple = (0.0,) * 9
+    """Magnetometer soft-iron, scale and misalignment matrix M, column-major
+    3x3 (all 0 -> identity), ``corrected = M * (raw - fixed_bias)``
+    (REQ-NAV-039). The Navigator forwards it to the magnetometer AHRS too
+    (REQ-SUITE-012)."""
+    mag_fixed_bias: tuple = (0.0, 0.0, 0.0)
+    """Magnetometer hard-iron offset [uT]. Independent of the estimated
+    hard-iron bias of ``estimate_mag_bias``."""
     chi2_reject_alpha: float = 0.0
-    auto_init_window_sec: float = 0.0  # [s], 0 -> C default. IMU
-                                        # leveling window for auto_init's
-                                        # bootstrap median, raise it for a
-                                        # low IMU rate so the window still
-                                        # spans >= 3 samples, otherwise the
-                                        # bootstrap silently never fires
-    # Stillness definition (REQ-NAV-013). For a Navigator running the whole
-    # suite this one set also defines standstill for the ARS/AHRS and, through
-    # them, for the vertical channel's zero-velocity update (REQ-SUITE-020) --
-    # the filters implement it separately, they are no longer tuned
-    # separately. Each 0 -> the C default.
-    #
-    # The window stddevs are the PRIMARY criterion (per-axis RMS of the raw
-    # IMU over a short window, bias-invariant); the magnitude bounds next to
-    # them are only loose sanity limits. Raising the stddevs far above any
-    # plausible sensor noise leaves the bounds alone in charge, which is what
-    # a platform with an inherently noisy standstill (a hovering multicopter)
-    # needs.
-    auto_zupt_static_gyr_rps: float = 0.0   # [rad/s] magnitude bound on |gyro|
-    auto_zupt_static_acc_mps2: float = 0.0  # [m/s^2] magnitude bound on ||f|-g|
-    auto_zupt_static_gyr_stddev_rps: float = 0.0   # [rad/s] window RMS stddev
-    auto_zupt_static_acc_stddev_mps2: float = 0.0  # [m/s^2] window RMS stddev
-    auto_zupt_max_vel_mps: float = 0.0  # [m/s]. Max |GNSS velocity| to arm.
-                                        # Applied only while a recent, precise
-                                        # enough fix exists - never the
-                                        # filter's own velocity state, which
-                                        # would be circular
-    auto_zupt_max_vel_stddev_mps: float = 0.0  # [m/s]. Accuracy that GNSS
-                                        # velocity must itself report (1-sigma,
-                                        # per axis) to count as evidence of
-                                        # standstill
-    auto_zupt_dwell_sec: float = 0.0    # [s] stillness required before a
-                                        # trigger
-    auto_zupt_min_interval_sec: float = 0.0  # [s] min time between triggers
-    speed_scale: float = 0.0            # multiplies the reported speed (0 -> 1)
-    speed_stddev_rel: float = 0.0       # speed-proportional 1-sigma, as a
-                                        # fraction of the speed (0 -> default)
-    speed_min_mps: float = 0.0          # below this FILTERED speed a sample is
-                                        # skipped: v_hat is undefined at v = 0
-    # Upper clamp of the GNSS conditioning pipeline (REQ-NAV-071) and the
-    # asymmetric accuracy envelope that feeds it (REQ-NAV-072). For all five:
-    # 0 -> ins's own default, negative -> that step is not applied.
-    gnss_pos_stddev_cap_hor_m: float = 0.0    # max horiz. pos stddev [m]
-    gnss_pos_stddev_cap_ver_m: float = 0.0    # max vert.  pos stddev [m]
-    gnss_vel_stddev_cap_hor_mps: float = 0.0  # max horiz. vel stddev [m/s]
-    gnss_vel_stddev_cap_ver_mps: float = 0.0  # max vert.  vel stddev [m/s]
-    gnss_acc_envelope_tau_sec: float = 0.0    # envelope decay time constant [s]
-    # Manoeuvre-dependent GNSS velocity noise (REQ-NAV-073), in [m/s] of extra
-    # velocity 1-sigma per [m/s^2] of n-frame ANTENNA acceleration: the body's
-    # plus the centripetal term of the lever arm (REQ-NAV-076).
-    # No default: 0 -> off.
-    gnss_vel_noise_acc_scale_hor: float = 0.0  # on N,E
-    gnss_vel_noise_acc_scale_ver: float = 0.0  # on D
-    # Averaging window for the acceleration that term reads (REQ-NAV-075)
-    # [s]: 0 -> ins's own default (200 ms), negative -> instantaneous.
+    """Global chi2 downweight significance level (REQ-NAV-046): 0 -> each
+    channel keeps its own gate, a positive alpha sets one shared threshold
+    ``chi2inv(1 - alpha, 1)`` for all channels."""
+    auto_init_window_sec: float = 0.0
+    """IMU leveling window [s] of the ``auto_init`` bootstrap, 0 -> C
+    default. Raise it for a low IMU rate so the window still spans at least
+    3 samples, otherwise the bootstrap silently never fires."""
+    auto_zupt_static_gyr_rps: float = 0.0
+    """Stillness detector (REQ-NAV-013), loose sanity bound on |gyro|
+    [rad/s], 0 -> C default. For a Navigator this one set defines
+    standstill for the whole suite, the ARS/AHRS and through them the
+    vertical channel (REQ-SUITE-020). The window 1-sigma values below are
+    the primary criterion, these magnitude bounds only sanity limits."""
+    auto_zupt_static_acc_mps2: float = 0.0
+    """Stillness detector, loose sanity bound on ||f| - g| [m/s^2], 0 -> C
+    default."""
+    auto_zupt_static_gyr_stddev_rps: float = 0.0
+    """Stillness detector, primary criterion: per-axis RMS 1-sigma of the
+    raw gyro over a short window [rad/s], 0 -> C default. Raising it far
+    above any plausible sensor noise leaves the magnitude bounds in charge,
+    which a platform with an inherently noisy standstill (a hovering
+    multicopter) needs."""
+    auto_zupt_static_acc_stddev_mps2: float = 0.0
+    """Stillness detector, primary criterion: per-axis RMS 1-sigma of the
+    raw accelerometer over a short window [m/s^2], 0 -> C default."""
+    auto_zupt_max_vel_mps: float = 0.0
+    """Largest GNSS speed [m/s] that still arms the automatic ZUPT. Applied
+    only while a recent, precise enough fix exists, never against the
+    filter's own velocity state, which would be circular."""
+    auto_zupt_max_vel_stddev_mps: float = 0.0
+    """Accuracy [m/s] the GNSS velocity has to report (1-sigma, per axis) to
+    count as evidence of standstill."""
+    auto_zupt_dwell_sec: float = 0.0
+    """Stillness [s] required before an automatic ZUPT triggers."""
+    auto_zupt_min_interval_sec: float = 0.0
+    """Smallest time [s] between two automatic ZUPT triggers."""
+    speed_scale: float = 0.0
+    """Factor on the reported speed (odometer), 0 -> 1."""
+    speed_stddev_rel: float = 0.0
+    """Speed-proportional 1-sigma of the speed measurement, as a fraction of
+    the speed, 0 -> C default."""
+    speed_min_mps: float = 0.0
+    """Filtered speed [m/s] below which a speed sample is skipped: the
+    direction of motion is undefined at standstill and meaningless just
+    above it, 0 -> C default."""
+    gnss_pos_stddev_cap_hor_m: float = 0.0
+    """Upper clamp of the horizontal GNSS position 1-sigma [m] (REQ-NAV-071),
+    0 -> C default, negative -> not applied."""
+    gnss_pos_stddev_cap_ver_m: float = 0.0
+    """Upper clamp of the vertical GNSS position 1-sigma [m], 0 -> C
+    default, negative -> not applied."""
+    gnss_vel_stddev_cap_hor_mps: float = 0.0
+    """Upper clamp of the horizontal GNSS velocity 1-sigma [m/s], 0 -> C
+    default, negative -> not applied."""
+    gnss_vel_stddev_cap_ver_mps: float = 0.0
+    """Upper clamp of the vertical GNSS velocity 1-sigma [m/s], 0 -> C
+    default, negative -> not applied."""
+    gnss_acc_envelope_tau_sec: float = 0.0
+    """Decay time constant [s] of the asymmetric GNSS accuracy envelope
+    (REQ-NAV-072), 0 -> C default, negative -> not applied."""
+    gnss_vel_noise_acc_scale_hor: float = 0.0
+    """Manoeuvre-dependent GNSS velocity noise on N and E (REQ-NAV-073):
+    extra velocity 1-sigma [m/s] per [m/s^2] of antenna acceleration (the
+    body's plus the centripetal term of the lever arm), 0 -> off."""
+    gnss_vel_noise_acc_scale_ver: float = 0.0
+    """Same as ``gnss_vel_noise_acc_scale_hor``, on D."""
     gnss_vel_noise_acc_window_sec: float = 0.0
-    # Min time between two fused GNSS epochs [ms] (REQ-NAV-074):
-    # 0 -> ins's own default (100 ms, 10 Hz), negative -> no limit.
+    """Averaging window [s] of the acceleration that the manoeuvre term
+    reads (REQ-NAV-075), 0 -> C default, negative -> instantaneous."""
     gnss_min_delay_ms: int = 0
-    auto_zupt_velocity_blind_disable: bool = False  # opt only the ARS/AHRS's
-                                        # own detector out (REQ-AHRS-017); ins
-                                        # keeps deciding for everyone. For a
-                                        # platform dominated by constant-
-                                        # velocity cruise, which no
-                                        # velocity-blind detector can tell
-                                        # from a standstill
-    # GNSS quality hysteresis around the 3D solution (REQ-NAV-051/052).
-    # Separate from the gnss_max_* fusion gates above: the start_* set
-    # decides whether the 3D solution may be ENTERED (strict), the stop_*
-    # set whether it has to be LEFT (loose, after gnss_stop_dwell_sec of
-    # nothing better). Each 0 -> the C default. Leaving re-arms the filter
-    # rather than holding it: position/velocity accessors go None until a
-    # re-bootstrap through the start_* gate, carrying only the IMU biases
-    # (see auto_reacquire_disable for the older hold-down behaviour).
-    gnss_start_max_horizontal_pos_stddev_m: float = 0.0    # [m]
-    gnss_start_max_vertical_pos_stddev_m: float = 0.0      # [m]
-    gnss_start_max_horizontal_vel_stddev_mps: float = 0.0  # [m/s]
-    gnss_start_max_vertical_vel_stddev_mps: float = 0.0    # [m/s]
-    gnss_stop_max_horizontal_pos_stddev_m: float = 0.0     # [m]
-    gnss_stop_max_vertical_pos_stddev_m: float = 0.0       # [m]
-    gnss_stop_max_horizontal_vel_stddev_mps: float = 0.0   # [m/s]
-    gnss_stop_max_vertical_vel_stddev_mps: float = 0.0     # [m/s]
-    gnss_init_dwell_sec: float = 0.0    # [s], 0 -> C default. How long the
-                                        # fix stream must stay entry-quality
-                                        # before the 3D solution is entered
-    gnss_init_dwell_disable: bool = False  # enter on the first good fix
-    gnss_stop_dwell_sec: float = 0.0    # [s], 0 -> C default. How long the
-                                        # fix stream must stay below the
-                                        # stop gates before 3D is left
-    gnss_stop_disable: bool = False     # never leave 3D on GNSS quality
-    baro_height_disable: bool = False  # never select barometric height at
-                                        # bootstrap (REQ-NAV-053), even with a
-                                        # barometer present - for a
-                                        # GNSS-labelled source that is not
-                                        # really satellite GNSS and already
-                                        # reports better-than-barometric
-                                        # vertical accuracy
-    gnss_pos_decimation: int = 0        # REQ-NAV-063. Fuse the GNSS position
-                                        # on every Nth epoch that offers a
-                                        # usable position AND velocity, the
-                                        # velocity alone on the other N-1: a
-                                        # receiver's two blocks come out of one
-                                        # coupled solution whose
-                                        # cross-covariance it does not report,
-                                        # so fusing both counts the same
-                                        # information twice. <= 1 -> off,
-                                        # 0 -> the C default
+    """Smallest time between two fused GNSS epochs [ms] (REQ-NAV-074), 0 ->
+    C default, negative -> no limit."""
+    auto_zupt_velocity_blind_disable: bool = False
+    """Opt only the ARS/AHRS's own stillness detector out (REQ-AHRS-017),
+    the INS keeps deciding for everyone. For a platform dominated by
+    constant-velocity cruise, which no velocity-blind detector can tell from
+    a standstill."""
+    gnss_start_max_horizontal_pos_stddev_m: float = 0.0
+    """Entry gate of the 3D solution (REQ-NAV-051/052): largest horizontal
+    position 1-sigma [m], 0 -> C default. Separate from the ``gnss_max_*``
+    fusion gates: the strict ``start_*`` set decides whether the 3D solution
+    may be entered, the loose ``stop_*`` set whether it has to be left
+    (after ``gnss_stop_dwell_sec`` of nothing better). Leaving re-arms the
+    filter: position and velocity go None until a new bootstrap through the
+    entry gate, which carries only the IMU biases over."""
+    gnss_start_max_vertical_pos_stddev_m: float = 0.0
+    """Entry gate: largest vertical position 1-sigma [m], 0 -> C default."""
+    gnss_start_max_horizontal_vel_stddev_mps: float = 0.0
+    """Entry gate: largest horizontal velocity 1-sigma [m/s], 0 -> C
+    default."""
+    gnss_start_max_vertical_vel_stddev_mps: float = 0.0
+    """Entry gate: largest vertical velocity 1-sigma [m/s], 0 -> C
+    default."""
+    gnss_stop_max_horizontal_pos_stddev_m: float = 0.0
+    """Exit gate: horizontal position 1-sigma [m] above which the 3D
+    solution is left, 0 -> C default."""
+    gnss_stop_max_vertical_pos_stddev_m: float = 0.0
+    """Exit gate: vertical position 1-sigma [m], 0 -> C default."""
+    gnss_stop_max_horizontal_vel_stddev_mps: float = 0.0
+    """Exit gate: horizontal velocity 1-sigma [m/s], 0 -> C default."""
+    gnss_stop_max_vertical_vel_stddev_mps: float = 0.0
+    """Exit gate: vertical velocity 1-sigma [m/s], 0 -> C default."""
+    gnss_init_dwell_sec: float = 0.0
+    """How long [s] the fixes have to stay at entry quality before the 3D
+    solution is entered, 0 -> C default."""
+    gnss_init_dwell_disable: bool = False
+    """Enter the 3D solution on the first good fix."""
+    gnss_stop_dwell_sec: float = 0.0
+    """How long [s] the fixes have to stay worse than the exit gate before
+    the 3D solution is left, 0 -> C default."""
+    gnss_stop_disable: bool = False
+    """Never leave the 3D solution because of GNSS quality."""
+    baro_height_disable: bool = False
+    """Never select the barometric height at bootstrap (REQ-NAV-053), even
+    with a barometer present. For a GNSS-labelled source that is not really
+    satellite GNSS and already reports better-than-barometric vertical
+    accuracy."""
+    gnss_pos_decimation: int = 0
+    """Fuse the GNSS position only on every Nth epoch that offers a usable
+    position and velocity, the velocity alone on the other N-1
+    (REQ-NAV-063). A receiver's two blocks come out of one coupled solution
+    whose cross-covariance it does not report, so fusing both counts the
+    same information twice. N <= 1 -> off, 0 -> C default."""
 
     def _to_struct(self) -> _CfgStruct:
         s = _CfgStruct()
