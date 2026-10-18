@@ -52,8 +52,8 @@ score:
   # NOT accuracy claims. Trip means inspect and retune.
   lim_att_bias_deg: 0.254  # observed 0.241 (roll)
   lim_att_std_deg: 0.313   # observed 0.298 (roll)
-  lim_yaw_bias_deg: 0.052  # observed 0.049
-  lim_yaw_std_deg: 0.615   # observed 0.585
+  lim_yaw_bias_deg: 0.057  # observed 0.054 (AHRS on true north, REQ-SUITE-029)
+  lim_yaw_std_deg: 0.595   # observed 0.567
   lim_pos_rms_m: 0.212     # observed 0.202
   leverarm_frd: [0, 0, 0]  # lighthouse deck is basically next to the CF IMU
 

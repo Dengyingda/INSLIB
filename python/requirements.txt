@@ -1,6 +1,5 @@
 # Runtime deps for tools/replay.py (dataset YAML + MAVLink output + --plot).
 # Install with: pip install -r python/requirements.txt
-# (equivalent to: pip install -e "python/[replay]")
 pyyaml
 pymavlink
 matplotlib

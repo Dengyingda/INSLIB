@@ -2,6 +2,9 @@
 
 [![CI](https://github.com/jnz/INSLIB/actions/workflows/ci.yml/badge.svg)](https://github.com/jnz/INSLIB/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/jnz/INSLIB/branch/main/graph/badge.svg)](https://codecov.io/gh/jnz/INSLIB)
+[![Release](https://img.shields.io/github/v/release/jnz/INSLIB)](https://github.com/jnz/INSLIB/releases)
+[![License: AGPL-3.0](https://img.shields.io/github/license/jnz/INSLIB)](LICENSE)
+![C11](https://img.shields.io/badge/C-C11-blue)
 
 ![INSLIB Logo](doc/figures/inslib_logo_transparent_small.png)
 
@@ -16,9 +19,9 @@ In action, fusing IMU measurements with Galileo HAS-corrected GPS/GNSS inputs:
 
 | Metric | Coverage |
 |---|---|
-| C0 (Line) | 99.4% (4296/4322) |
-| C1 (Branch) | 91.8% (2858/3113) |
-| MC/DC | 91.7% (2836/3092) |
+| C0 (Line) | 99.4% (4314/4340) |
+| C1 (Branch) | 91.7% (2867/3125) |
+| MC/DC | 91.7% (2845/3104) |
 <!-- COVERAGE:END -->
 
 <!-- STACK:START -->
@@ -59,6 +62,8 @@ references, absolute yaw references (GNSS compassing), scalar ground speed
 The core library is written in pure **C** (C11), has no external dependencies
 and is optimized for embedded microcontrollers.  A useful collection of Python
 helper programs and GUI apps are included in this repository.
+The Python binding is on PyPI: `pip install inslib` (see the
+[Python tutorial](tutorial/python_tutorial.md)).
 
 ## Features
 
@@ -242,7 +247,7 @@ with five different IMUs and a ground truth is used.
 | ADIS16460   | industrial-grade module | Analog Devices      | 8.0   |
 | ADIS16465   | industrial-grade module | Analog Devices      | 2.0   |
 | HGuide-i300 | industrial-grade module | Honeywell           | 3.0   |
-| Leador A15  | navigation-grade FOG IMU | Leador             | unknown     |
+| Leador A15  | navigation-grade FOG IMU | Leador             | 0.03  |
 
 The car trajectory with those five IMUs and RTK-GNSS
 positions and a ground truth, processed by INSLIB and by KF-GINS
@@ -304,6 +309,30 @@ returns, mean / max over the outages (smaller is better):
 
 ¹ Enabled non-holonomic (NHC) automotive lateral constraint (`automotive_lateral_constraint`).
 
+### INSLIB with faulty GNSS measurements
+
+The following comparison is injecting faults
+into GNSS measurements: one fault type per run, the same errors are applied for every filter.
+INSLIB runs with its default outlier handling (chi2 on) and for
+comparison without it. KF-GINS fuses every fix, EKF3 has its innovation
+gates and GPS glitch reset.
+
+Mean error over all events of all five IMUs / median time until
+the error stays below 0.3 m again (smaller is better):
+
+| Fault | INSLIB | INSLIB, no outlier test | KF-GINS | EKF3 |
+|---|---|---|---|---|
+| `spike`: single fixes 5 to 50 m off | 0.068m / 0.0s | 38.9m / 21.0s | 29.7m / > 30s | 0.726m / 1.1s |
+| `wrong_fix`: wrong RTK fix, 0.5 to 3 m for 5 to 30 s | 2.69m / 28.0s | 2.62m / 7.0s | 2.86m / 12.0s | 2.67m / 9.5s |
+| `multipath`: 3 to 15 m for 5 to 30 s, 1 m reported | 1.94m / 7.0s | 4.81m / 9.0s | 6.79m / 1.0s | 11.0m / 21.1s |
+| `degraded`: 1 m noise for 30 s, honestly reported | 0.688m / 4.0s | 0.688m / 4.0s | 0.940m / 1.0s | 1.67m / 3.7s |
+| `vel_spike`: single velocities 1 to 5 m/s off¹ | 0.062m / 0.0s | 0.069m / 0.0s | 0.064m / 0.0s | 0.916m / 3.0s |
+| `step`: a lasting 0.5 to 2 m step for 150 s, cm reported | 1.60m / 25.0s | 1.53m / 5.0s | 1.53m / 8.0s | 1.53m / 7.1s |
+| `big_step`: a lasting 5 to 10 m step for 150 s, cm reported | 8.57m / > 30s | 8.47m / 19.0s | 8.47m / 24.0s | 8.57m / 20.1s |
+| `gross`: 2 or 3 single fixes 500 m off within 30 s | 0.071m / 0.0s | 534m / > 30s | 493m / > 30s | 9.48m / 0.0s |
+
+¹ KF-GINS does not fuse velocity, the fault does not reach it.
+
 ## Setup
 
 This repository uses the `KFCore` git submodule. Clone it recursively:
@@ -362,7 +391,7 @@ Which variant do I need?
 
 Notes:
 
-* Main header per variant: `nav_suite.h`, `ins.h`, `ahrs.h`, `baro_alt.h`.
+* Main header per module: `nav_suite.h`, `ins.h`, `ahrs.h`, `baro_alt.h`.
 * ARS and AHRS share `ahrs.c` (mode set via `ahrs_config_t.mode`). Building it
   with `-DAHRS_NO_MAG` gives an ARS-only filter that does not need
   `magnetic_model.c/.h` and `wmm_lut.h`.

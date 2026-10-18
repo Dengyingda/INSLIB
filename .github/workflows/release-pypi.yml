@@ -187,12 +187,16 @@ jobs:
       # From the installed wheel, not from a checkout: the reference shows
       # exactly the package users get, and importing it needs the compiled
       # library anyway.
+      # The logo is the one the PyPI page shows too, served from main.
       - name: Generate
         shell: bash
+        env:
+          LOGO: https://raw.githubusercontent.com/jnz/INSLIB/main/doc/figures/inslib_logo_transparent_small.png
         run: |
           python -m pip install pdoc==16.0.0
           python -m pip install --pre --no-index --find-links dist inslib
-          python -m pdoc INSLIB --docformat restructuredtext -o site
+          python -m pdoc INSLIB --docformat restructuredtext -o site \
+            --logo "$LOGO" --logo-link https://github.com/jnz/INSLIB --favicon "$LOGO"
 
       - uses: actions/upload-pages-artifact@v3
         with:

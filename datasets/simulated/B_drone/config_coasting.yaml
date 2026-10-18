@@ -55,8 +55,8 @@ score:
   # produces after 6 s of an inert filter.
   lim_att_bias_deg: 0.405   # observed 0.385 (pitch)
   lim_att_std_deg: 0.248    # observed 0.235 (roll)
-  lim_yaw_bias_deg: 0.448   # observed 0.427
-  lim_yaw_std_deg: 3.3      # observed 3.135
+  lim_yaw_bias_deg: 0.448   # observed 0.267
+  lim_yaw_std_deg: 3.5      # observed 3.366 (AHRS on true north, REQ-SUITE-029)
   lim_pos_rms_m: 2.49       # observed 2.369
   lim_ellipsoid_rms_m: 0.5  # observed 0.476 (vertical continuity, REQ-NAV-066)
 init_stddev:                         # initial-state 1-sigma (each 0 -> built-in default)

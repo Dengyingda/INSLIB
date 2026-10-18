@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.4.0] - 2026-10-18 - PyPI Package (pip install inslib)
+
+### Added
+
+- The Python binding is published on PyPI: `pip install inslib` installs a
+  prebuilt wheel (Linux x86_64/aarch64/armv7l,32-bit Raspberry Pi OS,
+  Windows x64/ARM64, macOS Intel/Apple silicon).
+- API reference of the Python package.
+- Python tutorial rewritten around `pip install inslib`: a
+  minimal roll/pitch example (IMU only, ARS filter), GNSS, a barometer, a
+  compass (magnetometer), the per-epoch loop.
+- `nav_suite_set_magnetic_model_position()`: one call that sets the World
+  Magnetic Model position for the INS and the magnetometer AHRS.
+- More GNSS test scenarios added.
+  (`make datasets-kfgins-faults`, part of `make test`): spikes, a wrong RTK
+  fix, multipath, honest degradation, velocity spikes, lasting steps and
+  500 m outliers, with RTK and with L1 single point accuracy, written
+  reproducibly by the new `tools/gnss_faults.py`.
+
+### Fixed
+
+- Python binding: `Navigator()` and `Ins()` without a `Config` left the
+  filter uninitialized, so every epoch was treated as an IMU loss and no
+  solution ever came. Without an argument they now start from `Config()`.
+- The magnetometer AHRS ignored the World Magnetic Model position whenever
+  it arrived before the AHRS had started (for example Python's
+  `set_magnetic_model()` right after `Navigator()`), and lost it on every
+  restart, so its heading stayed on magnetic north, off by the local
+  declination. The suite now keeps the position and applies it on every
+  AHRS start.
+
 ## [1.3.0] - 2026-10-14 - RTS Smoother
 
 ### Added

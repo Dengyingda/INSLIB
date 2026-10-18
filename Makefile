@@ -233,7 +233,7 @@ CC_GOALS := all test test-asan check-all coverage readme-coverage \
             $(TEST_CORE) $(TEST_MATH) $(TEST_AHRS) $(TEST_AHRS_NOMAG) $(TEST_BARO) $(TEST_LOG) \
             test_core test_math test_ahrs test_ahrs_nomag test_baro test_log \
             $(REPLAY) replay $(INSRCV) insrcv \
-            pylib pytest datasets datasets-fog datasets-kfgins \
+            pylib pytest datasets datasets-fog datasets-kfgins datasets-kfgins-faults \
             datasets-tunnel datasets-tunnel-nhc datasets-tunnel-odometry \
             datasets-pedestrian datasets-inertial-roundtrip simulated crazyflie
 
@@ -270,6 +270,7 @@ endif
 endif
 
 .PHONY: all test clean coverage coverage-clean readme-coverage datasets datasets-kfgins \
+        datasets-kfgins-faults \
         datasets-fog datasets-tunnel datasets-tunnel-nhc datasets-tunnel-odometry \
         datasets-pedestrian datasets-inertial-roundtrip \
         simulated crazyflie tutorials reqs pylib pytest wmm doc doxygen test-asan \
@@ -549,8 +550,9 @@ wmm:
 # the list below. Every dataset here is committed and deterministic, so
 # `make test` runs the whole list as a regression gate -- a new entry
 # below is picked up by `make test` without a second edit.
-datasets: datasets-fog datasets-kfgins datasets-tunnel datasets-tunnel-nhc \
-          datasets-tunnel-odometry datasets-pedestrian datasets-inertial-roundtrip
+datasets: datasets-fog datasets-kfgins datasets-kfgins-faults datasets-tunnel \
+          datasets-tunnel-nhc datasets-tunnel-odometry datasets-pedestrian \
+          datasets-inertial-roundtrip
 
 $(REPLAY): $(SUITE_SRC) $(KFCORE_SRC) tools/replay.c tools/imu_mount.h $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
@@ -637,6 +639,28 @@ datasets-kfgins: $(REPLAY)
 	$(RUN)$(REPLAY) datasets/kfgins/config_vel.yaml
 	$(RUN)$(REPLAY) datasets/kfgins/config_vel_outage.yaml
 	$(RUN)$(REPLAY) datasets/kfgins/config_vel_outage_nhc.yaml
+
+# The same trial with synthetic GNSS faults and L1 single point fixes
+# (REQ-VER-050): spikes, a wrong RTK fix, multipath, honest degradation,
+# velocity spikes, lasting steps and 500 m blunders, written by
+# tools/gnss_faults.py with fixed seeds (python/tests/test_gnss_faults.py
+# checks that the committed files are what it writes). INSLIB runs with its
+# chi2 gate on, so these gate the outlier handling.
+datasets-kfgins-faults: $(REPLAY)
+	$(RUN)$(REPLAY) datasets/kfgins/config_fault_spike.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_fault_wrong_fix.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_fault_multipath.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_fault_degraded.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_fault_vel_spike.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_fault_step.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_fault_big_step.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_fault_gross.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_spp.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_spp_spike.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_spp_multipath.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_spp_vel_spike.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_spp_step.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_spp_gross.yaml
 
 # Car through a road tunnel: real u-blox fixes across a 94 s total GNSS
 # blackout, the only recording here that drives the coasting expiry, the

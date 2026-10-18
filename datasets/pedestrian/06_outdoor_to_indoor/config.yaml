@@ -45,8 +45,8 @@ score:
   # claims: the reference is a second estimator
   lim_att_bias_deg: 0.034     # observed 0.030 (roll)
   lim_att_std_deg: 0.146      # observed 0.139 (pitch)
-  lim_yaw_bias_deg: 1.33      # observed 1.264
-  lim_yaw_std_deg: 1.23       # observed 1.167
+  lim_yaw_bias_deg: 1.01      # observed 0.962 (AHRS on true north, REQ-SUITE-029)
+  lim_yaw_std_deg: 1.32       # observed 1.257
   lim_pos_rms_m: 0.373        # observed 0.355
   lim_ellipsoid_rms_m: 0.239  # observed 0.227
 

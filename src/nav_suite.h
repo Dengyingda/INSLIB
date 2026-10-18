@@ -200,6 +200,18 @@ typedef struct
     bool ars_att_from_init;  /**< next ARS start uses the prescribed attitude */
     bool ahrs_att_from_init; /**< next AHRS start uses the prescribed attitude */
 
+    /** World Magnetic Model position for the magnetometer AHRS
+     *  (REQ-SUITE-029). The AHRS only takes a position while it runs and
+     *  loses it when it restarts, so the suite keeps the latest one and
+     *  hands it over on every AHRS start. */
+    struct
+    {
+        bool  valid;   /**< a position has been set since nav_suite_init */
+        float lat_rad; /**< latitude [rad] */
+        float lon_rad; /**< longitude [rad] */
+        float year;    /**< decimal year */
+    } mag_model;
+
     /** Heading carry-over across an ins re-initialization (REQ-SUITE-022): the
      *  last 3D heading INS held while converged, paired with the ARS yaw of
      *  that same epoch. Refreshed every epoch INS is ready, so after a shutdown
@@ -337,6 +349,23 @@ extern "C"
     void nav_suite_set_init_att_hint(nav_suite_t* s, float roll_rad, float pitch_rad,
                                      float stddev_roll_pitch_rad, float yaw_rad,
                                      float stddev_yaw_rad);
+
+    /** @brief Set the World Magnetic Model position for both attitude
+     *  sources, so that their yaw refers to true north (REQ-SUITE-029).
+     *
+     *  ins takes it at once (NED magnetic reference and field gate). The
+     *  suite keeps the position and applies it to the magnetometer AHRS now
+     *  if it runs, and again on every AHRS start or restart. Callable at any
+     *  time, right after nav_suite_init() included, and again whenever the
+     *  position has moved far enough to matter. Non-finite input is
+     *  dropped.
+     *
+     *  @param[in,out] s The suite instance.
+     *  @param[in] lat_rad Latitude [rad].
+     *  @param[in] lon_rad Longitude [rad].
+     *  @param[in] year Decimal year (e.g. 2026.5). */
+    void nav_suite_set_magnetic_model_position(nav_suite_t* s, double lat_rad, double lon_rad,
+                                               float year);
 
     /** @brief Feed one measurement epoch to all three filters.
      *

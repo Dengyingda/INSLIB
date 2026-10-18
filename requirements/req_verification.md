@@ -1058,7 +1058,7 @@ the error figures, formed in ECEF, showed it on the reference.
 
 - **Status:** verified
 - **Parent:** REQ-VER-001
-- **Verification:** Test: python/tests/test_tutorials.py:test_c_tutorial_first_program; Test: python/tests/test_tutorials.py:test_c_tutorial_lighthouse_snippet; Test: python/tests/test_tutorials.py:test_attitude_tutorial_program; Test: python/tests/test_tutorials.py:test_python_tutorial_first_script; Test: python/tests/test_tutorials.py:test_python_tutorial_lighthouse_script; Test: python/tests/test_tutorials.py:test_python_snippets_use_existing_names; Test: python/tests/test_tutorials.py:test_c_names_in_tutorials_exist
+- **Verification:** Test: python/tests/test_tutorials.py:test_c_tutorial_first_program; Test: python/tests/test_tutorials.py:test_c_tutorial_lighthouse_snippet; Test: python/tests/test_tutorials.py:test_attitude_tutorial_program; Test: python/tests/test_tutorials.py:test_python_tutorial_first_script; Test: python/tests/test_tutorials.py:test_python_tutorial_tilt_script; Test: python/tests/test_tutorials.py:test_python_tutorial_baro_script; Test: python/tests/test_tutorials.py:test_python_tutorial_compass_script; Test: python/tests/test_tutorials.py:test_python_snippets_use_existing_names; Test: python/tests/test_tutorials.py:test_c_names_in_tutorials_exist
 
 The programs and scripts printed in tutorial/*.md shall build with the
 command line the tutorial gives (without warnings), run to completion and
@@ -1273,3 +1273,55 @@ ICM20602 from 0.233 to 0.179 deg rms and on the ADIS16465 from 0.119 to
 binding, but none of the front ends could set it, so a comparison against
 an estimator that predicts at the IMU rate had to run with a handicap
 nobody had chosen.
+
+## REQ-VER-050 — GNSS fault and single point replays of the KF-GINS trial
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: tools/replay.c:main; Test: python/tests/test_gnss_faults.py:test_committed_files_reproduce; Test: python/tests/test_gnss_faults.py:test_event_counts_and_spacing; Test: python/tests/test_gnss_faults.py:test_step_is_its_own_correct_answer; Test: python/tests/test_gnss_faults.py:test_spp_accuracy_is_reported; Test: python/tests/test_gnss_faults.py:test_faults_add_to_the_spp_error
+
+The suite shall carry, next to `datasets/kfgins/gnss_vel.csv`, GNSS files
+of the same Leador A15 trial with synthetic faults and with L1 single
+point (SPP) accuracy, a `config_fault_<type>.yaml`, `config_spp.yaml` or
+`config_spp_<type>.yaml` replay of each with ins's chi2 outlier gate on,
+and shall gate each against `ref.csv` in `make datasets` and `make test`.
+
+The files shall be written by `tools/gnss_faults.py` from `gnss_vel.csv`
+and `ref.csv` alone, with fixed seeds, so that the committed files are
+exactly what the script writes (`--check`). Its fault model:
+
+- `spike`: 3 single fixes, 3 s apart, offset U(5, 50) m, the reported
+  accuracy kept
+- `wrong_fix`: U(5, 30) s of fixes with one offset U(0.5, 3) m, the
+  reported accuracy kept (a wrong RTK ambiguity fix)
+- `multipath`: U(5, 30) s of fixes with one offset U(3, 15) m, reported at
+  1 m horizontal, 2 m vertical
+- `degraded`: 30 s of white noise of 1 m horizontal, 2 m vertical,
+  reported exactly so
+- `vel_spike`: 3 single velocities, 3 s apart, U(1, 5) m/s off
+- `step`: 150 s of fixes with one offset U(0.5, 2) m, the reported
+  accuracy kept (a change of the RTK base or the datum, a receiver reset)
+- `big_step`: as `step`, U(5, 10) m
+- `gross`: 3 times U(0, 30) s, the fix at or after each 500 m off (2
+  fixes when two times fall on the same one)
+
+Horizontal offsets point in a uniformly random direction, the vertical
+one is the horizontal magnitude times U(-1, 1). The events start 120 s
+after the platform first moves and follow every 90 s (every 300 s for the
+steps) until 90 s before the end of the truth. The SPP error is a
+first-order Gauss-Markov process per axis, 1.5 m horizontal and 3 m
+vertical (1 sigma), correlation time 30 s, reported with that accuracy.
+`spp_<type>` adds the faults of `spike`, `multipath`, `vel_spike`, `step`
+or `gross` on top, keeping the SPP accuracy as reported.
+
+Rationale: the chi2 gate (REQ-NAV-090) was only exercised on synthetic
+scenarios in `tests/` and on real data without faults. A change to the
+gate, to the GNSS noise floors or to the fusion order that lets a blunder
+through, or that keeps the filter from following a fix that stays off,
+shows here on real IMU data as a position RMS far above its gate. With the
+gate off (`chi2_disable: 1`) the 500 m blunders alone cost 76 m position
+RMS over the run with RTK (gate 0.015 m) and 18.6 m with SPP (gate
+3.111 m). The SPP files keep users without RTK in the regression: with
+metre accuracy reported the gate has to stay out of the way of the normal
+error and still remove the blunders. The gates are observed + max(5 %,
+0.003), rounded up, as for the other `datasets/kfgins` replays.

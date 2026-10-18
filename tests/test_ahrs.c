@@ -5005,6 +5005,110 @@ static void gapscn_run(bool aiding_in_gap, gapscn_result_t* res)
     res->n_downweighted = s.baro_alt.n_downweighted;
 }
 
+/* ---------------------------------------------------------------------------
+ * REQ-SUITE-029: a World Magnetic Model position set before the magnetometer
+ * AHRS runs, here right after nav_suite_init, must still reference the AHRS
+ * yaw to true north, and keep doing so after an IMU loss restarts it.
+ * ---------------------------------------------------------------------------
+ */
+
+/* One 100 Hz epoch of a static, tilted, magnetometer-equipped platform, or an
+ * epoch without IMU and magnetometer (an outage). */
+static void magmodel_epoch(nav_suite_t* s, ins_time_us_t t, bool imu, const float f_b[3],
+                           const float mag_b[3])
+{
+    ins_measurements_t m;
+    memset(&m, 0, sizeof(m));
+    m.timestamp = t;
+    if (imu)
+    {
+        m.strapdown_dt_sec = 0.01f;
+        m.acc.is_valid     = true;
+        m.gyr.is_valid     = true;
+        memcpy(m.acc.data, f_b, 3 * sizeof(float));
+        m.mag.is_valid = true;
+        memcpy(m.mag.data, mag_b, 3 * sizeof(float));
+        m.mag.Qll_diag[0] = m.mag.Qll_diag[1] = m.mag.Qll_diag[2] = 1.0f;
+    }
+    nav_suite_update(s, &m);
+}
+
+static void scenario_suite_mag_model_before_ahrs_start(void)
+{
+    printf("\n-- scenario: WMM position set before the AHRS starts (REQ-SUITE-029) --\n");
+
+    /* Darmstadt: declination ~ +3.7 deg (East), enough to tell a true from a
+       magnetic heading at the 1 deg tolerance used below. */
+    const double lat = 49.867378, lon = 8.638174;
+    const float  year     = 2026.5f;
+    const float  decl     = magnetic_declination_deg((float)lat, (float)lon, year);
+    const float  yaw_true = DEG2RAD(30.0f);
+    float        mag_n[3], f_b[3], mag_b[3];
+    magnetic_field_ned_uT((float)lat, (float)lon, year, mag_n);
+    body_meas_from_rpy(DEG2RAD(10.0f), DEG2RAD(-5.0f), yaw_true, f_b, mag_n, mag_b);
+    printf("    declination %.2f deg\n", (double)decl);
+    CHECK_TRUE(fabsf(decl) > 3.0f, "declination large enough to be seen");
+
+    ins_init_t init;
+    memset(&init, 0, sizeof(init));
+    ins_options_t opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.auto_init                     = true;
+    opt.allow_unlimited_deadreckoning = true;
+
+    static nav_suite_t s; /* keep the large struct off the stack */
+    memset(&s, 0, sizeof(s));
+    ins_time_us_t t = 1000000;
+    init.time       = t;
+    CHECK_TRUE(nav_suite_init(&s, &init, &opt) == 0, "nav_suite_init");
+
+    /* Non-finite input is dropped, nothing is kept. */
+    nav_suite_set_magnetic_model_position(&s, NAN, lon * M_PI / 180.0, year);
+    CHECK_TRUE(!s.mag_model.valid, "non-finite position dropped");
+
+    /* Right after init, long before the AHRS has its first magnetometer
+       sample: the AHRS itself would drop this position. */
+    nav_suite_set_magnetic_model_position(&s, lat * M_PI / 180.0, lon * M_PI / 180.0, year);
+    CHECK_TRUE(s.mag_model.valid, "position kept");
+    CHECK_TRUE(!s.ahrs.is_initialized, "AHRS not running yet when the position arrives");
+
+    float roll, pitch, yaw;
+    int   i;
+    for (i = 0; i < 3000; ++i) /* 30 s */
+    {
+        t += US_PER_SEC / 100;
+        magmodel_epoch(&s, t, true, f_b, mag_b);
+    }
+    CHECK_TRUE(nav_suite_get_rpy_ahrs(&s, &roll, &pitch, &yaw), "AHRS running");
+    printf("    AHRS yaw after the first start %.2f deg (true 30, magnetic %.2f)\n",
+           (double)RAD2DEG(yaw), 30.0 - (double)decl);
+    CHECK_NEAR(RAD2DEG(s.ahrs.declination_rad), decl, 0.01, "declination applied at the start");
+    CHECK_NEAR(RAD2DEG(yaw), 30.0, 1.0, "AHRS yaw on true north from the start");
+
+    /* IMU loss: half a second of epochs without IMU stops the AHRS, the
+       restart afterwards must get the kept position again. */
+    for (i = 0; i < 50; ++i)
+    {
+        t += US_PER_SEC / 100;
+        magmodel_epoch(&s, t, false, f_b, mag_b);
+    }
+    CHECK_TRUE(s.n_imu_loss == 1, "one IMU loss");
+    CHECK_TRUE(!s.ahrs.is_initialized, "AHRS stopped by the IMU loss");
+    for (i = 0; i < 3000; ++i)
+    {
+        t += US_PER_SEC / 100;
+        magmodel_epoch(&s, t, true, f_b, mag_b);
+    }
+    CHECK_TRUE(nav_suite_get_rpy_ahrs(&s, &roll, &pitch, &yaw), "AHRS restarted");
+    printf("    AHRS yaw after the restart %.2f deg\n", (double)RAD2DEG(yaw));
+    CHECK_NEAR(RAD2DEG(s.ahrs.declination_rad), decl, 0.01, "declination applied at the restart");
+    CHECK_NEAR(RAD2DEG(yaw), 30.0, 1.0, "AHRS yaw still on true north after the restart");
+
+    /* A new init starts from scratch, the position is forgotten. */
+    CHECK_TRUE(nav_suite_init(&s, &init, &opt) == 0, "nav_suite_init again");
+    CHECK_TRUE(!s.mag_model.valid, "re-init forgets the position");
+}
+
 static void scenario_imu_outage_700ms(void)
 {
     int k;
@@ -5099,6 +5203,7 @@ int main(void)
     scenario_free_yaw_integration();
     scenario_mag_yaw_convergence();
     scenario_wmm_position_aiding();
+    scenario_suite_mag_model_before_ahrs_start();
     scenario_mag_heading_helper();
     scenario_nav_suite();
     scenario_suite_att_hint();

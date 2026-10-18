@@ -2140,15 +2140,12 @@ int main(int argc, char** argv)
         g_suite.local_gnss_cfg.stddev_inflation_factor = cfg.local_gnss_stddev_inflation_factor;
     }
 
-    /* Magnetic model: both attitude sources must agree on the yaw datum
-       (true north) - ins gets the full NED reference vector + field
-       gate, the magnetometer AHRS its declination re-frame. */
+    /* Magnetic model: both attitude sources on the same yaw datum (true
+       north). nav_suite keeps it for every later AHRS start (REQ-SUITE-029). */
     if (cfg.mag_enable && cfg.wmm_year > 0.0)
     {
-        ins_set_magnetic_model_from_position(&g_suite.ins, g_ref[0].lat_rad, g_ref[0].lon_rad,
-                                             (float)cfg.wmm_year);
-        ahrs_set_position(&g_suite.ahrs, (float)g_ref[0].lat_rad, (float)g_ref[0].lon_rad,
-                          (float)cfg.wmm_year);
+        nav_suite_set_magnetic_model_position(&g_suite, g_ref[0].lat_rad, g_ref[0].lon_rad,
+                                              (float)cfg.wmm_year);
     }
     else if (cfg.mag_enable)
     {

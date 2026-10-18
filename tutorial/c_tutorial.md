@@ -64,9 +64,9 @@ int main(void)
     /* 1. The filter lives in one caller-owned struct. Zero it first. */
     ins_t ins = {0};
 
-    /* Example data: a random spot in Munich, 520 m ellipsoidal. The
+    /* Example data: a spot in Darmstadt, 190 m ellipsoidal. The
      * filter works in a local NED frame, this is where its origin sits. */
-    const double lat = DEG2RAD(48.1372), lon = DEG2RAD(11.5756), h = 520.0;
+    const double lat = DEG2RAD(49.867378), lon = DEG2RAD(8.638174), h = 190.0;
 
     /* 2. Initial values and noise assumptions. Zeros pick sane consumer
      *    MEMS defaults, so we only set what we care about. The position fixes the
@@ -175,7 +175,7 @@ cc -std=c11 -D_GNU_SOURCE \
 Expected output:
 
 ```
-position : lat 48.137200 deg  lon 11.575600 deg  h 520.0 m
+position : lat 49.867378 deg  lon 8.638174 deg  h 190.0 m
 attitude : roll 0.00  pitch 0.00  yaw 0.00 deg
 ```
 
@@ -352,7 +352,10 @@ path works with any IMU.
 attitude-only filters (ARS/AHRS) and a barometric vertical channel in parallel,
 and arbitrates the best available answer: `FULL` -> `COASTING` ->
 `ATTITUDE_ONLY` -> `NONE`. If you want graceful degradation out of the box,
-start there, the measurement struct and conventions are identical.
+start there, the measurement struct and conventions are identical. With a
+magnetometer, call `nav_suite_set_magnetic_model_position(&suite, lat, lon,
+year)` instead of the `ins` function: it reaches the AHRS as well, at any
+time, right after `nav_suite_init()` included.
 
 ## Where to look next
 

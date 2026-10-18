@@ -22,7 +22,9 @@ python/
     libINSLIB.so           built here by `make pylib` (git-ignored)
   csrc/ins_capi.c/.h    thin, stable C ABI shim (ins_core_* bare, ins_suite_* suite)
   examples/runner.yaml    fully commented runner reference config (CSV)
-  pyproject.toml          packaging metadata (editable install works today)
+  pyproject.toml          packaging metadata (PyPI: pip install inslib)
+  setup.py                build hook: compiles libINSLIB into the package
+  PYPI.md                 the package description shown on pypi.org
 ```
 
 The programs built on this package live in `tools/`, next to the C tools:
@@ -153,10 +155,25 @@ python3 tools/inspostgui.py --batch datasets/fog --gnss-outage 120:60  # with a 
 
 ## Build & install
 
+Released versions are on PyPI (prebuilt wheels for Linux x86_64/aarch64/
+armv7l, Windows x64/ARM64 and macOS Intel/Apple silicon, the import name
+stays `INSLIB`):
+
+```sh
+pip install inslib
+```
+
+From the checkout:
+
 ```sh
 make pylib            # builds python/INSLIB/libINSLIB.so
 pip install -e python/   # optional: editable install so `import INSLIB` works anywhere
 ```
+
+The editable install compiles the library into `python/INSLIB/` itself
+(`setup.py`, needs gcc/clang, `$CC` overrides, on Windows MSVC when no
+gcc is on PATH), so `make pylib` first is only needed for use without
+installing.
 
 `replay.py` additionally needs PyYAML and (for `--mavlink`) pymavlink.
 One-time venv setup for that:
@@ -173,13 +190,14 @@ python\setup_venv.bat
 python\.venv\Scripts\activate.bat
 ```
 
-Or without a venv: `pip install -r python/requirements.txt`
-(equivalent extra: `pip install -e "python/[replay]"`).
+Or without a venv: `pip install -r python/requirements.txt`.
 
-Full `pip install INSLIB` (compiling the C sources into per-platform
-wheels) needs a build backend (scikit-build-core / meson-python) and is
-deferred. The ctypes + flat-ABI design means one wheel per *platform*,
-not per Python version.
+The PyPI wheels are built by cibuildwheel
+(`.github/workflows/release-pypi.yml`, settings in `pyproject.toml`).
+The ctypes + flat-ABI design means one `py3-none-<platform>` wheel per
+*platform*, not per Python version. A local wheel:
+`python -m build --wheel python/`. There is no sdist: the C sources
+live outside `python/`, so building needs the full repository checkout.
 
 ## Swiss army knife: run your own CSV data (inslib-run)
 

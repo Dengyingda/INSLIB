@@ -19,6 +19,15 @@ Contents:
   INSLIB setup of the INSLIB vs KF-GINS vs EKF3 table in readme.md, normal
   operation, coasting through the outages, and the same with the
   non-holonomic constraint and the IMU mounting yaw taken from the truth
+* `gnss_fault_<type>.csv`, `gnss_spp.csv`, `gnss_spp_<type>.csv`:
+  `gnss_vel.csv` with SYNTHETIC GNSS faults (spikes, a wrong RTK fix,
+  multipath, honest degradation, velocity spikes, lasting steps, 500 m
+  blunders), with every fix at L1 single point accuracy, and with faults
+  on top of that. Written by `python3 tools/gnss_faults.py datasets/kfgins`
+  with fixed seeds, its docstring has the fault model (REQ-VER-050)
+* `config_fault_<type>.yaml`, `config_spp.yaml`, `config_spp_<type>.yaml`:
+  INSLIB with its chi2 outlier gate on through these files, normal
+  operation as `config_vel.yaml` otherwise (`make datasets-kfgins-faults`)
 * `ADIS16460/`, `ADIS16465/`, `ICM20602/`, `i300/`: `config.yaml` and the
   matching KF-GINS `kf-gins.yaml` of the other four IMUs of the table. The
   data is not part of this repository, the header of each `config.yaml`

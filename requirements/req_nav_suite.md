@@ -813,3 +813,26 @@ flight or a vehicle in a turn, where that assumption fails by degrees.
 Reporting the static initial 1-sigma there would make the restarted
 filter overconfident from its first epoch on, the same mistake the
 restart is meant to undo.
+
+## REQ-SUITE-029 — Magnetic model position kept across AHRS starts
+
+- **Status:** verified
+- **Parent:** REQ-AHRS-014
+- **Verification:** Test: tests/test_ahrs.c:scenario_suite_mag_model_before_ahrs_start
+
+The wrapper shall offer one interface that sets the World Magnetic Model
+position (latitude, longitude, decimal year) for both attitude sources:
+ins shall receive it at once (its NED magnetic reference and field
+gate), and the wrapper shall keep the latest position and apply it to
+the magnetometer AHRS (REQ-AHRS-014) whenever that AHRS starts, at the
+first bootstrap and at every restart (REQ-SUITE-027, health check,
+precision watchdog), and at once if the AHRS is already running. A
+position given before the AHRS has started shall therefore reference
+its yaw to true north from the start, and no restart shall fall back
+to magnetic north. nav_suite_init shall forget a kept position.
+
+Rationale: the AHRS only accepts a position while it is running and
+forgets it when it restarts. A caller that sets the position once, the
+natural place being right after nav_suite_init, would otherwise get a
+heading on magnetic north, off by the local declination, without any
+warning.

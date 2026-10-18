@@ -23,6 +23,9 @@
 /doc/doxygen/
 /python/.venv/
 /python/INSLIB.egg-info/
+/python/build/
+/python/dist/
+/wheelhouse/
 /python/__pycache__/
 __pycache__/
 *.gcda

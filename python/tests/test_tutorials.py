@@ -186,8 +186,8 @@ def test_c_tutorial_lighthouse_snippet():
     assert "warming up" not in out, f"lighthouse variant never became ready\n{out}"
     m = re.search(r"position : lat ([\d.]+) deg", out)
     assert m, out
-    # 1.5 m north of the anchor at 48.1372 deg is +1.35e-5 deg
-    assert abs(float(m.group(1)) - 48.137213) < 3e-6, out
+    # 1.5 m north of the anchor at 49.867378 deg is +1.35e-5 deg
+    assert abs(float(m.group(1)) - 49.867391) < 3e-6, out
 
 
 def test_attitude_tutorial_program():
@@ -233,15 +233,34 @@ def test_python_tutorial_first_script():
     _compare_output(_run_python(script), expected, "python_tutorial first script")
 
 
-def test_python_tutorial_lighthouse_script():
+def test_python_tutorial_tilt_script():
     blocks = [b for (lg, b, _) in _blocks(_read("python_tutorial.md"))
-              if lg == "python" and "local_pos((1.5" in b]
+              if lg == "python" and "nav.rpy_ars()" in b
+              and b.startswith("import math")]
     assert len(blocks) == 1
     script = blocks[0]
-    expected = re.search(r"^# -> (.*)$", script, re.M).group(1)
-    out = _run_python(script)
-    got = [ln for ln in out.splitlines() if ln.strip() and not ln.startswith("[")][-1]
-    _compare_output(got, expected, "python_tutorial lighthouse script")
+    expected = _block_after("python_tutorial.md", "It prints:")
+    _compare_output(_run_python(script), expected, "python_tutorial tilt script")
+
+
+def test_python_tutorial_baro_script():
+    blocks = [b for (lg, b, _) in _blocks(_read("python_tutorial.md"))
+              if lg == "python" and "nav.baro(pressure)" in b
+              and b.startswith("import math")]
+    assert len(blocks) == 1
+    script = blocks[0]
+    expected = _block_after("python_tutorial.md", "Prints the height above the start:")
+    _compare_output(_run_python(script), expected, "python_tutorial baro script")
+
+
+def test_python_tutorial_compass_script():
+    blocks = [b for (lg, b, _) in _blocks(_read("python_tutorial.md"))
+              if lg == "python" and "nav.rpy_ahrs()" in b
+              and b.startswith("import math")]
+    assert len(blocks) == 1
+    script = blocks[0]
+    expected = _block_after("python_tutorial.md", "Prints the heading:")
+    _compare_output(_run_python(script), expected, "python_tutorial compass script")
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +344,9 @@ _TESTS = [
     test_c_tutorial_lighthouse_snippet,
     test_attitude_tutorial_program,
     test_python_tutorial_first_script,
-    test_python_tutorial_lighthouse_script,
+    test_python_tutorial_tilt_script,
+    test_python_tutorial_baro_script,
+    test_python_tutorial_compass_script,
     test_python_snippets_use_existing_names,
     test_c_names_in_tutorials_exist,
 ]

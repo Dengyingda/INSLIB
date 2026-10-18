@@ -3126,8 +3126,7 @@ static void wmm_update(insrcv_t* r, double lat_deg, double lon_deg, const char* 
 
     const double lat_rad = lat_deg * (M_PI / 180.0);
     const double lon_rad = lon_deg * (M_PI / 180.0);
-    ins_set_magnetic_model_from_position(&r->suite.ins, lat_rad, lon_rad, year);
-    ahrs_set_position(&r->suite.ahrs, (float)lat_rad, (float)lon_rad, year);
+    nav_suite_set_magnetic_model_position(&r->suite, lat_rad, lon_rad, year);
     /* Logged for the first model and whenever the epoch source improves.
        The position refreshes in between are routine and stay quiet. */
     if (!r->wmm_set || (int)epoch_rank > r->wmm_rank)

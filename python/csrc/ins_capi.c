@@ -9,7 +9,7 @@
 
 #include "ins.h"
 #include "nav_suite.h"
-#include "ahrs.h"             /* ahrs_set_position (WMM true north) */
+#include "ahrs.h"             /* ahrs_get_bias_gyr, ahrs_get_rpy_stddev */
 #include "geodetic_toolbox.h" /* ins_latlonh_to_ecef */
 #include "ins_capi.h"
 
@@ -1050,12 +1050,10 @@ void ins_suite_set_magnetic_model_position(void* h, double lat_rad, double lon_r
 {
     ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
     if (!c) return;
-    /* Both attitude sources must agree on the yaw datum (true north):
-       ins gets the full NED reference vector + field gate, the
-       magnetometer AHRS gets its declination re-frame. The ARS has no
+    /* nav_suite hands the position to ins and the magnetometer AHRS and
+       keeps it for every later AHRS start (REQ-SUITE-029). The ARS has no
        magnetometer, so its (free) yaw needs no declination. */
-    ins_set_magnetic_model_from_position(&c->suite.ins, lat_rad, lon_rad, year);
-    ahrs_set_position(&c->suite.ahrs, (float)lat_rad, (float)lon_rad, year);
+    nav_suite_set_magnetic_model_position(&c->suite, lat_rad, lon_rad, year);
 }
 
 int ins_suite_get_mode(void* h)

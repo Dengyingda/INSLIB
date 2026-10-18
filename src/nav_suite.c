@@ -159,7 +159,7 @@ static void nav_suite_latch_datum_origin(nav_suite_t* s)
     s->datum_offset_t_last  = 0;
 }
 
-/* @satisfies REQ-SUITE-004 REQ-SUITE-011 REQ-SUITE-020 */
+/* @satisfies REQ-SUITE-004 REQ-SUITE-011 REQ-SUITE-020 REQ-SUITE-029 */
 int nav_suite_init(nav_suite_t* s, const ins_init_t* init, const ins_options_t* opt)
 {
     if (s == NULL || init == NULL || opt == NULL) { return -1; }
@@ -195,6 +195,7 @@ int nav_suite_init(nav_suite_t* s, const ins_init_t* init, const ins_options_t* 
     s->level_win.count               = 0;
     s->n_att_boot_moving             = 0;
     s->baro_datum_known              = false;
+    s->mag_model.valid               = false; /* REQ-SUITE-029 */
 
     /* Stillness definition (REQ-SUITE-020): same reasoning as the chi2 flag
        above, for the question "is the platform standing still". ins, the two
@@ -254,6 +255,22 @@ int nav_suite_init(nav_suite_t* s, const ins_init_t* init, const ins_options_t* 
     return rc;
 }
 
+/* Start an ARS/AHRS instance. The magnetometer AHRS forgets a World Magnetic
+ * Model position on every (re)start, so the kept one is handed over again
+ * right after ahrs_init (REQ-SUITE-029). Its start yaw comes from the
+ * magnetometer, so the declination re-frame of ahrs_set_position turns that
+ * magnetic heading into a true one. */
+/* @satisfies REQ-SUITE-029 */
+static void nav_suite_ahrs_start(nav_suite_t* s, ahrs_t* a, const ahrs_config_t* cfg,
+                                 ins_time_us_t t)
+{
+    (void)ahrs_init(a, cfg, t);
+    if (a == &s->ahrs && s->mag_model.valid)
+    {
+        ahrs_set_position(a, s->mag_model.lat_rad, s->mag_model.lon_rad, s->mag_model.year);
+    }
+}
+
 /* Bootstrap an AHRS instance once the leveling window is full: roll/pitch from
  * accelerometer leveling over the window, widened if it was not quasi-static
  * (REQ-SUITE-028); yaw from the magnetometer (AHRS mode), or (unless
@@ -287,7 +304,7 @@ static void nav_suite_ahrs_bootstrap(nav_suite_t* s, ahrs_t* a, ahrs_config_t* c
                 c.rpy_init_rad[i]        = s->ins.init.rpy_init_rad[i];
                 c.rpy_init_stddev_rad[i] = NAV_SUITE_AHRS_INIT_RP_STDDEV;
             }
-            (void)ahrs_init(a, &c, m->timestamp);
+            nav_suite_ahrs_start(s, a, &c, m->timestamp);
             return;
         }
         if (mag_b != NULL &&
@@ -297,7 +314,7 @@ static void nav_suite_ahrs_bootstrap(nav_suite_t* s, ahrs_t* a, ahrs_config_t* c
         {
             c.rpy_init_rad[2] = ahrs_mag_heading(mag_b, c.rpy_init_rad[0], c.rpy_init_rad[1]);
             c.rpy_init_stddev_rad[2] = NAV_SUITE_AHRS_INIT_YAW_STDDEV;
-            (void)ahrs_init(a, &c, m->timestamp);
+            nav_suite_ahrs_start(s, a, &c, m->timestamp);
             return;
         }
         /* No ARS to take it from: level like any other start. */
@@ -322,7 +339,7 @@ static void nav_suite_ahrs_bootstrap(nav_suite_t* s, ahrs_t* a, ahrs_config_t* c
 
     ahrs_config_t c = *cfg;
     (void)ahrs_get_bias_carry(a, c.gyr_bias_init_rps, c.gyr_bias_init_stddev_rps);
-    (void)ahrs_init(a, &c, m->timestamp);
+    nav_suite_ahrs_start(s, a, &c, m->timestamp);
 }
 
 /* IMU loss (REQ-SUITE-027): the ARS/AHRS and baro_alt never see the epochs
@@ -810,6 +827,32 @@ void nav_suite_set_init_att_hint(nav_suite_t* s, float roll_rad, float pitch_rad
         }
         else if (s->ins.opt.auto_init) { s->ars_yaw_from_init = false; }
     }
+}
+
+/* @satisfies REQ-SUITE-029 */
+void nav_suite_set_magnetic_model_position(nav_suite_t* s, double lat_rad, double lon_rad,
+                                           float year)
+{
+    if (s == NULL) { return; }
+    /* float is plenty for a magnetic model lookup on a grid of degrees, and
+       NaN and Inf survive the conversion for the check below. */
+    const float lat_f = (float)lat_rad;
+    const float lon_f = (float)lon_rad;
+    if (!isfinite(lat_f) || !isfinite(lon_f) || !isfinite(year))
+    {
+        return; /* drop non-finite input at the API boundary */
+    }
+    s->mag_model.valid   = true;
+    s->mag_model.lat_rad = lat_f;
+    s->mag_model.lon_rad = lon_f;
+    s->mag_model.year    = year;
+
+    /* Both attitude sources on the same yaw datum (true north): ins gets the
+       full NED reference vector and field gate, the AHRS its declination
+       re-frame. A no-op for the AHRS while it is not running, the kept
+       position reaches it on its next start (nav_suite_ahrs_start). */
+    ins_set_magnetic_model_from_position(&s->ins, lat_rad, lon_rad, year);
+    ahrs_set_position(&s->ahrs, lat_f, lon_f, year);
 }
 
 /* @satisfies REQ-SUITE-001 REQ-SUITE-003 REQ-SUITE-021 */
